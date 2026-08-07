@@ -58,7 +58,9 @@ HEADER_MAP = {
     "stc12c5a60s2_p.h": "keil-stc12.h",
     "stc12c5a60ad.h": "keil-stc12.h",
     "stc12c5a56s2.h": "keil-stc12.h",
-    "stc15f2k60s2.h": "keil-stc12.h",
+    # Deliberately NOT mapped: stc15*.h. The STC15 puts Timer 2 at 0xD6/0xD7
+    # where the 8052 (and SDCC's stc12.h) has 0xCC/0xCD, so redirecting it here
+    # would produce code that compiles and writes to the wrong registers.
     "reg51.h": "keil-reg51.h",
     "reg52.h": "keil-reg52.h",
     "at89x51.h": "keil-reg51.h",

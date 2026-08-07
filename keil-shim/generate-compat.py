@@ -26,6 +26,10 @@ SFRS = [
     ("ADC_CONTR", 0xBC), ("ADC_RES", 0xBD), ("ADC_RESL", 0xBE),
 ]
 PORTS = (("P0", 0x80), ("P1", 0x90), ("P2", 0xA0), ("P3", 0xB0), ("P4", 0xC0))
+# Same register, different vendor spelling. IPH2 turns up in 23 of the 26
+# vendor headers in the survey; SDCC calls it IP2H, at the same address.
+ALIASES = [("IPH2", "IP2H")]
+
 CONSTANTS = [
     ("ADC_POWER", "0x80", "ADC_CONTR bit 7"),
     ("ADC_SPEEDLL", "0x00", "540 clocks per conversion"),
@@ -70,6 +74,11 @@ out.append("")
 out.append("/* Vendor-header constants (datasheet 9.2). */")
 for name, value, note in CONSTANTS:
     out.append(f"#define {name:<12} {value}   /* {note} */")
+out += ["", "/* Same register, different vendor spelling. */"]
+for vendor_name, sdcc_name in ALIASES:
+    if vendor_name not in have_sfr:
+        out.append(f"#define {vendor_name:<12} {sdcc_name}")
+
 out += ["", "/* Older vendor headers spell the IAP registers ISP_*. */"]
 for name, _ in SFRS:
     if name.startswith("IAP_"):

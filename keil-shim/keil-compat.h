@@ -63,6 +63,9 @@ __sbit __at (0xC7) P47;
 #define ADC_FLAG     0x10   /* conversion complete */
 #define ADC_START    0x08   /* begin a conversion */
 
+/* Same register, different vendor spelling. */
+#define IPH2         IP2H
+
 /* Older vendor headers spell the IAP registers ISP_*. */
 #define ISP_DATA     IAP_DATA
 #define ISP_ADDRH    IAP_ADDRH
