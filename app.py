@@ -9,6 +9,7 @@ extensions can talk to both with the same client code.
 """
 
 import base64
+import html
 import os
 import re
 import shutil
@@ -19,7 +20,7 @@ import uuid
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -98,8 +99,8 @@ class CompileReq(BaseModel):
     format: str = "hex"
 
 
-@app.post("/compile")
-async def compile_source(req: CompileReq):
+def build(req: CompileReq) -> dict:
+    """Compile and return the JSON-shaped result. Shared by both endpoints."""
     if len(req.code.encode("utf-8")) > MAX_SOURCE_BYTES:
         return {"success": False, "error": "source too large"}
 
@@ -198,6 +199,35 @@ async def compile_source(req: CompileReq):
         shutil.rmtree(work, ignore_errors=True)
 
 
+@app.post("/compile")
+async def compile_source(req: CompileReq):
+    """Compile and return the image base64-encoded inside JSON."""
+    return build(req)
+
+
+@app.post("/download")
+async def download(req: CompileReq):
+    """Same as /compile, but returns the raw file with a filename attached.
+
+    Saves callers from base64-decoding by hand:
+        curl -X POST .../download -H 'Content-Type: application/json' \
+             -d @req.json -OJ
+    """
+    result = build(req)
+    if not result["success"]:
+        return PlainTextResponse(result["error"], status_code=400)
+    return Response(
+        content=base64.b64decode(result["base64"]),
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{result["filename"]}"',
+            "X-Image-Bytes": str(result["bytes"]),
+            # So a browser fetch() can read the size without a preflight dance.
+            "Access-Control-Expose-Headers": "Content-Disposition, X-Image-Bytes",
+        },
+    )
+
+
 @app.get("/health")
 async def health():
     stage_toolchain()
@@ -248,36 +278,44 @@ void main(void)
 """
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return f"""<!doctype html>
+# The page is a plain string with a __EXAMPLE__ placeholder rather than an
+# f-string: JavaScript is mostly braces, and doubling every one of them to
+# survive f-string interpolation makes it unreadable and easy to break.
+PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>stc-compiler</title>
 <style>
-  :root {{ color-scheme: dark; }}
-  * {{ box-sizing: border-box; }}
-  body {{ margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;
-         background:#14161a; color:#e6e6e6; display:flex; flex-direction:column; height:100vh; }}
-  header {{ padding:12px 20px; background:#1c1f26; border-bottom:1px solid #2a2e37;
-            display:flex; gap:16px; align-items:center; flex-wrap:wrap; }}
-  h1 {{ font-size:15px; margin:0; font-weight:600; }}
-  h1 small {{ font-weight:400; color:#8a91a0; margin-left:8px; }}
-  main {{ flex:1; display:flex; min-height:0; }}
-  textarea {{ flex:1; border:0; padding:16px; resize:none; background:#14161a; color:#e6e6e6;
-              font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; outline:none; }}
-  aside {{ width:42%; min-width:280px; border-left:1px solid #2a2e37; padding:16px;
-           overflow:auto; background:#101216; }}
-  pre {{ margin:0; white-space:pre-wrap; word-break:break-all;
-         font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; color:#b9c0cc; }}
-  button {{ background:#3b82f6; color:#fff; border:0; padding:7px 16px; border-radius:6px;
-            font-size:13px; font-weight:500; cursor:pointer; }}
-  button:disabled {{ opacity:.5; cursor:default; }}
-  select, input {{ background:#22262f; color:#e6e6e6; border:1px solid #333945;
-                   border-radius:6px; padding:6px 8px; font-size:13px; }}
-  label {{ color:#8a91a0; font-size:12px; }}
-  .ok {{ color:#4ade80; }} .err {{ color:#f87171; }}
-  a {{ color:#7aa2f7; }}
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+         background:#14161a; color:#e6e6e6; display:flex; flex-direction:column; height:100vh; }
+  header { padding:10px 18px; background:#1c1f26; border-bottom:1px solid #2a2e37;
+           display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0 auto 0 0; font-weight:600; white-space:nowrap; }
+  h1 small { font-weight:400; color:#8a91a0; margin-left:8px; }
+  main { flex:1; display:flex; min-height:0; }
+  textarea { flex:1; border:0; padding:16px; resize:none; background:#14161a; color:#e6e6e6;
+             font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; outline:none; }
+  aside { width:44%; min-width:300px; border-left:1px solid #2a2e37;
+          display:flex; flex-direction:column; background:#101216; }
+  #tabs { display:flex; gap:2px; padding:8px 10px 0; border-bottom:1px solid #2a2e37; }
+  #tabs button { background:none; border:0; border-bottom:2px solid transparent;
+                 color:#8a91a0; padding:6px 12px; font-size:12px; cursor:pointer; }
+  #tabs button.on { color:#e6e6e6; border-bottom-color:#3b82f6; }
+  #panes { flex:1; overflow:auto; padding:14px 16px; }
+  pre { margin:0; white-space:pre-wrap; word-break:break-all;
+        font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; color:#b9c0cc; }
+  button.primary { background:#3b82f6; color:#fff; border:0; padding:7px 16px;
+                   border-radius:6px; font-size:13px; font-weight:500; cursor:pointer; }
+  button.ghost { background:#22262f; color:#e6e6e6; border:1px solid #333945;
+                 padding:7px 14px; border-radius:6px; font-size:13px; cursor:pointer; }
+  button:disabled { opacity:.4; cursor:default; }
+  select, input { background:#22262f; color:#e6e6e6; border:1px solid #333945;
+                  border-radius:6px; padding:6px 8px; font-size:13px; }
+  label { color:#8a91a0; font-size:12px; display:flex; align-items:center; gap:5px; }
+  .ok { color:#4ade80; } .err { color:#f87171; } .dim { color:#8a91a0; }
+  a { color:#7aa2f7; }
 </style></head><body>
 <header>
   <h1>stc-compiler <small>C &rarr; Intel HEX for STC12 / 8051, via SDCC</small></h1>
@@ -289,38 +327,146 @@ async def index():
     </select>
   </label>
   <label>FOSC <input id=fosc value=11059200 size=9></label>
-  <button id=go>Compile</button>
-  <span id=status></span>
+  <label>format
+    <select id=format>
+      <option value=hex>.hex (packihx)</option>
+      <option value=ihx>.ihx (raw)</option>
+      <option value=bin>.bin</option>
+    </select>
+  </label>
+  <button class=primary id=go>Compile</button>
+  <button class=ghost id=dl disabled>Download</button>
+  <button class=ghost id=copy disabled>Copy</button>
+  <span id=status class=dim>ready</span>
 </header>
 <main>
-  <textarea id=code spellcheck=false>{EXAMPLE}</textarea>
-  <aside><pre id=out>POST /compile with {{"code": "...", "target": "stc12c5a60s2"}}.
-See <a href="/docs">/docs</a> for the schema, <a href="/health">/health</a> for the SDCC version.</pre></aside>
+  <textarea id=code spellcheck=false>__EXAMPLE__</textarea>
+  <aside>
+    <div id=tabs>
+      <button class=on data-pane=out>Output</button>
+      <button data-pane=mem>Memory</button>
+      <button data-pane=log>Log</button>
+    </div>
+    <div id=panes>
+      <pre id=out>Press Compile, or POST to <code>/compile</code> for JSON and
+<code>/download</code> for the raw file.
+
+See <a href="/docs">/docs</a> for the schema and <a href="/health">/health</a> for the SDCC version.</pre>
+      <pre id=mem hidden></pre>
+      <pre id=log hidden></pre>
+    </div>
+  </aside>
 </main>
 <script>
 const $ = id => document.getElementById(id);
-let blob = null;
-$('go').onclick = async () => {{
-  $('go').disabled = true; $('status').textContent = 'compiling...';
-  try {{
-    const r = await fetch('/compile', {{
-      method: 'POST', headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{code: $('code').value, target: $('target').value,
-                            fosc: parseInt($('fosc').value, 10) || null}})
-    }});
-    const d = await r.json();
-    if (d.success) {{
-      blob = d.base64;
-      $('status').innerHTML = '<span class=ok>' + d.bytes + ' bytes</span>';
-      $('out').textContent = atob(d.base64) + (d.memory ? '\\n\\n' + d.memory : '');
-    }} else {{
-      $('status').innerHTML = '<span class=err>failed</span>';
-      $('out').textContent = d.error || 'unknown error';
-    }}
-  }} catch (e) {{
-    $('status').innerHTML = '<span class=err>error</span>';
-    $('out').textContent = String(e);
-  }}
-  $('go').disabled = false;
-}};
-</script></body></html>"""
+let image = null;          // {bytes: Uint8Array, filename: string}
+
+document.querySelectorAll('#tabs button').forEach(tab => {
+  tab.onclick = () => {
+    document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b === tab));
+    ['out', 'mem', 'log'].forEach(p => { $(p).hidden = (p !== tab.dataset.pane); });
+  };
+});
+
+function bytesFromBase64(b64) {
+  const binary = atob(b64);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+// .bin is not text, so show a classic offset/hex/ascii dump instead of mojibake.
+function hexdump(bytes, limit = 4096) {
+  const lines = [];
+  const n = Math.min(bytes.length, limit);
+  for (let off = 0; off < n; off += 16) {
+    const row = bytes.subarray(off, Math.min(off + 16, n));
+    const hex = [...row].map(b => b.toString(16).padStart(2, '0')).join(' ').padEnd(47);
+    const ascii = [...row].map(b => (b >= 32 && b < 127) ? String.fromCharCode(b) : '.').join('');
+    lines.push(off.toString(16).padStart(6, '0') + '  ' + hex + '  |' + ascii + '|');
+  }
+  if (bytes.length > limit) lines.push(`... ${bytes.length - limit} more bytes`);
+  return lines.join('\n');
+}
+
+function setBusy(busy) {
+  $('go').disabled = busy;
+  if (busy) { $('dl').disabled = true; $('copy').disabled = true; }
+}
+
+$('go').onclick = async () => {
+  setBusy(true);
+  $('status').className = 'dim';
+  $('status').textContent = 'compiling...';
+  image = null;
+  const format = $('format').value;
+  try {
+    const response = await fetch('/compile', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        code: $('code').value,
+        target: $('target').value,
+        fosc: parseInt($('fosc').value, 10) || null,
+        format,
+      })
+    });
+    const data = await response.json();
+    if (data.success) {
+      image = {bytes: bytesFromBase64(data.base64), filename: data.filename};
+      $('status').className = 'ok';
+      $('status').textContent = data.bytes + ' bytes → ' + data.filename;
+      $('out').textContent = (format === 'bin')
+        ? hexdump(image.bytes)
+        : new TextDecoder().decode(image.bytes);
+      $('mem').textContent = data.memory || '(none)';
+      $('log').textContent = data.log || '(no warnings)';
+      $('dl').disabled = false;
+      $('copy').disabled = (format === 'bin');
+    } else {
+      $('status').className = 'err';
+      $('status').textContent = 'failed';
+      $('out').textContent = data.error || 'unknown error';
+      $('log').textContent = data.log || data.error || '';
+    }
+  } catch (err) {
+    $('status').className = 'err';
+    $('status').textContent = 'error';
+    $('out').textContent = String(err);
+  }
+  setBusy(false);
+};
+
+$('dl').onclick = () => {
+  if (!image) return;
+  const url = URL.createObjectURL(new Blob([image.bytes], {type: 'application/octet-stream'}));
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = image.filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  // Revoke on the next tick; Safari cancels the download if it goes too early.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+
+$('copy').onclick = async () => {
+  if (!image) return;
+  await navigator.clipboard.writeText(new TextDecoder().decode(image.bytes));
+  const previous = $('copy').textContent;
+  $('copy').textContent = 'Copied';
+  setTimeout(() => { $('copy').textContent = previous; }, 1200);
+};
+
+// Cmd/Ctrl-Enter compiles, like every other editor.
+$('code').addEventListener('keydown', event => {
+  if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); $('go').click(); }
+});
+</script></body></html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    # RCDATA inside <textarea> tolerates a bare "<", but "&" would be read as
+    # an entity -- and the example has "&=" in it. Escape properly.
+    return PAGE.replace("__EXAMPLE__", html.escape(EXAMPLE))

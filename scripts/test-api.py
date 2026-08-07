@@ -159,5 +159,48 @@ result, _ = post({"code": "void main(void) { not C }"})
 check("workspace path stripped from errors", "/tmp/build-" not in result.get("error", ""),
       result.get("error", "").splitlines()[0][:60])
 
+print("\ndownload endpoint")
+def download(payload):
+    req = urllib.request.Request(f"{BASE}/download", json.dumps(payload).encode(),
+                                 {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as response:
+        return response.read(), dict(response.headers)
+
+for fmt, want_name, want_text in (("hex", "main.hex", True),
+                                  ("ihx", "main.ihx", True),
+                                  ("bin", "main.bin", False)):
+    blob, headers = download({"code": SOURCE, "format": fmt})
+    disposition = headers.get("Content-Disposition", "")
+    check(f"{fmt}: filename in Content-Disposition", f'filename="{want_name}"' in disposition,
+          disposition)
+    check(f"{fmt}: body is the raw file",
+          bool(blob) and (blob.startswith(b":") if want_text else not blob.startswith(b":")),
+          f"{len(blob)} bytes")
+    check(f"{fmt}: X-Image-Bytes matches body",
+          headers.get("X-Image-Bytes") == str(len(blob)),
+          f"header {headers.get('X-Image-Bytes')} vs {len(blob)}")
+
+check("CORS exposes the filename header",
+      "Content-Disposition" in download({"code": SOURCE})[1]
+          .get("Access-Control-Expose-Headers", ""))
+
+try:
+    download({"code": "void main(void) { not C }"})
+    check("failed download returns 4xx", False, "got 200")
+except urllib.error.HTTPError as exc:
+    body = exc.read().decode()
+    check("failed download returns 4xx", exc.code == 400, f"http {exc.code}")
+    check("failed download body is the compiler error", "syntax error" in body,
+          body.splitlines()[0][:60])
+
+print("\nbrowser UI")
+with urllib.request.urlopen(f"{BASE}/", timeout=60) as response:
+    page = response.read().decode()
+check("serves HTML", page.lstrip().startswith("<!doctype html"))
+check("has a Download control", "id=dl" in page and "URL.createObjectURL" in page)
+check("has a format picker", "id=format" in page)
+check("hex-dumps binary output", "function hexdump" in page)
+check("example is HTML-escaped", "&amp;= ~0x80" in page)
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

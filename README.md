@@ -60,6 +60,24 @@ Failure returns `{"success": false, "error": "<compiler output>"}`.
 The `memory` field is worth surfacing to users — it is how you catch an image
 quietly outgrowing 60 KB of flash or 248 bytes of stack.
 
+### `POST /download`
+
+Identical request body, but returns the **raw file** with a filename attached
+instead of base64 inside JSON — so `curl` can just save it:
+
+```bash
+curl -X POST https://stc-compiler.vercel.app/download \
+     -H 'Content-Type: application/json' \
+     -d '{"code": "#include <stc12.h>\nvoid main(void) { P1 = 0; for(;;); }"}' \
+     -OJ                       # -OJ takes the name from Content-Disposition
+# -> main.hex
+```
+
+Response headers: `Content-Disposition: attachment; filename="main.hex"`,
+`X-Image-Bytes`, and `Access-Control-Expose-Headers` so a browser `fetch()` can
+read both. A compile failure returns **400** with the compiler output as plain
+text.
+
 ### `GET /health`
 
 Reports the SDCC version and the known targets. Also the cheapest way to see
@@ -68,6 +86,10 @@ whether a cold start staged the toolchain correctly.
 ### `GET /`
 
 A small browser UI with the blink example preloaded — no build step, no CDN.
+Pick a target, clock and output format, compile with the button or
+<kbd>Cmd</kbd>/<kbd>Ctrl</kbd>+<kbd>Enter</kbd>, then **Download** the image or
+**Copy** it to the clipboard. Output, SDCC's memory map and the build log are
+on separate tabs; `.bin` is shown as a hex dump rather than mojibake.
 
 ### `GET /docs`
 
