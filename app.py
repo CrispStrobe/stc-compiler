@@ -10,6 +10,7 @@ extensions can talk to both with the same client code.
 
 import base64
 import html
+import json
 import os
 import re
 import shutil
@@ -17,6 +18,8 @@ import stat
 import subprocess
 import tempfile
 import uuid
+
+import stc_pseudocode
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -86,6 +89,9 @@ def stage_toolchain():
 
 class CompileReq(BaseModel):
     code: str
+    # "c" compiles the body as-is; "pseudocode" runs it through the
+    # BrickWright-style front end first (see stc_pseudocode.py).
+    language: str = "c"
     target: str = "stc12c5a60s2"
     # Clock in Hz. Emitted as -DFOSC_HZ=<n>UL, which is what the
     # stc12c5a60s2-lab examples expect. None omits it entirely.
@@ -103,6 +109,20 @@ def build(req: CompileReq) -> dict:
     """Compile and return the JSON-shaped result. Shared by both endpoints."""
     if len(req.code.encode("utf-8")) > MAX_SOURCE_BYTES:
         return {"success": False, "error": "source too large"}
+
+    generated_c = None
+    if req.language.lower() in ("pseudocode", "pseudo", "bw"):
+        try:
+            generated_c, program = stc_pseudocode.transpile(req.code)
+        except stc_pseudocode.PseudocodeError as exc:
+            return {"success": False, "error": str(exc), "line": exc.line,
+                    "stage": "transpile"}
+        req = req.model_copy(update={"code": generated_c})
+        # The pseudocode's own CLOCK wins; FOSC_HZ is already baked into the C.
+        req = req.model_copy(update={"fosc": None})
+    elif req.language.lower() != "c":
+        return {"success": False,
+                "error": f"unknown language '{req.language}'; use 'c' or 'pseudocode'"}
 
     target = TARGETS.get(req.target.lower())
     if target is None:
@@ -189,6 +209,7 @@ def build(req: CompileReq) -> dict:
 
         return {
             "success": True,
+            "c": generated_c,          # None unless language was "pseudocode"
             "base64": base64.b64encode(blob).decode("ascii"),
             "filename": name,
             "bytes": len(blob),
@@ -203,6 +224,26 @@ def build(req: CompileReq) -> dict:
 async def compile_source(req: CompileReq):
     """Compile and return the image base64-encoded inside JSON."""
     return build(req)
+
+
+@app.post("/transpile")
+async def transpile_only(req: CompileReq):
+    """Pseudocode in, C out. No compiler involved -- useful for seeing exactly
+    what the front end produced before handing it to SDCC."""
+    try:
+        code, program = stc_pseudocode.transpile(req.code)
+    except stc_pseudocode.PseudocodeError as exc:
+        return {"success": False, "error": str(exc), "line": exc.line}
+    return {
+        "success": True,
+        "c": code,
+        "part": program.part,
+        "clock": program.clock,
+        "pins": {name: {"sfr": pin.sfr, "direction": pin.direction,
+                        "active_low": pin.active_low}
+                 for name, pin in program.pins.items()},
+        "variables": program.variables,
+    }
 
 
 @app.post("/download")
@@ -228,38 +269,207 @@ async def download(req: CompileReq):
     )
 
 
-# --------------------------------------------------------------- imprint
-# Site operator details for the About dialog. Kept in the environment rather
-# than the source so the address is never committed to a public repo, and so
-# a fork deploying its own instance does not publish someone else's details.
+# ----------------------------------------------------------------- about
+# Mirrors the About screen of the sibling apps (CrisperWeaver, CrispSorter):
+# service provider, contact, privacy, disclaimer, licence, then the list of
+# third-party components. Bilingual, like the rest of this project's docs.
 #
-#   vercel env add IMPRINT_NAME production
-#   vercel env add IMPRINT_ADDRESS production   # newlines allowed
-#   vercel env add IMPRINT_EMAIL production
-#
-# Germany requires this on a publicly reachable service (§5 DDG, formerly TMG).
-# If nothing is set the section is omitted rather than showing a placeholder.
-def imprint_html() -> str:
-    name = os.environ.get("IMPRINT_NAME", "").strip()
-    address = os.environ.get("IMPRINT_ADDRESS", "").strip()
-    email = os.environ.get("IMPRINT_EMAIL", "").strip()
-    if not (name or address or email):
-        return ""
+# The provider block can be overridden per-deployment so a fork does not
+# publish someone else's details:  IMPRINT_NAME / _ADDRESS / _EMAIL / _PHONE.
+PROVIDER_NAME = os.environ.get("IMPRINT_NAME", "Christian Ströbele")
+PROVIDER_ADDRESS = os.environ.get(
+    "IMPRINT_ADDRESS", "Nikolausstr. 5\n70190 Stuttgart\nDeutschland / Germany")
+PROVIDER_EMAIL = os.environ.get("IMPRINT_EMAIL", "postmaster@crispstro.be")
+PROVIDER_PHONE = os.environ.get("IMPRINT_PHONE", "+49 176 6421 8601")
 
-    rows = []
-    if name:
-        rows.append(f"<strong>{html.escape(name)}</strong>")
-    if address:
-        rows.append("<br>".join(html.escape(line) for line in address.splitlines() if line.strip()))
-    if email:
-        safe = html.escape(email)
-        rows.append(f'<a href="mailto:{safe}">{safe}</a>')
+SDCC_VERSION_LABEL = "4.0.0+dfsg-2"
 
-    return (
-        '<h3>Imprint / Impressum</h3>'
-        '<p class=dim>Angaben gem\u00e4\u00df \u00a7 5 DDG \u00b7 responsible for content</p>'
-        "<address>" + "<br>".join(rows) + "</address>"
+LICENCE_ROWS = [
+    ("This service &mdash; API, browser UI, build scripts",
+     "MIT", "https://github.com/CrispStrobe/stc-compiler/blob/main/LICENSE"),
+    ("<a href='https://sdcc.sourceforge.net/' target=_blank rel=noopener>SDCC</a> 4.0.0 &mdash; "
+     "<code>sdcc</code>, <code>sdcpp</code>, <code>sdas8051</code>, <code>sdld</code>, "
+     "<code>packihx</code>, <code>makebin</code>",
+     "GPL-2.0-or-later", "https://www.gnu.org/licenses/old-licenses/gpl-2.0.html"),
+    ("SDCC runtime headers and libraries, including <code>mcs51/stc12.h</code>",
+     "GPL-2.0-or-later<br>with linking exception",
+     "https://www.gnu.org/licenses/old-licenses/gpl-2.0.html"),
+    ("<a href='https://github.com/fastapi/fastapi' target=_blank rel=noopener>FastAPI</a>, "
+     "<a href='https://github.com/pydantic/pydantic' target=_blank rel=noopener>Pydantic</a>",
+     "MIT", "https://opensource.org/license/mit"),
+    ("<a href='https://github.com/encode/starlette' target=_blank rel=noopener>Starlette</a>, "
+     "<a href='https://github.com/encode/uvicorn' target=_blank rel=noopener>Uvicorn</a>",
+     "BSD-3-Clause", "https://opensource.org/license/bsd-3-clause"),
+]
+
+LINKING_EXCEPTION = (
+    "As a special exception, if you link this library with other files, some of which "
+    "are compiled with SDCC, to produce an executable, this library does not by itself "
+    "cause the resulting executable to be covered by the GNU General Public License."
+)
+
+TEXT = {
+    "en": {
+        "tagline": "Compiles C to Intel HEX for the STC12C5A60S2 and other 8051 parts. "
+                   "The compile side of a Scratch-blocks-to-8051 back-end for BrickWright.",
+        "provider": "Service Provider",
+        "contact": "Contact",
+        "email": "Email",
+        "phone": "Phone",
+        "project": "Project",
+        "privacy": "Privacy",
+        "privacy_text":
+            "Source you submit is compiled in an ephemeral container and the workspace is "
+            "deleted as soon as the response is sent. Nothing is stored, put in a database, "
+            "or used for anything else. No cookies, no analytics, no tracking. The hosting "
+            "provider may keep ordinary request metadata such as IP address and timestamps "
+            "in its own logs.",
+        "disclaimer": "Disclaimer",
+        "disclaimer_text":
+            "This software is provided \u201cas is\u201d, without warranty of any kind, express "
+            "or implied, including but not limited to the warranties of merchantability, "
+            "fitness for a particular purpose and noninfringement. In no event shall the "
+            "authors be liable for any claim, damages or other liability arising from, out "
+            "of or in connection with the software or its use.",
+        "hardware": "You are responsible for what you flash and for the hardware you flash it to:",
+        "hw_1": "The <strong>STC12C5A60S2 is a 5&nbsp;V part</strong> (3.5&ndash;5.5&nbsp;V). "
+                "The <strong>STC12LE5A60S2 is not</strong> (2.1&ndash;3.6&nbsp;V) and 5&nbsp;V "
+                "will destroy it. Check the marking on your chip.",
+        "hw_2": "A wrong <code>FOSC</code> produces working code that keeps the wrong time. "
+                "Verify it against a clock before trusting anything time-critical.",
+        "hw_3": "Nothing here is validated for safety-critical, medical or industrial use.",
+        "licence": "Licence",
+        "licence_text":
+            "This service is free software under the MIT licence. It bundles the SDCC "
+            "compiler, which is GPL-2.0-or-later.",
+        "output_yours": "What you compile here is yours.",
+        "output_text":
+            "SDCC is GPL, but its runtime libraries and headers &mdash; the ones your program "
+            "actually links against &mdash; carry an explicit exception:",
+        "source_offer":
+            "The SDCC binaries are unmodified, from Debian bullseye. Corresponding source: ",
+        "components": "Third-party components",
+        "affil": "Not affiliated",
+        "affil_text":
+            "Not affiliated with, endorsed by or connected to STC MCU Limited (Hongjing "
+            "Technology), the SDCC project, or the LEGO Group. All trademarks belong to "
+            "their respective owners.",
+        "close": "Close",
+    },
+    "de": {
+        "tagline": "Übersetzt C nach Intel HEX für den STC12C5A60S2 und andere 8051-Typen. "
+                   "Die Compiler-Seite eines Scratch-Blöcke-nach-8051-Backends für BrickWright.",
+        "provider": "Anbieter",
+        "contact": "Kontakt",
+        "email": "E-Mail",
+        "phone": "Telefon",
+        "project": "Projekt",
+        "privacy": "Datenschutz",
+        "privacy_text":
+            "Eingesendeter Quelltext wird in einem flüchtigen Container übersetzt; das "
+            "Arbeitsverzeichnis wird gelöscht, sobald die Antwort verschickt ist. Es wird "
+            "nichts gespeichert, in eine Datenbank gelegt oder anderweitig verwendet. Keine "
+            "Cookies, keine Analyse, kein Tracking. Der Hosting-Anbieter kann übliche "
+            "Verbindungsdaten wie IP-Adresse und Zeitstempel in seinen eigenen Protokollen "
+            "vorhalten.",
+        "disclaimer": "Haftungsausschluss",
+        "disclaimer_text":
+            "Diese Software wird \u201ewie besehen\u201c zur Verfügung gestellt, ohne jegliche "
+            "ausdrückliche oder stillschweigende Gewährleistung, insbesondere der "
+            "Marktgängigkeit, Eignung für einen bestimmten Zweck oder der Nichtverletzung "
+            "von Rechten Dritter. In keinem Fall haften die Autor:innen für Ansprüche, "
+            "Schäden oder sonstige Haftungen, die sich aus oder im Zusammenhang mit der "
+            "Software oder deren Nutzung ergeben.",
+        "hardware": "Sie sind selbst dafür verantwortlich, was Sie flashen und auf welche Hardware:",
+        "hw_1": "Der <strong>STC12C5A60S2 ist ein 5-V-Typ</strong> (3,5&ndash;5,5&nbsp;V). Der "
+                "<strong>STC12LE5A60S2 ist es nicht</strong> (2,1&ndash;3,6&nbsp;V), 5&nbsp;V "
+                "zerstören ihn. Prüfen Sie den Aufdruck auf dem Chip.",
+        "hw_2": "Ein falsches <code>FOSC</code> ergibt lauffähigen Code mit falschen Zeiten. "
+                "Vor zeitkritischem Einsatz gegen eine Uhr prüfen.",
+        "hw_3": "Nichts hiervon ist für sicherheitskritische, medizinische oder industrielle "
+                "Anwendungen geprüft.",
+        "licence": "Lizenz",
+        "licence_text":
+            "Dieser Dienst ist freie Software unter der MIT-Lizenz. Er bündelt den "
+            "SDCC-Compiler, der unter GPL-2.0-or-later steht.",
+        "output_yours": "Was Sie hier übersetzen, gehört Ihnen.",
+        "output_text":
+            "SDCC steht unter der GPL, seine Laufzeitbibliotheken und Header &mdash; also das, "
+            "wogegen Ihr Programm tatsächlich gelinkt wird &mdash; tragen jedoch eine "
+            "ausdrückliche Ausnahme:",
+        "source_offer":
+            "Die SDCC-Binaries stammen unverändert aus Debian bullseye. Zugehöriger Quelltext: ",
+        "components": "Fremdkomponenten",
+        "affil": "Keine Verbindung",
+        "affil_text":
+            "Keine Verbindung zu, Billigung durch oder Zugehörigkeit zu STC MCU Limited "
+            "(Hongjing Technology), dem SDCC-Projekt oder der LEGO-Gruppe. Alle Marken "
+            "gehören ihren jeweiligen Inhabern.",
+        "close": "Schließen",
+    },
+}
+
+REPO_LINKS = (
+    '<a href="https://github.com/CrispStrobe" target=_blank rel=noopener>CrispStrobe</a> &middot; '
+    '<a href="https://github.com/CrispStrobe/stc-compiler" target=_blank rel=noopener>stc-compiler</a> &middot; '
+    '<a href="https://github.com/CrispStrobe/stc12c5a60s2-lab" target=_blank rel=noopener>stc12c5a60s2-lab</a> &middot; '
+    '<a href="https://github.com/CrispStrobe/brickwright" target=_blank rel=noopener>BrickWright</a> &middot; '
+    '<a href="https://github.com/CrispStrobe/legacy-lego-compiler" target=_blank rel=noopener>legacy-lego-compiler</a>'
+)
+
+
+def about_pane(lang: str) -> str:
+    """One language's worth of About content."""
+    s = TEXT[lang]
+    address = "<br>".join(html.escape(line) for line in PROVIDER_ADDRESS.splitlines() if line.strip())
+    mail = html.escape(PROVIDER_EMAIL)
+    tel = html.escape(PROVIDER_PHONE)
+    tel_href = "tel:" + re.sub(r"[^+0-9]", "", PROVIDER_PHONE)
+
+    rows = "".join(
+        f"<tr><td>{what}</td><td><a href='{url}' target=_blank rel=noopener>{lic}</a></td></tr>"
+        for what, lic, url in LICENCE_ROWS
     )
+
+    return f"""<div class=pane data-lang="{lang}">
+  <p class=dim>{s['tagline']}</p>
+
+  <h3>{s['provider']}</h3>
+  <address><strong>{html.escape(PROVIDER_NAME)}</strong><br>{address}</address>
+
+  <h3>{s['contact']}</h3>
+  <p>{s['email']}: <a href="mailto:{mail}">{mail}</a><br>
+     {s['phone']}: <a href="{tel_href}">{tel}</a></p>
+
+  <h3>{s['project']}</h3>
+  <p>{REPO_LINKS}</p>
+
+  <h3>{s['privacy']}</h3>
+  <p>{s['privacy_text']}</p>
+
+  <h3>{s['disclaimer']}</h3>
+  <p>{s['disclaimer_text']}</p>
+  <p>{s['hardware']}</p>
+  <ul><li>{s['hw_1']}</li><li>{s['hw_2']}</li><li>{s['hw_3']}</li></ul>
+
+  <h3>{s['licence']}</h3>
+  <p>{s['licence_text']}</p>
+  <p><strong>{s['output_yours']}</strong> {s['output_text']}</p>
+  <blockquote>{LINKING_EXCEPTION}</blockquote>
+  <p>{s['source_offer']}<code>apt-get source sdcc={SDCC_VERSION_LABEL}</code> &middot;
+     <a href="https://github.com/CrispStrobe/stc-compiler/blob/main/NOTICE.md"
+        target=_blank rel=noopener>NOTICE.md</a></p>
+
+  <h3>{s['components']}</h3>
+  <table>{rows}</table>
+
+  <h3>{s['affil']}</h3>
+  <p>{s['affil_text']}</p>
+</div>"""
+
+
+def about_html() -> str:
+    return about_pane("en") + about_pane("de")
 
 
 @app.get("/health")
@@ -369,12 +579,26 @@ PAGE = r"""<!doctype html>
   dialog address { font-style:normal; font-size:13px; line-height:1.65; color:#c8cedb; }
   dialog blockquote { margin:8px 0; padding:8px 12px; border-left:2px solid #3b82f6;
                       background:#14161a; font-size:12.5px; color:#b9c0cc; }
+  .sheet-head { display:flex; align-items:center; gap:12px; padding:18px 26px 12px;
+               border-bottom:1px solid #2a2e37; }
+  .sheet-head h2 { margin:0 auto 0 0; font-size:17px; }
+  .langs { display:flex; gap:4px; }
+  button.lang { background:none; border:1px solid #2a2e37; color:#8a91a0;
+                border-radius:6px; padding:4px 10px; font-size:12px; cursor:pointer; }
+  button.lang.on { color:#e6e6e6; border-color:#3b82f6; }
+  .pane[hidden] { display:none; }
   .sheet-foot { display:flex; justify-content:flex-end; gap:8px;
                 padding:12px 26px; border-top:1px solid #2a2e37; background:#14161a; }
   code { font:12px ui-monospace,SFMono-Regular,Menlo,monospace; color:#b9c0cc; }
 </style></head><body>
 <header>
   <h1>stc-compiler <small>C &rarr; Intel HEX for STC12 / 8051, via SDCC</small></h1>
+  <label>language
+    <select id=language>
+      <option value=pseudocode>Pseudocode</option>
+      <option value=c selected>C</option>
+    </select>
+  </label>
   <label>target
     <select id=target>
       <option value=stc12c5a60s2>STC12C5A60S2</option>
@@ -401,6 +625,7 @@ PAGE = r"""<!doctype html>
   <aside>
     <div id=tabs>
       <button class=on data-pane=out>Output</button>
+      <button data-pane=cgen hidden>C</button>
       <button data-pane=mem>Memory</button>
       <button data-pane=log>Log</button>
     </div>
@@ -409,6 +634,7 @@ PAGE = r"""<!doctype html>
 <code>/download</code> for the raw file.
 
 See <a href="/docs">/docs</a> for the schema and <a href="/health">/health</a> for the SDCC version.</pre>
+      <pre id=cgen hidden></pre>
       <pre id=mem hidden></pre>
       <pre id=log hidden></pre>
     </div>
@@ -416,66 +642,14 @@ See <a href="/docs">/docs</a> for the schema and <a href="/health">/health</a> f
 </main>
 
 <dialog id=about>
-  <div class=sheet>
+  <div class=sheet-head>
     <h2>stc-compiler</h2>
-    <p class=dim>Compiles C to Intel HEX for the STC12C5A60S2 and other 8051 parts.
-    The compile side of a Scratch-blocks-to-8051 back-end for BrickWright.</p>
-
-    <h3>Made by</h3>
-    <p><a href="https://github.com/CrispStrobe" target=_blank rel=noopener>CrispStrobe</a> &middot;
-       <a href="https://github.com/CrispStrobe/stc-compiler" target=_blank rel=noopener>this service</a> &middot;
-       <a href="https://github.com/CrispStrobe/stc12c5a60s2-lab" target=_blank rel=noopener>hardware guide</a> &middot;
-       <a href="https://github.com/CrispStrobe/brickwright" target=_blank rel=noopener>BrickWright</a> &middot;
-       <a href="https://github.com/CrispStrobe/legacy-lego-compiler" target=_blank rel=noopener>LEGO compiler</a></p>
-
-    <h3>Licences</h3>
-    <table>
-      <tr><td>This service &mdash; API, UI, build scripts</td><td>MIT</td></tr>
-      <tr><td><a href="https://sdcc.sourceforge.net/" target=_blank rel=noopener>SDCC</a> 4.0.0 &mdash;
-              <code>sdcc</code>, <code>sdcpp</code>, <code>sdas8051</code>, <code>sdld</code>,
-              <code>packihx</code>, <code>makebin</code></td><td>GPL-2.0-or-later</td></tr>
-      <tr><td>SDCC runtime headers and libraries, including <code>mcs51/stc12.h</code></td>
-          <td>GPL-2.0-or-later<br>with linking exception</td></tr>
-      <tr><td><a href="https://github.com/fastapi/fastapi" target=_blank rel=noopener>FastAPI</a>,
-              <a href="https://github.com/pydantic/pydantic" target=_blank rel=noopener>Pydantic</a></td><td>MIT</td></tr>
-      <tr><td><a href="https://github.com/encode/starlette" target=_blank rel=noopener>Starlette</a>,
-              <a href="https://github.com/encode/uvicorn" target=_blank rel=noopener>Uvicorn</a></td><td>BSD-3-Clause</td></tr>
-    </table>
-
-    <p><strong>What you compile here is yours.</strong> SDCC is GPL, but its runtime
-    libraries and headers carry an explicit exception:</p>
-    <blockquote>As a special exception, if you link this library with other files, some of
-    which are compiled with SDCC, to produce an executable, this library does not by itself
-    cause the resulting executable to be covered by the GNU General Public License.</blockquote>
-    <p>The SDCC binaries come unmodified from Debian bullseye. Corresponding source:
-    <code>apt-get source sdcc=4.0.0+dfsg-2</code>. Full detail in
-    <a href="https://github.com/CrispStrobe/stc-compiler/blob/main/NOTICE.md" target=_blank rel=noopener>NOTICE.md</a>.</p>
-
-    <h3>Disclaimer</h3>
-    <p>Provided <strong>as is, without warranty of any kind</strong>, express or implied.
-    You are responsible for what you flash and for the hardware you flash it to.</p>
-    <ul>
-      <li>The <strong>STC12C5A60S2 is a 5&nbsp;V part</strong> (3.5&ndash;5.5&nbsp;V). The
-          <strong>STC12LE5A60S2 is not</strong> (2.1&ndash;3.6&nbsp;V) and 5&nbsp;V will
-          destroy it. Check the marking on your chip.</li>
-      <li>A wrong <code>FOSC</code> gives working code with wrong timing &mdash; verify it
-          against a clock before trusting anything time-critical.</li>
-      <li>Nothing here is checked for safety-critical, medical or industrial use.</li>
-    </ul>
-
-    <h3>Not affiliated</h3>
-    <p>Not affiliated with, endorsed by or connected to STC MCU Limited (Hongjing
-    Technology), the SDCC project, or the LEGO Group. All trademarks belong to their
-    respective owners.</p>
-
-    <h3>Data</h3>
-    <p>Source you submit is compiled in an ephemeral container and the workspace is
-    deleted as soon as the response is sent. Nothing is stored, logged to a database, or
-    used for anything else. The hosting provider may keep ordinary request metadata such
-    as IP address and timestamps in its own logs.</p>
-
-    __IMPRINT__
+    <div class=langs>
+      <button class="lang on" data-lang=en>English</button>
+      <button class=lang data-lang=de>Deutsch</button>
+    </div>
   </div>
+  <div class=sheet>__ABOUT__</div>
   <div class=sheet-foot><button class=primary id=aboutClose>Close</button></div>
 </dialog>
 
@@ -486,7 +660,7 @@ let image = null;          // {bytes: Uint8Array, filename: string}
 document.querySelectorAll('#tabs button').forEach(tab => {
   tab.onclick = () => {
     document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b === tab));
-    ['out', 'mem', 'log'].forEach(p => { $(p).hidden = (p !== tab.dataset.pane); });
+    ['out', 'cgen', 'mem', 'log'].forEach(p => { $(p).hidden = (p !== tab.dataset.pane); });
   };
 });
 
@@ -527,6 +701,7 @@ $('go').onclick = async () => {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         code: $('code').value,
+        language: $('language').value,
         target: $('target').value,
         fosc: parseInt($('fosc').value, 10) || null,
         format,
@@ -540,6 +715,8 @@ $('go').onclick = async () => {
       $('out').textContent = (format === 'bin')
         ? hexdump(image.bytes)
         : new TextDecoder().decode(image.bytes);
+      $('cgen').textContent = data.c || '';
+      document.querySelector('#tabs button[data-pane=cgen]').hidden = !data.c;
       $('mem').textContent = data.memory || '(none)';
       $('log').textContent = data.log || '(no warnings)';
       $('dl').disabled = false;
@@ -579,7 +756,35 @@ $('copy').onclick = async () => {
   setTimeout(() => { $('copy').textContent = previous; }, 1200);
 };
 
+const STARTERS = {c: $('code').value, pseudocode: __PSEUDO_EXAMPLE__};
+let lastLanguage = $('language').value;
+$('language').onchange = () => {
+  const next = $('language').value;
+  // Only clobber the editor if it still holds the untouched starter program.
+  if ($('code').value.trim() === (STARTERS[lastLanguage] || '').trim()) {
+    $('code').value = STARTERS[next];
+  }
+  lastLanguage = next;
+  $('fosc').disabled = (next === 'pseudocode');   // pseudocode carries CLOCK
+};
+$('language').onchange();
+
 $('aboutBtn').onclick = () => $('about').showModal();
+document.querySelectorAll('button.lang').forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll('button.lang').forEach(b => b.classList.toggle('on', b === btn));
+    document.querySelectorAll('#about .pane').forEach(pane => {
+      pane.hidden = (pane.dataset.lang !== btn.dataset.lang);
+    });
+    $('aboutClose').textContent = (btn.dataset.lang === 'de') ? 'Schlie\u00dfen' : 'Close';
+  };
+});
+// Start on the browser's language if it is German.
+if ((navigator.language || '').toLowerCase().startsWith('de')) {
+  document.querySelector('button.lang[data-lang=de]').click();
+} else {
+  document.querySelectorAll('#about .pane').forEach(p => { p.hidden = (p.dataset.lang !== 'en'); });
+}
 $('aboutClose').onclick = () => $('about').close();
 // Click outside the sheet closes it; <dialog> already handles Escape.
 $('about').addEventListener('click', event => {
@@ -599,4 +804,5 @@ async def index():
     # RCDATA inside <textarea> tolerates a bare "<", but "&" would be read as
     # an entity -- and the example has "&=" in it. Escape properly.
     return (PAGE.replace("__EXAMPLE__", html.escape(EXAMPLE))
-                .replace("__IMPRINT__", imprint_html()))
+                .replace("__PSEUDO_EXAMPLE__", json.dumps(stc_pseudocode.EXAMPLE))
+                .replace("__ABOUT__", about_html()))

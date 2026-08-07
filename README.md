@@ -60,6 +60,12 @@ Failure returns `{"success": false, "error": "<compiler output>"}`.
 The `memory` field is worth surfacing to users — it is how you catch an image
 quietly outgrowing 60 KB of flash or 248 bytes of stack.
 
+### `POST /transpile`
+
+Pseudocode in, C out, no compiler involved — for seeing exactly what the front
+end produced. Returns `c`, plus the resolved `part`, `clock`, `pins` and
+`variables`. Errors carry a `line`.
+
 ### `POST /download`
 
 Identical request body, but returns the **raw file** with a filename attached
@@ -119,6 +125,55 @@ generally needs one (§ 5 DDG, formerly TMG).
 FastAPI's generated OpenAPI documentation.
 
 ---
+
+## Pseudocode
+
+Set `"language": "pseudocode"` and the body goes through a BrickWright-style
+front end first. The dialect follows the conventions already used by
+[`sb3-creator`](https://github.com/CrispStrobe/sb3-creator)'s pseudocode —
+UPPERCASE for structure and control flow, lowercase for statements,
+indentation for nesting:
+
+```
+DEVICE STC12C5A60S2:
+  CLOCK 11059200
+  PIN led1 = P1.0 OUTPUT ACTIVE LOW
+  PIN led2 = P1.1 OUTPUT ACTIVE LOW
+  PIN button = P3.2 INPUT
+
+  WHEN started:
+    set counter to 0
+    FOREVER:
+      REPEAT 6:
+        turn on led1
+        turn off led2
+        wait 0.15 seconds
+        turn off led1
+        turn on led2
+        wait 0.15 seconds
+      change counter by 1
+      IF counter > 2 THEN:
+        set counter to 0
+```
+
+| Form | Notes |
+|---|---|
+| `DEVICE <part>:` | optional wrapper, like `SPRITE Name:` |
+| `CLOCK <hz>` / `CLOCK <n> MHz` | overrides the `fosc` request field |
+| `PIN <name> = P1.0 OUTPUT [ACTIVE LOW]` | `ACTIVE LOW` makes `turn on` drive 0 |
+| `PIN <name> = P3.2 INPUT` | readable in expressions |
+| `WHEN started:` | also accepts `WHEN flag clicked:` |
+| `FOREVER:` · `REPEAT n:` · `IF c THEN:` / `ELSE:` | indentation-scoped |
+| `turn on/off <pin>` · `set <pin> high/low` · `toggle <pin>` | |
+| `wait <n> seconds` / `<n> ms` | Timer 0, not a spin loop |
+| `set <v> to <e>` · `change <v> by <e>` | variables are 16-bit `int` |
+| `+ - * / %`, `= != < > <= >=`, `and or not` | `=` compares, as in Scratch |
+
+`ACTIVE LOW` is the point of the whole thing: a quasi-bidirectional 8051 pin
+sinks 20 mA but sources ~230 µA, so LEDs get wired active-low and `turn on`
+has to emit a `0`. The front end knows that, so the pseudocode never has to.
+
+Response includes the generated `c` alongside the image, so nothing is hidden.
 
 ## Targets
 

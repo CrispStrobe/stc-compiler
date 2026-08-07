@@ -204,6 +204,11 @@ check("example is HTML-escaped", "&amp;= ~0x80" in page)
 
 print("\nabout dialog")
 check("has an About control", 'id=aboutBtn' in page and '<dialog id=about>' in page)
+check("service provider address", "Nikolausstr. 5" in page and "70190 Stuttgart" in page)
+check("contact email and phone", "mailto:postmaster@crispstro.be" in page and 'href="tel:+49' in page)
+check("bilingual EN/DE panes", 'data-lang="en"' in page and 'data-lang="de"' in page)
+check("German section headings", "<h3>Anbieter</h3>" in page and "Haftungsausschluss" in page)
+check("links to the GPL-2 text", "gnu.org/licenses/old-licenses/gpl-2.0.html" in page)
 check("names the wrapper licence", "MIT" in page)
 check("names SDCC's licence", "GPL-2.0-or-later" in page)
 check("quotes the linking exception", "special exception" in page)
@@ -214,9 +219,75 @@ check("states non-affiliation", "Not affiliated with" in page)
 check("links to CrispStrobe", "github.com/CrispStrobe" in page)
 check("links to NOTICE.md", "NOTICE.md" in page)
 check("describes data handling", "deleted as soon as the response is sent" in page)
-imprint = "Impressum" in page
-print(f"  \033[36mINFO\033[0m  imprint block: "
-      + ("present" if imprint else "omitted (IMPRINT_* env vars not set)"))
+
+print("\npseudocode front end")
+PSEUDO = """DEVICE STC12C5A60S2:
+  CLOCK 11059200
+  PIN led1 = P1.0 OUTPUT ACTIVE LOW
+  PIN button = P3.2 INPUT
+
+  WHEN started:
+    set n to 0
+    FOREVER:
+      REPEAT 3:
+        turn on led1
+        wait 0.2 seconds
+        turn off led1
+        wait 0.2 seconds
+      change n by 1
+      IF n > 5 THEN:
+        set n to 0
+"""
+
+req = urllib.request.Request(f"{BASE}/transpile", json.dumps({"code": PSEUDO}).encode(),
+                             {"Content-Type": "application/json"})
+with urllib.request.urlopen(req, timeout=120) as response:
+    tr = json.load(response)
+check("/transpile succeeds", tr.get("success") is True, tr.get("error", "")[:60])
+check("reports the clock", tr.get("clock") == 11059200, str(tr.get("clock")))
+check("maps pins to SFRs", tr.get("pins", {}).get("led1", {}).get("sfr") == "P1_0")
+check("records active-low", tr.get("pins", {}).get("led1", {}).get("active_low") is True)
+check("keeps INPUT direction", tr.get("pins", {}).get("button", {}).get("direction") == "input")
+check("collects variables", tr.get("variables") == ["n"], str(tr.get("variables")))
+c = tr.get("c", "")
+check("emits push-pull setup", "P1M0 |=  0x01" in c)
+check("active-low off state", "P1_0 = 1;" in c)
+check("REPEAT becomes a for loop", "for (_i" in c)
+check("IF becomes an if", "if ((n > 5))" in c)
+
+result, elapsed = post({"code": PSEUDO, "language": "pseudocode"})
+check("pseudocode compiles to an image", result.get("success") is True,
+      result.get("error", "")[:60])
+check("returns the generated C too", bool(result.get("c")))
+image, errors = code_bytes(base64.b64decode(result["base64"]).decode())
+check("image checksums valid", not errors)
+check("reload matches CLOCK", reload_value(image) == 65536 - 11059200 // 12 // 1000)
+
+hi = post({"code": PSEUDO.replace("CLOCK 11059200", "CLOCK 22118400"),
+           "language": "pseudocode", "fosc": 11059200})[0]
+image, _ = code_bytes(base64.b64decode(hi["base64"]).decode())
+check("CLOCK overrides the fosc field",
+      reload_value(image) == 65536 - 22118400 // 12 // 1000)
+
+print("\npseudocode errors point at a line")
+for source, line_no, expect in [
+    ("WHEN started:\n  wobble the thing", 2, "do not understand"),
+    ("WHEN started:\n  turn on ghost", 2, "unknown pin"),
+    ("PIN b = P3.2 INPUT\nWHEN started:\n  turn on b", 3, "cannot be driven"),
+    ("PIN a = P1.0 OUTPUT\n", 1, "no 'WHEN started:'"),
+]:
+    result, _ = post({"code": source, "language": "pseudocode"})
+    ok = (result.get("success") is False and result.get("line") == line_no
+          and expect in result.get("error", ""))
+    check(f"{expect[:24]!r}", ok,
+          f"line {result.get('line')} (want {line_no}): {result.get('error','')[:44]}")
+
+check("unknown language rejected",
+      post({"code": "x", "language": "cobol"})[0].get("error", "").startswith("unknown language"))
+
+print("\nUI exposes the front end")
+check("language picker", "id=language" in page and 'value=pseudocode' in page)
+check("C tab for generated source", 'data-pane=cgen' in page)
 
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
