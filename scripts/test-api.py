@@ -202,5 +202,21 @@ check("has a format picker", "id=format" in page)
 check("hex-dumps binary output", "function hexdump" in page)
 check("example is HTML-escaped", "&amp;= ~0x80" in page)
 
+print("\nabout dialog")
+check("has an About control", 'id=aboutBtn' in page and '<dialog id=about>' in page)
+check("names the wrapper licence", "MIT" in page)
+check("names SDCC's licence", "GPL-2.0-or-later" in page)
+check("quotes the linking exception", "special exception" in page)
+check("gives corresponding source", "apt-get source sdcc=" in page)
+check("has a warranty disclaimer", "without warranty of any kind" in page)
+check("warns about the 5V vs LE part", "STC12LE5A60S2 is not" in page)
+check("states non-affiliation", "Not affiliated with" in page)
+check("links to CrispStrobe", "github.com/CrispStrobe" in page)
+check("links to NOTICE.md", "NOTICE.md" in page)
+check("describes data handling", "deleted as soon as the response is sent" in page)
+imprint = "Impressum" in page
+print(f"  \033[36mINFO\033[0m  imprint block: "
+      + ("present" if imprint else "omitted (IMPRINT_* env vars not set)"))
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

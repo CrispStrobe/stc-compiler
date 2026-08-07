@@ -228,6 +228,40 @@ async def download(req: CompileReq):
     )
 
 
+# --------------------------------------------------------------- imprint
+# Site operator details for the About dialog. Kept in the environment rather
+# than the source so the address is never committed to a public repo, and so
+# a fork deploying its own instance does not publish someone else's details.
+#
+#   vercel env add IMPRINT_NAME production
+#   vercel env add IMPRINT_ADDRESS production   # newlines allowed
+#   vercel env add IMPRINT_EMAIL production
+#
+# Germany requires this on a publicly reachable service (§5 DDG, formerly TMG).
+# If nothing is set the section is omitted rather than showing a placeholder.
+def imprint_html() -> str:
+    name = os.environ.get("IMPRINT_NAME", "").strip()
+    address = os.environ.get("IMPRINT_ADDRESS", "").strip()
+    email = os.environ.get("IMPRINT_EMAIL", "").strip()
+    if not (name or address or email):
+        return ""
+
+    rows = []
+    if name:
+        rows.append(f"<strong>{html.escape(name)}</strong>")
+    if address:
+        rows.append("<br>".join(html.escape(line) for line in address.splitlines() if line.strip()))
+    if email:
+        safe = html.escape(email)
+        rows.append(f'<a href="mailto:{safe}">{safe}</a>')
+
+    return (
+        '<h3>Imprint / Impressum</h3>'
+        '<p class=dim>Angaben gem\u00e4\u00df \u00a7 5 DDG \u00b7 responsible for content</p>'
+        "<address>" + "<br>".join(rows) + "</address>"
+    )
+
+
 @app.get("/health")
 async def health():
     stage_toolchain()
@@ -316,6 +350,28 @@ PAGE = r"""<!doctype html>
   label { color:#8a91a0; font-size:12px; display:flex; align-items:center; gap:5px; }
   .ok { color:#4ade80; } .err { color:#f87171; } .dim { color:#8a91a0; }
   a { color:#7aa2f7; }
+  button.link { background:none; border:0; color:#8a91a0; font-size:13px;
+                cursor:pointer; text-decoration:underline; padding:4px; }
+  button.link:hover { color:#e6e6e6; }
+  dialog { background:#181b21; color:#e6e6e6; border:1px solid #2a2e37; border-radius:10px;
+           max-width:640px; width:calc(100% - 32px); padding:0; }
+  dialog::backdrop { background:rgba(0,0,0,.6); }
+  .sheet { padding:22px 26px 26px; max-height:78vh; overflow:auto; }
+  dialog h2 { margin:0 0 4px; font-size:17px; }
+  dialog h3 { margin:22px 0 6px; font-size:13px; text-transform:uppercase;
+              letter-spacing:.06em; color:#8a91a0; }
+  dialog p, dialog li { font-size:13px; line-height:1.6; color:#c8cedb; margin:6px 0; }
+  dialog ul { margin:6px 0; padding-left:18px; }
+  dialog table { width:100%; border-collapse:collapse; margin:8px 0; font-size:12.5px; }
+  dialog td { padding:5px 8px 5px 0; border-bottom:1px solid #23272f;
+              vertical-align:top; color:#c8cedb; }
+  dialog td:last-child { text-align:right; white-space:nowrap; color:#8a91a0; }
+  dialog address { font-style:normal; font-size:13px; line-height:1.65; color:#c8cedb; }
+  dialog blockquote { margin:8px 0; padding:8px 12px; border-left:2px solid #3b82f6;
+                      background:#14161a; font-size:12.5px; color:#b9c0cc; }
+  .sheet-foot { display:flex; justify-content:flex-end; gap:8px;
+                padding:12px 26px; border-top:1px solid #2a2e37; background:#14161a; }
+  code { font:12px ui-monospace,SFMono-Regular,Menlo,monospace; color:#b9c0cc; }
 </style></head><body>
 <header>
   <h1>stc-compiler <small>C &rarr; Intel HEX for STC12 / 8051, via SDCC</small></h1>
@@ -338,6 +394,7 @@ PAGE = r"""<!doctype html>
   <button class=ghost id=dl disabled>Download</button>
   <button class=ghost id=copy disabled>Copy</button>
   <span id=status class=dim>ready</span>
+  <button class=link id=aboutBtn title="Licences, disclaimer and imprint">About</button>
 </header>
 <main>
   <textarea id=code spellcheck=false>__EXAMPLE__</textarea>
@@ -357,6 +414,71 @@ See <a href="/docs">/docs</a> for the schema and <a href="/health">/health</a> f
     </div>
   </aside>
 </main>
+
+<dialog id=about>
+  <div class=sheet>
+    <h2>stc-compiler</h2>
+    <p class=dim>Compiles C to Intel HEX for the STC12C5A60S2 and other 8051 parts.
+    The compile side of a Scratch-blocks-to-8051 back-end for BrickWright.</p>
+
+    <h3>Made by</h3>
+    <p><a href="https://github.com/CrispStrobe" target=_blank rel=noopener>CrispStrobe</a> &middot;
+       <a href="https://github.com/CrispStrobe/stc-compiler" target=_blank rel=noopener>this service</a> &middot;
+       <a href="https://github.com/CrispStrobe/stc12c5a60s2-lab" target=_blank rel=noopener>hardware guide</a> &middot;
+       <a href="https://github.com/CrispStrobe/brickwright" target=_blank rel=noopener>BrickWright</a> &middot;
+       <a href="https://github.com/CrispStrobe/legacy-lego-compiler" target=_blank rel=noopener>LEGO compiler</a></p>
+
+    <h3>Licences</h3>
+    <table>
+      <tr><td>This service &mdash; API, UI, build scripts</td><td>MIT</td></tr>
+      <tr><td><a href="https://sdcc.sourceforge.net/" target=_blank rel=noopener>SDCC</a> 4.0.0 &mdash;
+              <code>sdcc</code>, <code>sdcpp</code>, <code>sdas8051</code>, <code>sdld</code>,
+              <code>packihx</code>, <code>makebin</code></td><td>GPL-2.0-or-later</td></tr>
+      <tr><td>SDCC runtime headers and libraries, including <code>mcs51/stc12.h</code></td>
+          <td>GPL-2.0-or-later<br>with linking exception</td></tr>
+      <tr><td><a href="https://github.com/fastapi/fastapi" target=_blank rel=noopener>FastAPI</a>,
+              <a href="https://github.com/pydantic/pydantic" target=_blank rel=noopener>Pydantic</a></td><td>MIT</td></tr>
+      <tr><td><a href="https://github.com/encode/starlette" target=_blank rel=noopener>Starlette</a>,
+              <a href="https://github.com/encode/uvicorn" target=_blank rel=noopener>Uvicorn</a></td><td>BSD-3-Clause</td></tr>
+    </table>
+
+    <p><strong>What you compile here is yours.</strong> SDCC is GPL, but its runtime
+    libraries and headers carry an explicit exception:</p>
+    <blockquote>As a special exception, if you link this library with other files, some of
+    which are compiled with SDCC, to produce an executable, this library does not by itself
+    cause the resulting executable to be covered by the GNU General Public License.</blockquote>
+    <p>The SDCC binaries come unmodified from Debian bullseye. Corresponding source:
+    <code>apt-get source sdcc=4.0.0+dfsg-2</code>. Full detail in
+    <a href="https://github.com/CrispStrobe/stc-compiler/blob/main/NOTICE.md" target=_blank rel=noopener>NOTICE.md</a>.</p>
+
+    <h3>Disclaimer</h3>
+    <p>Provided <strong>as is, without warranty of any kind</strong>, express or implied.
+    You are responsible for what you flash and for the hardware you flash it to.</p>
+    <ul>
+      <li>The <strong>STC12C5A60S2 is a 5&nbsp;V part</strong> (3.5&ndash;5.5&nbsp;V). The
+          <strong>STC12LE5A60S2 is not</strong> (2.1&ndash;3.6&nbsp;V) and 5&nbsp;V will
+          destroy it. Check the marking on your chip.</li>
+      <li>A wrong <code>FOSC</code> gives working code with wrong timing &mdash; verify it
+          against a clock before trusting anything time-critical.</li>
+      <li>Nothing here is checked for safety-critical, medical or industrial use.</li>
+    </ul>
+
+    <h3>Not affiliated</h3>
+    <p>Not affiliated with, endorsed by or connected to STC MCU Limited (Hongjing
+    Technology), the SDCC project, or the LEGO Group. All trademarks belong to their
+    respective owners.</p>
+
+    <h3>Data</h3>
+    <p>Source you submit is compiled in an ephemeral container and the workspace is
+    deleted as soon as the response is sent. Nothing is stored, logged to a database, or
+    used for anything else. The hosting provider may keep ordinary request metadata such
+    as IP address and timestamps in its own logs.</p>
+
+    __IMPRINT__
+  </div>
+  <div class=sheet-foot><button class=primary id=aboutClose>Close</button></div>
+</dialog>
+
 <script>
 const $ = id => document.getElementById(id);
 let image = null;          // {bytes: Uint8Array, filename: string}
@@ -457,6 +579,13 @@ $('copy').onclick = async () => {
   setTimeout(() => { $('copy').textContent = previous; }, 1200);
 };
 
+$('aboutBtn').onclick = () => $('about').showModal();
+$('aboutClose').onclick = () => $('about').close();
+// Click outside the sheet closes it; <dialog> already handles Escape.
+$('about').addEventListener('click', event => {
+  if (event.target === $('about')) $('about').close();
+});
+
 // Cmd/Ctrl-Enter compiles, like every other editor.
 $('code').addEventListener('keydown', event => {
   if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); $('go').click(); }
@@ -469,4 +598,5 @@ $('code').addEventListener('keydown', event => {
 async def index():
     # RCDATA inside <textarea> tolerates a bare "<", but "&" would be read as
     # an entity -- and the example has "&=" in it. Escape properly.
-    return PAGE.replace("__EXAMPLE__", html.escape(EXAMPLE))
+    return (PAGE.replace("__EXAMPLE__", html.escape(EXAMPLE))
+                .replace("__IMPRINT__", imprint_html()))

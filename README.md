@@ -91,6 +91,29 @@ Pick a target, clock and output format, compile with the button or
 **Copy** it to the clipboard. Output, SDCC's memory map and the build log are
 on separate tabs; `.bin` is shown as a hex dump rather than mojibake.
 
+**About dialog** — an *About* link in the header opens a modal listing every
+licence (this wrapper MIT; SDCC GPL-2.0-or-later; its runtime headers with the
+linking exception, quoted in full), the corresponding-source pointer, links to
+the related CrispStrobe repositories, a warranty and hardware disclaimer, a
+non-affiliation statement, what happens to submitted source, and the imprint.
+
+### Imprint / Impressum
+
+The operator details in the About dialog come from environment variables, so a
+real postal address is never committed to a public repository and a fork
+deploying its own instance does not publish someone else's details:
+
+```bash
+vercel env add IMPRINT_NAME production      # e.g. Jane Doe
+vercel env add IMPRINT_ADDRESS production   # multi-line is fine
+vercel env add IMPRINT_EMAIL production
+vercel --prod                               # redeploy to pick them up
+```
+
+If none are set the section is omitted entirely rather than rendering a
+placeholder. Note that a publicly reachable service operated from Germany
+generally needs one (§ 5 DDG, formerly TMG).
+
 ### `GET /docs`
 
 FastAPI's generated OpenAPI documentation.
