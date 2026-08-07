@@ -123,10 +123,14 @@ def sfr_addresses(header: pathlib.Path | None = None) -> dict[str, int]:
 
 
 class Translation:
-    def __init__(self, text: str, changes: dict, unresolved: list):
+    def __init__(self, text: str, changes: dict, unresolved: list,
+                 warnings: list | None = None):
         self.text = text
         self.changes = changes
         self.unresolved = unresolved
+        # Things that will compile but may not behave. Worth more attention
+        # than the errors, because nothing else will ever surface them.
+        self.warnings = warnings or []
 
 
 def translate(source: str, known: dict[str, int] | None = None,
@@ -135,6 +139,7 @@ def translate(source: str, known: dict[str, int] | None = None,
     bits = provided_bits() if bits is None else bits
     changes: dict[str, int] = {}
     unresolved: list[str] = []
+    warnings: list[str] = []
 
     def bump(kind, n=1):
         if n:
@@ -254,7 +259,46 @@ def translate(source: str, known: dict[str, int] | None = None,
     source = re.sub(r"^([ \t]*(?:\w+\s+)*?\w+)\s+(\w+(?:\[[^\]]*\])?)\s+_at_\s+"
                     r"(0x[0-9A-Fa-f]+|\d+)\s*;", fix_at, source, flags=re.M)
 
-    return Translation(source, changes, unresolved)
+    # --- old-style parameter lists ---------------------------------------
+    # Keil accepts `int f(int a, b)`, carrying the type across; SDCC wants each
+    # parameter typed. 43 occurrences in the survey, and the cause of most of
+    # the "too many parameters" failures.
+    def fix_params(match):
+        head, params, tail = match.group(1), match.group(2), match.group(3)
+        parts = [p.strip() for p in params.split(",")]
+        if len(parts) < 2 or " " not in parts[0]:
+            return match.group(0)          # a call, or already fully typed
+        last_type = parts[0].rsplit(" ", 1)[0].strip()
+        out, fixed = [parts[0]], False
+        for part in parts[1:]:
+            if re.fullmatch(r"[A-Za-z_]\w*", part):
+                out.append(f"{last_type} {part}")
+                fixed = True
+            else:
+                out.append(part)
+                if " " in part:
+                    last_type = part.rsplit(" ", 1)[0].strip()
+        if not fixed:
+            return match.group(0)
+        bump("old-style-params")
+        return f"{head}({', '.join(out)}){tail}"
+
+    source = re.sub(r"(\b\w+[ \t*]+\w+[ \t]*)\(([^)(;]*)\)([ \t]*[;{])",
+                    fix_params, source)
+
+    # --- ISR visibility ---------------------------------------------------
+    # SDCC only emits an interrupt vector if the ISR (or a prototype) is visible
+    # in the translation unit holding main(). Keil links vectors separately, so
+    # Keil projects routinely put ISRs in their own file -- 24 of the 37
+    # ISR-defining files in the survey do. That compiles cleanly under SDCC and
+    # the interrupt simply never fires, which no error will ever tell you.
+    if re.search(r"__interrupt\s*\(", source) and not re.search(r"\bmain\s*\(", source):
+        warnings.append(
+            "this file defines an interrupt handler but has no main(); SDCC only "
+            "emits the vector if the handler or a prototype is visible in the "
+            "file containing main(), so copy the prototype there")
+
+    return Translation(source, changes, unresolved, warnings)
 
 
 def shim_args() -> list[str]:

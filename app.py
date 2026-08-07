@@ -119,6 +119,7 @@ def build(req: CompileReq) -> dict:
     generated_c = None
     keil_changes: dict = {}
     keil_unresolved: list = []
+    keil_warnings: list = []
     if req.language.lower() in ("pseudocode", "pseudo", "bw"):
         try:
             generated_c, program = stc_pseudocode.transpile(req.code)
@@ -134,6 +135,7 @@ def build(req: CompileReq) -> dict:
         generated_c = result.text
         keil_changes = result.changes
         keil_unresolved = result.unresolved
+        keil_warnings = result.warnings
         req = req.model_copy(update={"code": generated_c})
     elif req.language.lower() != "c":
         return {"success": False,
@@ -240,6 +242,7 @@ def build(req: CompileReq) -> dict:
             "c": generated_c,          # None unless the source was translated
             "translated": keil_changes or None,
             "unresolved": keil_unresolved or None,
+            "warnings": keil_warnings or None,
             "disassembly": listing,     # None unless disassemble was requested
             "base64": base64.b64encode(blob).decode("ascii"),
             "filename": name,
@@ -298,8 +301,8 @@ async def translate_keil(req: CompileReq):
     """Keil C51 in, SDCC-dialect C out. No compiler involved."""
     stage_toolchain()
     result = keil2sdcc.translate(req.code)
-    return {"success": True, "c": result.text,
-            "translated": result.changes, "unresolved": result.unresolved}
+    return {"success": True, "c": result.text, "translated": result.changes,
+            "unresolved": result.unresolved, "warnings": result.warnings}
 
 
 @app.post("/decompile")
