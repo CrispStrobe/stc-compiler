@@ -40,9 +40,29 @@ def to_asm(entries, memory) -> str:
             targets.add(int(value, 16))
     targets &= starts                      # only label real instruction starts
 
+    # A displacement or page-relative branch whose target is not a labelable
+    # instruction start is data that happened to decode as a branch. Handing
+    # the assembler a bare number there invites frame games (displacements
+    # come out short by 2, AJMPs trip 2K-page relocation errors); emitting the
+    # raw bytes as .db is byte-exact by construction. LJMP/LCALL keep numeric
+    # operands -- a 16-bit absolute encodes the same either way.
+    frame_sensitive = ("SJMP", "JZ", "JNZ", "JC", "JNC", "JB", "JNB", "JBC",
+                       "CJNE", "DJNZ", "AJMP", "ACALL")
+
     lines = [".area CODE (ABS)"]
     expected = None
     for address, raw, text in entries:
+        if text.startswith(frame_sensitive):
+            operands = re.findall(r"0x([0-9A-F]{4})\b", text)
+            if operands and int(operands[-1], 16) not in targets:
+                text = ".db   " + ", ".join(f"0x{b:02X}" for b in raw)
+        if text.startswith(("AJMP", "ACALL")) \
+                and (address + 2) >> 11 != address >> 11:
+            # An AJMP/ACALL in the last bytes of a 2K page targets the NEXT
+            # page (the 8051 pages by the following instruction's address);
+            # sdld's page check uses the instruction's own page and rejects
+            # this legitimate encoding, so emit the bytes directly.
+            text = ".db   " + ", ".join(f"0x{b:02X}" for b in raw)
         if expected is None or address != expected:
             lines.append(f"\t.org 0x{address:04X}")
         if address in targets:

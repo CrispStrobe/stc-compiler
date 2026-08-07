@@ -13,6 +13,8 @@ Verified against SDCC's own assembly listing for the same program: see
 
 from __future__ import annotations
 
+import re
+
 # ------------------------------------------------------------------ SFR names
 # STC12C5A60S2. Addresses cross-checked against SDCC's mcs51/stc12.h.
 SFR = {
@@ -238,36 +240,82 @@ def parse_hex(text: str) -> dict[int, int]:
 
 # ------------------------------------------------------------------ disassemble
 
-def disassemble(memory: dict[int, int], start: int | None = None,
-                end: int | None = None) -> list[tuple[int, bytes, str]]:
-    """Linear sweep. Returns (address, raw bytes, text) per instruction.
+# Mnemonics whose 16-bit-looking operand is a real control-flow target. Only
+# these seed sync points: a `MOV DPTR, #imm16` is as often a table base as a
+# code address, and anchoring on it could split live instructions.
+_BRANCHES = ("LJMP", "AJMP", "SJMP", "LCALL", "ACALL", "JZ", "JNZ", "JC",
+             "JNC", "JB", "JNB", "JBC", "CJNE", "DJNZ")
 
-    Linear rather than following control flow, because SDCC lays code out
-    contiguously and a sweep is what you want when comparing against a
-    compiler listing. Data embedded in the code stream would decode as
-    nonsense, which is a limitation worth knowing rather than hiding.
-    """
-    if not memory:
-        return []
-    address = min(memory) if start is None else start
-    last = max(memory) if end is None else end
-    out = []
+
+def _sweep(memory: dict[int, int], first: int, last: int,
+           anchors: set[int]) -> tuple[list, set, set]:
+    """One linear pass. Anchors are addresses proven to be instruction
+    starts; an instruction that would span one is cut short and emitted as
+    `.db` bytes, and decoding re-phases at the anchor."""
+    entries: list[tuple[int, bytes, str]] = []
+    starts: set[int] = set()
+    targets: set[int] = set()
+    address = first
     while address <= last:
         opcode = memory.get(address)
         if opcode is None:
             address += 1
             continue
         length, render = TABLE[opcode]
+        conflict = next((a for a in range(address + 1, address + length)
+                         if a in anchors), None)
+        if conflict is not None:
+            raw = bytes(memory.get(a, 0) for a in range(address, conflict))
+            entries.append((address, raw,
+                            ".db   " + ", ".join(f"0x{b:02X}" for b in raw)))
+            address = conflict
+            continue
         raw = bytes(memory.get(address + i, 0) for i in range(length))
-        operands = raw[1:]
         following = (address + length) & 0xFFFF
         try:
-            text = render(operands, following)
+            text = render(raw[1:], following)
         except IndexError:
-            text = f".db   0x{opcode:02X}"      # truncated at the end of the image
-        out.append((address, raw, text))
+            text = f".db   0x{opcode:02X}"    # truncated at the end of the image
+        entries.append((address, raw, text))
+        starts.add(address)
+        if text.startswith(_BRANCHES):
+            for value in re.findall(r"0x([0-9A-Fa-f]{4})\b", text):
+                targets.add(int(value, 16))
         address += length
-    return out
+    return entries, starts, targets
+
+
+def disassemble(memory: dict[int, int], start: int | None = None,
+                end: int | None = None,
+                sync: bool = True) -> list[tuple[int, bytes, str]]:
+    """Linear sweep with branch-target sync points.
+
+    Linear because SDCC lays code out contiguously and a sweep is what you
+    want when comparing against a compiler listing. Keil, though, interleaves
+    jump and font tables between functions; data in the code stream decodes
+    as nonsense and desynchronises every boundary after it. The fix uses the
+    branches themselves as ground truth: a target landing mid-instruction
+    *proves* the sweep is out of phase there, so the target becomes an anchor
+    -- decoding restarts at it and the orphaned bytes before it are emitted
+    as `.db`. Iterate until no new anchors appear (anchors only grow, so this
+    terminates). Images with no embedded data never gain an anchor and come
+    out exactly as the plain sweep did.
+    """
+    if not memory:
+        return []
+    first = min(memory) if start is None else start
+    last = max(memory) if end is None else end
+    anchors: set[int] = set()
+    while True:
+        entries, starts, targets = _sweep(memory, first, last, anchors)
+        if not sync:
+            return entries
+        fresh = {t for t in targets
+                 if first <= t <= last and t in memory
+                 and t not in starts and t not in anchors}
+        if not fresh:
+            return entries
+        anchors |= fresh
 
 
 def format_listing(entries: list[tuple[int, bytes, str]]) -> str:
