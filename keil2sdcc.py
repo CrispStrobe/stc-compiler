@@ -30,26 +30,69 @@ specifier against many as an identifier -- not worth the false positives.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import re
 
 SHIM_DIR = pathlib.Path(__file__).parent / "keil-shim"
 
+# Where SDCC's own mcs51 headers live. They are the source of every SFR address
+# the sbit rewrite needs, so getting this wrong silently turns every
+# `sbit LED = P1^0;` into an unresolved one. SDCC_INCLUDE_DIR lets a deployment
+# point at a staged toolchain -- on Vercel the compiler is copied to /tmp.
+SDCC_INCLUDE_DIRS = [
+    os.environ["SDCC_INCLUDE_DIR"]] if os.environ.get("SDCC_INCLUDE_DIR") else []
+SDCC_INCLUDE_DIRS += [
+    "/tmp/sdcc/share/sdcc/include/mcs51",
+    "/opt/homebrew/share/sdcc/include/mcs51",
+    "/usr/share/sdcc/include/mcs51",
+    "/usr/local/share/sdcc/include/mcs51",
+]
+
 # Headers Keil projects include that SDCC has no equivalent for. Mapped rather
 # than vendored: the vendor headers carry no licence, and SDCC's own stc12.h
 # already declares the same register names.
 HEADER_MAP = {
-    "stc12c5a60s2.h": "stc12.h",
-    "stc12c5a.h": "stc12.h",
-    "stc12c5a60s2_p.h": "stc12.h",
-    "stc12c5a60ad.h": "stc12.h",
-    "reg51.h": "8051.h",
-    "reg52.h": "8052.h",
-    "at89x51.h": "at89x51.h",
-    "at89x52.h": "at89x52.h",
+    "stc12c5a60s2.h": "keil-stc12.h",
+    "stc12c5a.h": "keil-stc12.h",
+    "stc12c5a60s2_p.h": "keil-stc12.h",
+    "stc12c5a60ad.h": "keil-stc12.h",
+    "stc12c5a56s2.h": "keil-stc12.h",
+    "stc15f2k60s2.h": "keil-stc12.h",
+    "reg51.h": "keil-reg51.h",
+    "reg52.h": "keil-reg52.h",
+    "at89x51.h": "keil-reg51.h",
+    "at89x52.h": "keil-reg52.h",
 }
 
 STORAGE = ("xdata", "idata", "pdata", "bdata", "code")
+
+
+def provided_bits(include_shim: bool = True) -> dict[str, int]:
+    """Every __sbit SDCC's headers and our compat shim already declare.
+
+    A Keil project routinely declares its own `sbit P13 = P1^3;`. Once the
+    shim provides the same name at the same address, keeping both is a
+    duplicate-symbol error -- so the translator drops the redundant one.
+    """
+    out: dict[str, int] = {}
+    paths = list(SHIM_DIR.glob("*.h")) if (include_shim and SHIM_DIR.is_dir()) else []
+    for base in SDCC_INCLUDE_DIRS:
+        directory = pathlib.Path(base)
+        if directory.is_dir():
+            paths += [directory / "stc12.h", directory / "8052.h", directory / "8051.h"]
+            break
+    for path in paths:
+        if not path.exists():
+            continue
+        text = path.read_text(errors="replace")
+        for value, name in re.findall(
+                r"__sbit\s+__at\s*\(?\s*(0x[0-9A-Fa-f]+)\s*\)?\s*(\w+)", text):
+            out.setdefault(name, int(value, 16))
+        for name, base_addr, index in re.findall(
+                r"SBIT\s*\(\s*(\w+)\s*,\s*(0x[0-9A-Fa-f]+)\s*,\s*(\d+)", text):
+            out.setdefault(name, int(base_addr, 16) + int(index))
+    return out
 
 
 def sfr_addresses(header: pathlib.Path | None = None) -> dict[str, int]:
@@ -59,9 +102,7 @@ def sfr_addresses(header: pathlib.Path | None = None) -> dict[str, int]:
     if header:
         roots.append(header)
     else:
-        for base in ("/opt/homebrew/share/sdcc/include/mcs51",
-                     "/usr/share/sdcc/include/mcs51",
-                     "/usr/local/share/sdcc/include/mcs51"):
+        for base in SDCC_INCLUDE_DIRS:
             path = pathlib.Path(base)
             if path.is_dir():
                 roots += [path / "stc12.h", path / "8052.h", path / "8051.h"]
@@ -86,8 +127,10 @@ class Translation:
         self.unresolved = unresolved
 
 
-def translate(source: str, known: dict[str, int] | None = None) -> Translation:
+def translate(source: str, known: dict[str, int] | None = None,
+              bits: dict[str, int] | None = None) -> Translation:
     known = dict(known if known is not None else sfr_addresses())
+    bits = provided_bits() if bits is None else bits
     changes: dict[str, int] = {}
     unresolved: list[str] = []
 
@@ -110,12 +153,19 @@ def translate(source: str, known: dict[str, int] | None = None) -> Translation:
     source = re.sub(r'#\s*include\s*([<"])([^>"]+)[>"]', fix_include, source)
 
     # --- sfr / sfr16 ------------------------------------------------------
-    # Collect first so `sbit X = MYSFR^n;` can resolve a locally declared SFR.
+    # Collected so `sbit X = MYSFR^n;` can resolve an SFR this file declares
+    # itself. Kept apart from `provided`, or the dedup below would see a
+    # file's own declaration as a duplicate of itself and delete it.
+    provided = dict(known)
     for name, value in re.findall(r"^\s*sfr\s+(\w+)\s*=\s*(0x[0-9A-Fa-f]+|\d+)\s*;",
                                   source, re.M):
         known[name] = int(value, 0)
 
     def fix_sfr(match):
+        name, value = match.group(2), int(match.group(3), 0)
+        if provided.get(name) == value:
+            bump("sfr-dup")
+            return f"{match.group(1)}/* {name}: already declared by SDCC */"
         bump("sfr")
         return f"{match.group(1)}__sfr __at ({match.group(3)}) {match.group(2)};"
 
@@ -138,8 +188,12 @@ def translate(source: str, known: dict[str, int] | None = None) -> Translation:
         if bit:
             base, index = bit.group(1), int(bit.group(2))
             if base in known:
+                address = known[base] + index
+                if bits.get(name) == address:
+                    bump("sbit-dup")
+                    return f"{indent}/* {name}: already declared by SDCC */"
                 bump("sbit")
-                return f"{indent}__sbit __at (0x{known[base] + index:02X}) {name};"
+                return f"{indent}__sbit __at (0x{address:02X}) {name};"
             if re.fullmatch(r"0[xX][0-9A-Fa-f]+|\d+", base):
                 bump("sbit")
                 return f"{indent}__sbit __at (0x{int(base, 0) + index:02X}) {name};"
@@ -163,25 +217,32 @@ def translate(source: str, known: dict[str, int] | None = None) -> Translation:
     source = re.sub(r"\binterrupt\s+(\d+)(?:\s+using\s+(\d+))?", fix_interrupt, source)
 
     # --- storage classes --------------------------------------------------
-    for keyword in STORAGE:
-        source, n = re.subn(rf"(?<![\w.])(?<!__){keyword}(?=\s+[\w*])",
-                            f"__{keyword}", source)
+    # Keil allows the storage class on either side of the type -- both
+    # `unsigned char code t[]` and `code unsigned char t[]` occur in the wild --
+    # so match the keyword wherever it sits, and rely on what FOLLOWS it.
+    #
+    # A storage keyword is always followed by whitespace and then a type,
+    # an identifier or a `*`. Used as an ordinary identifier it is followed by
+    # an operator instead: `g(data)`, `data = 3`, `data[i]`, `code == 3`. That
+    # asymmetry is what makes this safe without parsing C properly.
+    for keyword in ("xdata", "idata", "pdata", "code", "data"):
+        source, n = re.subn(
+            rf"(?<![\w.])(?<!->)(?<!__){keyword}\b(?=\s+[A-Za-z_*])",
+            f"__{keyword}", source)
         bump(keyword, n)
 
-    # `bit` as a type. Guarded so it does not touch identifiers containing it.
-    source, n = re.subn(r"(?<![\w.])(?<!__)bit(?=\s+\w+\s*[;,=\)\[])", "__bit", source)
+    # SDCC has no __bdata; bit-addressable RAM is just data, and any sbit into
+    # it needs an explicit address anyway (which the sbit rewrite above gives).
+    source, n = re.subn(r"(?<![\w.])(?<!__)bdata\b(?=\s+[A-Za-z_*])", "__data", source)
+    bump("bdata", n)
+
+    # `bit` as a type: a variable, a return type, a parameter, or a cast.
+    # Keil reserves the word, so it is never an identifier in Keil source.
+    source, n = re.subn(r"(?<![\w.])bit\b(?=\s*[A-Za-z_*()])", "__bit", source)
     bump("bit", n)
 
     source, n = re.subn(r"(?<![\w.])(?<!__)reentrant\b", "__reentrant", source)
     bump("reentrant", n)
-
-    # Bare `data`. Only rewritten where a type keyword immediately precedes it,
-    # which is the one position where it cannot be an identifier -- `unsigned
-    # char data i;` is a declaration, `foo(data)` is a variable.
-    source, n = re.subn(
-        r"\b(unsigned|signed|char|int|long|short|float|double|void)\s+data\s+(?=[\w*])",
-        r"\1 __data ", source)
-    bump("data", n)
 
     # `int x _at_ 0x30;` -> `__at (0x30) int x;`
     def fix_at(match):

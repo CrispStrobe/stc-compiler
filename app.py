@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import uuid
 
+import keil2sdcc
 import stc_disasm
 import stc_pseudocode
 
@@ -91,7 +92,8 @@ def stage_toolchain():
 class CompileReq(BaseModel):
     code: str
     # "c" compiles the body as-is; "pseudocode" runs it through the
-    # BrickWright-style front end first (see stc_pseudocode.py).
+    # BrickWright-style front end first (see stc_pseudocode.py); "keil"
+    # translates the Keil C51 dialect into SDCC's (see keil2sdcc.py).
     language: str = "c"
     target: str = "stc12c5a60s2"
     # Clock in Hz. Emitted as -DFOSC_HZ=<n>UL, which is what the
@@ -115,6 +117,8 @@ def build(req: CompileReq) -> dict:
         return {"success": False, "error": "source too large"}
 
     generated_c = None
+    keil_changes: dict = {}
+    keil_unresolved: list = []
     if req.language.lower() in ("pseudocode", "pseudo", "bw"):
         try:
             generated_c, program = stc_pseudocode.transpile(req.code)
@@ -124,6 +128,13 @@ def build(req: CompileReq) -> dict:
         req = req.model_copy(update={"code": generated_c})
         # The pseudocode's own CLOCK wins; FOSC_HZ is already baked into the C.
         req = req.model_copy(update={"fosc": None})
+    elif req.language.lower() in ("keil", "c51"):
+        stage_toolchain()      # SFR addresses come from the staged SDCC headers
+        result = keil2sdcc.translate(req.code)
+        generated_c = result.text
+        keil_changes = result.changes
+        keil_unresolved = result.unresolved
+        req = req.model_copy(update={"code": generated_c})
     elif req.language.lower() != "c":
         return {"success": False,
                 "error": f"unknown language '{req.language}'; use 'c' or 'pseudocode'"}
@@ -144,7 +155,12 @@ def build(req: CompileReq) -> dict:
     with open(src, "w", encoding="utf-8") as handle:
         handle.write(req.code)
 
-    cmd = [os.path.join(STAGE_BIN, "sdcc"), "-mmcs51", "--std-c99"]
+    cmd = [os.path.join(STAGE_BIN, "sdcc"), "-mmcs51"]
+    # Keil source predates C99 habits and leans on the older grammar; forcing
+    # --std-c99 on it costs compiles for nothing.
+    if not keil_changes:
+        cmd.append("--std-c99")
+    cmd += keil2sdcc.shim_args()
     cmd += target["flags"]
     if req.fosc:
         cmd.append(f"-DFOSC_HZ={int(req.fosc)}UL")
@@ -221,7 +237,9 @@ def build(req: CompileReq) -> dict:
 
         return {
             "success": True,
-            "c": generated_c,          # None unless language was "pseudocode"
+            "c": generated_c,          # None unless the source was translated
+            "translated": keil_changes or None,
+            "unresolved": keil_unresolved or None,
             "disassembly": listing,     # None unless disassemble was requested
             "base64": base64.b64encode(blob).decode("ascii"),
             "filename": name,
@@ -273,6 +291,15 @@ async def disassemble_image(req: DisassembleReq):
         "start": min(memory) if memory else 0,
         "end": max(memory) if memory else 0,
     }
+
+
+@app.post("/translate")
+async def translate_keil(req: CompileReq):
+    """Keil C51 in, SDCC-dialect C out. No compiler involved."""
+    stage_toolchain()
+    result = keil2sdcc.translate(req.code)
+    return {"success": True, "c": result.text,
+            "translated": result.changes, "unresolved": result.unresolved}
 
 
 @app.post("/decompile")

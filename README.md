@@ -159,6 +159,47 @@ FastAPI's generated OpenAPI documentation.
 
 ---
 
+## Keil C51
+
+Set `"language": "keil"` and the body is translated from the Keil dialect into
+SDCC's before compiling. `POST /translate` returns just the translated C.
+
+Nearly every STC12 project in the wild is a Keil µVision project, and SDCC
+rejects the dialect outright, so a large body of existing code is otherwise
+unreachable from an open toolchain. The two disagree on syntax, not semantics.
+
+| Keil | SDCC |
+|---|---|
+| `sbit LED = P1^0;` | `__sbit __at (0x90) LED;` |
+| `sfr ADC_CONTR = 0xBC;` | `__sfr __at (0xBC) ADC_CONTR;` |
+| `xdata` `idata` `pdata` `code` `data` | `__xdata` … (either side of the type) |
+| `bit f(bit x)`, `(bit)y` | `__bit` |
+| `void t(void) interrupt 1 using 2` | `__interrupt(1) __using(2)` |
+| `int x _at_ 0x30;` | `__at (0x30) int x;` |
+| `#include <STC12C5A60S2.H>`, `<reg52.h>` | our shim → SDCC's `<stc12.h>` |
+| `_nop_`, `_crol_`, … | `keil-shim/intrins.h` |
+
+`sbit` needs the SFR's address to turn `P1^0` into `0x90`. Those come from
+SDCC's own `mcs51/stc12.h` plus any `sfr` the file declares itself — kept in
+separate tables, because a file's own declaration must not look like a
+duplicate of itself.
+
+Declarations that duplicate one SDCC already provides at the same address are
+dropped rather than emitted: SDCC treats a second declaration of an SFR as an
+error, not a redefinition. `keil-shim/keil-compat.h` is **generated**
+(`generate-compat.py`) with the same filter, so an SDCC release that adds a
+register cannot silently break the shim.
+
+Bare `data` and `code` are rewritten only where followed by whitespace and a
+type, identifier or `*`. Used as ordinary identifiers they are followed by an
+operator instead — `g(data)`, `code == 3`, `data[i]` — and that asymmetry is
+what makes the rewrite safe without parsing C properly.
+
+**Measured, not asserted: 65 of 86 (75%)** of the Keil-dialect files in a
+survey of 36 public STC12 projects compile after translation. Remaining
+failures are mostly not dialect: missing project headers, function-pointer
+signatures SDCC rejects, and struct initialiser differences.
+
 ## Pseudocode
 
 Set `"language": "pseudocode"` and the body goes through a BrickWright-style
