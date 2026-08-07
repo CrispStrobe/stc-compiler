@@ -1,39 +1,26 @@
 """
-stc_pseudocode — BrickWright-style pseudocode → C for the STC12 / 8051.
+stc_pseudocode — BrickWright-style pseudocode ⇄ C for the STC12 / 8051.
 
-The dialect deliberately follows the conventions already used by
-sb3-creator's pseudocode (`SPRITE Name:` / `WHEN flag clicked:` / `REPEAT n:` /
-`IF x > y THEN:` / `set v to n`): UPPERCASE for structure and control flow,
-lowercase for statements, and indentation for nesting. Someone who can read a
-BrickWright project can read this.
+The dialect follows the conventions already used by sb3-creator's pseudocode
+(`SPRITE Name:` / `WHEN flag clicked:` / `REPEAT n:` / `IF x > y THEN:` /
+`set v to n`): UPPERCASE for structure and control flow, lowercase for
+statements, indentation for nesting, and `=` comparing rather than assigning.
 
-    DEVICE STC12C5A60S2:
-      CLOCK 11059200
-      PIN led1 = P1.0 OUTPUT ACTIVE LOW
-      PIN led2 = P1.1 OUTPUT ACTIVE LOW
-      PIN button = P3.2 INPUT
+Parsing builds an **AST**, and both back ends walk it:
 
-      WHEN started:
-        set counter to 0
-        FOREVER:
-          turn on led1
-          turn off led2
-          wait 0.15 seconds
-          turn off led1
-          turn on led2
-          wait 0.15 seconds
+    text ──parse──▶ Program (AST) ──emit_c─────────▶ C ──▶ SDCC ──▶ .hex
+                          │
+                          └────────emit_pseudocode─▶ text
 
-The emitted C is the same shape as the hand-written examples in
-CrispStrobe/stc12c5a60s2-lab, so the two stay comparable: Timer 0 for the
-millisecond base, PxM1/PxM0 for port modes, and active-low LED wiring.
+That is the same shape as sb3-creator, where blocks are the IR and
+`decompile(project)` walks it back to pseudocode — and it is what makes the
+round-trip testable, because `parse` and `emit_pseudocode` have to be inverses.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-
-# --------------------------------------------------------------------- model
 
 PORT_RE = re.compile(r"^P([0-4])\.([0-7])$", re.I)
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -47,17 +34,151 @@ class PseudocodeError(Exception):
         super().__init__(f"line {line}: {message}")
 
 
+# ============================================================== expression AST
+
+class Expr:
+    pass
+
+
+@dataclass
+class Num(Expr):
+    value: float
+
+    def text(self) -> str:
+        return str(int(self.value)) if float(self.value).is_integer() else str(self.value)
+
+
+@dataclass
+class Var(Expr):
+    name: str
+
+
+@dataclass
+class PinRef(Expr):
+    name: str
+
+
+@dataclass
+class Unary(Expr):
+    op: str            # "not" | "-"
+    operand: Expr
+
+
+@dataclass
+class Binary(Expr):
+    op: str            # pseudocode spelling: or and = != < > <= >= + - * / %
+    left: Expr
+    right: Expr
+
+
+# Lowest binding first. The index doubles as precedence, so the emitters can
+# work out where parentheses are genuinely needed instead of adding them
+# everywhere -- which matters because the pseudocode back end's output has to
+# parse back to the identical tree.
+PRECEDENCE = [
+    ("or",),
+    ("and",),
+    ("=", "!=", "<", ">", "<=", ">="),
+    ("+", "-"),
+    ("*", "/", "%"),
+]
+LEVEL = {op: index for index, ops in enumerate(PRECEDENCE) for op in ops}
+UNARY_LEVEL = len(PRECEDENCE)
+
+TO_C = {"or": "||", "and": "&&", "=": "==", "!=": "!=",
+        "<": "<", ">": ">", "<=": "<=", ">=": ">=",
+        "+": "+", "-": "-", "*": "*", "/": "/", "%": "%"}
+SYNONYM = {"==": "=", "<>": "!="}
+
+
+# =============================================================== statement AST
+
+class Stmt:
+    pass
+
+
+@dataclass
+class SetPin(Stmt):
+    pin: str
+    high: bool
+    # How it was written, so decompiling gives back the same sentence:
+    # "turn on/off" reads better for LEDs, "set high/low" for logic levels.
+    style: str = "level"        # "level" | "onoff"
+
+
+@dataclass
+class Toggle(Stmt):
+    pin: str
+
+
+@dataclass
+class Wait(Stmt):
+    amount: Expr
+    unit: str                   # "seconds" | "ms"
+
+
+@dataclass
+class WaitUntil(Stmt):
+    cond: Expr
+
+
+@dataclass
+class SetVar(Stmt):
+    name: str
+    value: Expr
+
+
+@dataclass
+class ChangeVar(Stmt):
+    name: str
+    delta: Expr
+
+
+@dataclass
+class Forever(Stmt):
+    body: list
+
+
+@dataclass
+class Repeat(Stmt):
+    count: Expr
+    body: list
+
+
+@dataclass
+class Loop(Stmt):
+    cond: Expr
+    body: list
+    until: bool = False         # REPEAT UNTIL c  vs  WHILE c
+
+
+@dataclass
+class If(Stmt):
+    cond: Expr
+    body: list
+    orelse: list = field(default_factory=list)
+
+
+@dataclass
+class Call(Stmt):
+    name: str
+    args: list
+
+
+@dataclass
+class Stop(Stmt):
+    pass
+
+
+# ===================================================================== program
+
 @dataclass
 class Pin:
     name: str
     port: int
     bit: int
-    direction: str          # "output" | "input" | "analog"
+    direction: str              # "output" | "input" | "analog"
     active_low: bool = False
-
-    @property
-    def adc_channel(self) -> int:
-        return self.bit     # ADC channel n is on P1.n
 
     @property
     def sfr(self) -> str:
@@ -67,12 +188,16 @@ class Pin:
     def mask(self) -> int:
         return 1 << self.bit
 
+    @property
+    def adc_channel(self) -> int:
+        return self.bit         # ADC channel n is on P1.n
+
 
 @dataclass
 class Procedure:
     name: str
-    params: list[str]
-    body: list[str] = field(default_factory=list)
+    params: list
+    body: list = field(default_factory=list)
 
     @property
     def c_name(self) -> str:
@@ -83,15 +208,18 @@ class Procedure:
 class Program:
     part: str = "stc12c5a60s2"
     clock: int = 11059200
-    pins: dict[str, Pin] = field(default_factory=dict)
-    variables: list[str] = field(default_factory=list)
+    pins: dict = field(default_factory=dict)
+    variables: list = field(default_factory=list)
     procedures: dict = field(default_factory=dict)
-    locals_: set = field(default_factory=set)   # params of the procedure being parsed
     body: list = field(default_factory=list)
-    uses_adc: bool = False
+    locals_: set = field(default_factory=set)
+
+    @property
+    def uses_adc(self) -> bool:
+        return any(pin.direction == "analog" for pin in self.pins.values())
 
 
-# -------------------------------------------------------------------- lexing
+# ====================================================================== lexing
 
 @dataclass
 class Line:
@@ -107,35 +235,21 @@ def read_lines(source: str) -> list[Line]:
         stripped = re.sub(r"\s*(?:#|//).*$", "", raw)
         if not stripped.strip():
             continue
-        if "\t" in stripped[: len(stripped) - len(stripped.lstrip())]:
+        lead = stripped[: len(stripped) - len(stripped.lstrip())]
+        if "\t" in lead:
             raise PseudocodeError(number, "tabs in indentation; use spaces")
-        out.append(Line(number, len(stripped) - len(stripped.lstrip()), stripped.strip()))
+        out.append(Line(number, len(lead), stripped.strip()))
     return out
 
 
-# --------------------------------------------------------------- expressions
-# Precedence climbing over the same operator set the BrickWright pseudocode
-# uses. `=` is comparison here, as it is there — assignment is `set ... to ...`.
-
-BINARY = [
-    (("or",), "||"),
-    (("and",), "&&"),
-    (("=", "==", "!=", "<>", "<=", ">=", "<", ">"), None),
-    (("+", "-"), None),
-    (("*", "/", "%"), None),
-]
-COMPARE = {"=": "==", "==": "==", "!=": "!=", "<>": "!=",
-           "<=": "<=", ">=": ">=", "<": "<", ">": ">"}
-
-TOKEN_RE = re.compile(r"""
-    \s*(?:
+TOKEN_RE = re.compile(r"""\s*(?:
       (?P<number>\d+\.\d+|\d+)
     | (?P<op><=|>=|!=|<>|==|[-+*/%()<>=])
-    | (?P<word>[A-Za-z_][A-Za-z0-9_.]*)
+    | (?P<word>[A-Za-z_][A-Za-z0-9_]*)
     )""", re.X)
 
 
-def tokenize_expr(text: str, line: int) -> list[str]:
+def tokenize(text: str, line: int) -> list[str]:
     tokens, pos = [], 0
     while pos < len(text):
         match = TOKEN_RE.match(text, pos)
@@ -145,11 +259,13 @@ def tokenize_expr(text: str, line: int) -> list[str]:
             break
         tokens.append(match.group().strip())
         pos = match.end()
-    return [t for t in tokens if t]
+    return [token for token in tokens if token]
 
+
+# ================================================================= expressions
 
 class ExprParser:
-    def __init__(self, tokens: list[str], program: Program, line: int):
+    def __init__(self, tokens, program: Program, line: int):
         self.tokens, self.pos, self.program, self.line = tokens, 0, program, line
 
     def peek(self):
@@ -160,21 +276,21 @@ class ExprParser:
         self.pos += 1
         return token
 
-    def parse(self, level: int = 0) -> str:
-        if level >= len(BINARY):
+    def parse(self, level: int = 0) -> Expr:
+        if level >= len(PRECEDENCE):
             return self.atom()
-        left = self.parse(level + 1)
-        operators, fixed = BINARY[level]
+        node = self.parse(level + 1)
         while True:
             token = self.peek()
-            if token is None or token.lower() not in operators:
-                return left
+            if token is None:
+                return node
+            op = SYNONYM.get(token, token.lower())
+            if op not in PRECEDENCE[level]:
+                return node
             self.take()
-            right = self.parse(level + 1)
-            c_op = fixed or COMPARE.get(token, token)
-            left = f"({left} {c_op} {right})"
+            node = Binary(op, node, self.parse(level + 1))
 
-    def atom(self) -> str:
+    def atom(self) -> Expr:
         token = self.take()
         if token is None:
             raise PseudocodeError(self.line, "expression ended early")
@@ -182,53 +298,45 @@ class ExprParser:
             inner = self.parse()
             if self.take() != ")":
                 raise PseudocodeError(self.line, "missing ')'")
-            return f"({inner})"
+            return inner
         if token == "-":
-            return f"(-{self.atom()})"
+            return Unary("-", self.atom())
         if token.lower() == "not":
-            return f"(!{self.atom()})"
+            return Unary("not", self.atom())
         if re.fullmatch(r"\d+\.\d+|\d+", token):
-            return str(int(float(token))) if "." not in token else token
+            return Num(float(token))
         lowered = token.lower()
         if lowered in self.program.pins:
-            pin = self.program.pins[lowered]
-            if pin.direction == "analog":
-                self.program.uses_adc = True
-                return f"adc_read({pin.adc_channel})"
-            # Reading an active-low input: "pressed" means the pin is low.
-            return f"(!{pin.sfr})" if pin.active_low else pin.sfr
+            return PinRef(lowered)
         if lowered in ("true", "on", "high"):
-            return "1"
+            return Num(1)
         if lowered in ("false", "off", "low"):
-            return "0"
+            return Num(0)
         if NAME_RE.match(token):
-            if token in self.program.locals_:
-                return token          # a procedure parameter, not a global
-            if token not in self.program.variables:
+            if token not in self.program.locals_ and token not in self.program.variables:
                 self.program.variables.append(token)
-            return token
+            return Var(token)
         raise PseudocodeError(self.line, f"unexpected {token!r}")
 
 
-def expression(text: str, program: Program, line: int) -> str:
-    parser = ExprParser(tokenize_expr(text, line), program, line)
-    value = parser.parse()
+def expression(text: str, program: Program, line: int) -> Expr:
+    parser = ExprParser(tokenize(text, line), program, line)
+    node = parser.parse()
     if parser.peek() is not None:
         raise PseudocodeError(line, f"trailing {parser.peek()!r} in expression")
-    return value
+    return node
 
 
-# ------------------------------------------------------------------ statements
+# ================================================================== statements
 
 def parse_block(lines: list[Line], index: int, parent_indent: int,
-                program: Program) -> tuple[list[str], int]:
-    """Emit C for the block nested under `parent_indent`.
+                program: Program) -> tuple[list, int]:
+    """Parse the block nested under `parent_indent` into a list of Stmt.
 
     The block's own indent is whatever its first line uses, so 2 spaces, 4
-    spaces or any other consistent width all work -- only consistency within
-    one block matters.
+    spaces or any other width work -- only consistency within one block matters.
     """
-    body: list[str] = []
+    body: list = []
     if index >= len(lines) or lines[index].indent <= parent_indent:
         return body, index
     indent = lines[index].indent
@@ -241,51 +349,41 @@ def parse_block(lines: list[Line], index: int, parent_indent: int,
             raise PseudocodeError(
                 line.number,
                 f"inconsistent indentation: expected {indent} spaces, got {line.indent}")
-        text = line.text
-        lowered = text.lower()
+        text, lowered = line.text, line.text.lower()
 
-        # --- FOREVER: -----------------------------------------------------
         if lowered in ("forever:", "forever"):
             inner, index = parse_block(lines, index + 1, indent, program)
-            body += ["for (;;) {", *indent_all(inner), "}"]
+            body.append(Forever(inner))
             continue
 
-        # --- REPEAT n: ----------------------------------------------------
-        repeat = re.fullmatch(r"repeat\s+(?!until\b)(.+?)\s*:", lowered)
-        if repeat:
-            count = expression(text[len("repeat"):].rstrip(":").strip(), program, line.number)
-            inner, index = parse_block(lines, index + 1, indent, program)
-            var = f"_i{indent}"
-            body += [f"{{ unsigned int {var}; for ({var} = 0; {var} < ({count}); {var}++) {{",
-                     *indent_all(inner), "} }"]
-            continue
-
-        # --- WHILE cond: / REPEAT UNTIL cond: -----------------------------
         loop = re.fullmatch(r"(while|repeat\s+until)\s+(.+?)\s*:", lowered)
         if loop:
             keyword = loop.group(1)
             raw = text[len(keyword):].strip().rstrip(":").strip()
-            test = expression(raw, program, line.number)
-            if keyword.startswith("repeat"):
-                test = f"!({test})"      # REPEAT UNTIL c  ==  WHILE not c
+            cond = expression(raw, program, line.number)
             inner, index = parse_block(lines, index + 1, indent, program)
-            body += [f"while ({test}) {{", *indent_all(inner), "}"]
+            body.append(Loop(cond, inner, until=keyword.startswith("repeat")))
             continue
 
-        # --- IF cond THEN: / ELSE: ---------------------------------------
-        cond = re.fullmatch(r"if\s+(.+?)\s+then\s*:", lowered)
-        if cond:
+        repeat = re.fullmatch(r"repeat\s+(?!until\b)(.+?)\s*:", lowered)
+        if repeat:
+            count = expression(text[len("repeat"):].rstrip(":").strip(),
+                               program, line.number)
+            inner, index = parse_block(lines, index + 1, indent, program)
+            body.append(Repeat(count, inner))
+            continue
+
+        conditional = re.fullmatch(r"if\s+(.+?)\s+then\s*:", lowered)
+        if conditional:
             raw = text[len("if"):].strip()
             raw = raw[: raw.lower().rindex("then")].strip()
-            test = expression(raw, program, line.number)
+            cond = expression(raw, program, line.number)
             inner, index = parse_block(lines, index + 1, indent, program)
-            body += [f"if ({test}) {{", *indent_all(inner)]
+            node = If(cond, inner)
             if (index < len(lines) and lines[index].indent == indent
                     and lines[index].text.lower() in ("else:", "else")):
-                otherwise, index = parse_block(lines, index + 1, indent, program)
-                body += ["} else {", *indent_all(otherwise), "}"]
-            else:
-                body += ["}"]
+                node.orelse, index = parse_block(lines, index + 1, indent, program)
+            body.append(node)
             continue
 
         if lowered in ("else:", "else"):
@@ -296,94 +394,78 @@ def parse_block(lines: list[Line], index: int, parent_indent: int,
     return body, index
 
 
-def indent_all(lines: list[str]) -> list[str]:
-    return ["    " + line for line in lines]
-
-
-def simple_statement(text: str, program: Program, line: int) -> str:
+def simple_statement(text: str, program: Program, line: int) -> Stmt:
     lowered = text.lower()
 
-    def pin_of(name: str) -> Pin:
+    def output_pin(name: str) -> str:
         pin = program.pins.get(name.lower())
         if pin is None:
             raise PseudocodeError(line, f"unknown pin {name!r}; declare it with PIN")
         if pin.direction != "output":
-            raise PseudocodeError(line, f"{name!r} is an INPUT and cannot be driven")
-        return pin
+            raise PseudocodeError(
+                line, f"{name!r} is an {pin.direction.upper()} and cannot be driven")
+        return pin.name
 
-    # wait until <condition>
     until = re.match(r"wait\s+until\s+(.+)$", text, re.I)
     if until:
-        return f"while (!({expression(until.group(1), program, line)})) ;"
+        return WaitUntil(expression(until.group(1), program, line))
 
-    # wait <n> seconds | wait <n> ms
     wait = re.fullmatch(r"wait\s+(.+?)\s*(seconds?|secs?|s|ms|milliseconds?)", lowered)
     if wait:
-        amount, unit = wait.group(1), wait.group(2)
-        try:
-            value = float(amount)
-            ms = int(round(value if unit.startswith("m") else value * 1000))
-            return f"delay_ms({ms});"
-        except ValueError:
-            expr = expression(amount, program, line)
-            return (f"delay_ms({expr});" if unit.startswith("m")
-                    else f"delay_ms((unsigned int)(({expr}) * 1000));")
+        unit = "ms" if wait.group(2).startswith("m") else "seconds"
+        return Wait(expression(wait.group(1), program, line), unit)
 
-    # turn on/off <pin>
     turn = re.fullmatch(r"turn\s+(on|off)\s+(\w+)", lowered)
     if turn:
-        pin = pin_of(turn.group(2))
+        pin = program.pins[output_pin(turn.group(2)).lower()]
         on = turn.group(1) == "on"
-        level = (0 if on else 1) if pin.active_low else (1 if on else 0)
-        return f"{pin.sfr} = {level};"
+        return SetPin(pin.name, high=(not on) if pin.active_low else on, style="onoff")
 
-    # set <pin> high/low  |  set <var> to <expr>
-    setp = re.fullmatch(r"set\s+(\w+)\s+(high|low)", lowered)
-    if setp:
-        return f"{pin_of(setp.group(1)).sfr} = {1 if setp.group(2) == 'high' else 0};"
+    level = re.fullmatch(r"set\s+(\w+)\s+(high|low)", lowered)
+    if level:
+        return SetPin(output_pin(level.group(1)), high=(level.group(2) == "high"))
 
-    setv = re.match(r"set\s+([A-Za-z_]\w*)\s+to\s+(.+)$", text, re.I)
-    if setv:
-        name = setv.group(1)
+    assign = re.match(r"set\s+([A-Za-z_]\w*)\s+to\s+(.+)$", text, re.I)
+    if assign:
+        name = assign.group(1)
         if name.lower() in program.pins:
             raise PseudocodeError(line, f"{name!r} is a pin; use 'set {name} high/low'")
+        value = expression(assign.group(2), program, line)
         if name not in program.variables and name not in program.locals_:
             program.variables.append(name)
-        return f"{name} = {expression(setv.group(2), program, line)};"
+        return SetVar(name, value)
 
     change = re.match(r"change\s+([A-Za-z_]\w*)\s+by\s+(.+)$", text, re.I)
     if change:
         name = change.group(1)
+        delta = expression(change.group(2), program, line)
         if name not in program.variables and name not in program.locals_:
             program.variables.append(name)
-        return f"{name} += {expression(change.group(2), program, line)};"
+        return ChangeVar(name, delta)
 
     toggle = re.fullmatch(r"toggle\s+(\w+)", lowered)
     if toggle:
-        sfr = pin_of(toggle.group(1)).sfr
-        return f"{sfr} = !{sfr};"
+        return Toggle(output_pin(toggle.group(1)))
 
     if lowered in ("stop", "stop all", "halt"):
-        return "for (;;) ;   /* stop */"
+        return Stop()
 
-    # A call to a DEFINEd procedure: `blink 3` or `blink(3)` or `blink 3, 4`.
     call = re.match(r"([A-Za-z_]\w*)\s*(?:\((.*)\)|\s+(.*))?$", text)
     if call and call.group(1).lower() in program.procedures:
         procedure = program.procedures[call.group(1).lower()]
         raw_args = (call.group(2) or call.group(3) or "").strip()
-        args = split_arguments(raw_args)
+        args = [expression(a, program, line) for a in split_arguments(raw_args)]
         if len(args) != len(procedure.params):
             raise PseudocodeError(
                 line, f"{procedure.name!r} takes {len(procedure.params)} "
                       f"argument(s), got {len(args)}")
-        rendered = ", ".join(expression(a, program, line) for a in args)
-        return f"{procedure.c_name}({rendered});"
+        return Call(procedure.name, args)
 
     raise PseudocodeError(line, f"do not understand {text!r}")
 
 
 def split_arguments(text: str) -> list[str]:
-    """Split on commas (or plain spaces) that are not inside parentheses."""
+    """Split on commas that are not inside parentheses."""
     if not text:
         return []
     parts, depth, current = [], 0, ""
@@ -401,7 +483,14 @@ def split_arguments(text: str) -> list[str]:
     return [part.strip() for part in parts if part.strip()]
 
 
-# ---------------------------------------------------------------- the parser
+# ===================================================================== parsing
+
+DEFINE_RE = re.compile(r"define\s+(?:fast\s+)?([A-Za-z_]\w*)\s*(.*?):\s*$", re.I)
+WHEN_RE = re.compile(r"when\s+(started|flag\s+clicked|powered\s+on)\s*:", re.I)
+PIN_RE = re.compile(r"pin\s+(\w+)\s*=\s*(p[0-4]\.[0-7])\s+(output|input|analog)"
+                    r"(?:\s+active\s+(low|high))?", re.I)
+CLOCK_RE = re.compile(r"clock\s+([\d_]+)\s*(hz|mhz)?", re.I)
+
 
 def parse(source: str) -> Program:
     lines = read_lines(source)
@@ -411,22 +500,18 @@ def parse(source: str) -> Program:
     program = Program()
     index = 0
 
-    # Optional `DEVICE <part>:` wrapper, mirroring `SPRITE Name:`.
-    base_indent = lines[0].indent
     device = re.fullmatch(r"device\s+([\w-]+)\s*:", lines[0].text, re.I)
     if device:
         program.part = device.group(1).lower()
         index = 1
-        base_indent = lines[1].indent if len(lines) > 1 else 0
 
     # Pass one: register every DEFINE header, so a procedure may be called
     # before its definition appears -- the order people actually write in.
-    define_re = re.compile(r"define\s+(?:fast\s+)?([A-Za-z_]\w*)\s*(.*?):\s*$", re.I)
     for line in lines:
-        header = define_re.fullmatch(line.text)
+        header = DEFINE_RE.fullmatch(line.text)
         if header:
-            name, raw_params = header.group(1), header.group(2)
-            params = re.findall(r"\(\s*([A-Za-z_]\w*)\s*\)", raw_params)
+            name = header.group(1)
+            params = re.findall(r"\(\s*([A-Za-z_]\w*)\s*\)", header.group(2))
             if name.lower() in program.procedures:
                 raise PseudocodeError(line.number, f"procedure {name!r} defined twice")
             program.procedures[name.lower()] = Procedure(name, params)
@@ -436,16 +521,14 @@ def parse(source: str) -> Program:
         line = lines[index]
         text, lowered = line.text, line.text.lower()
 
-        clock = re.fullmatch(r"clock\s+([\d_]+)\s*(hz|mhz)?", lowered)
+        clock = CLOCK_RE.fullmatch(lowered)
         if clock and not started:
             value = int(clock.group(1).replace("_", ""))
             program.clock = value * 1_000_000 if clock.group(2) == "mhz" else value
             index += 1
             continue
 
-        pin = re.fullmatch(
-            r"pin\s+(\w+)\s*=\s*(p[0-4]\.[0-7])\s+(output|input|analog)"
-            r"(?:\s+active\s+(low|high))?", lowered)
+        pin = PIN_RE.fullmatch(lowered)
         if pin and not started:
             name, where, direction, active = pin.groups()
             if name in program.pins:
@@ -453,14 +536,14 @@ def parse(source: str) -> Program:
             port, bit = PORT_RE.match(where).groups()
             if direction == "analog" and port != "1":
                 raise PseudocodeError(
-                    line.number,
-                    f"ANALOG is only available on P1.0-P1.7 (ADC0-ADC7), not {where.upper()}")
+                    line.number, "ANALOG is only available on P1.0-P1.7 "
+                                 f"(ADC0-ADC7), not {where.upper()}")
             program.pins[name] = Pin(name, int(port), int(bit), direction,
                                      active_low=(active == "low"))
             index += 1
             continue
 
-        header = define_re.fullmatch(text)
+        header = DEFINE_RE.fullmatch(text)
         if header:
             procedure = program.procedures[header.group(1).lower()]
             program.locals_ = set(procedure.params)
@@ -471,7 +554,7 @@ def parse(source: str) -> Program:
                                       f"procedure {procedure.name!r} has an empty body")
             continue
 
-        if re.fullmatch(r"when\s+(started|flag\s+clicked|powered\s+on)\s*:", lowered):
+        if WHEN_RE.fullmatch(lowered):
             if started:
                 raise PseudocodeError(line.number, "only one WHEN block is supported")
             started = True
@@ -479,9 +562,8 @@ def parse(source: str) -> Program:
             continue
 
         raise PseudocodeError(
-            line.number,
-            f"do not understand {text!r}"
-            + ("" if started else " (expected CLOCK, PIN or WHEN started:)"))
+            line.number, f"do not understand {text!r}"
+            + ("" if started else " (expected CLOCK, PIN, DEFINE or WHEN started:)"))
 
     if not started:
         raise PseudocodeError(lines[-1].number, "no 'WHEN started:' block")
@@ -490,9 +572,189 @@ def parse(source: str) -> Program:
     return program
 
 
-# ------------------------------------------------------------------- emitter
+# ========================================================= pseudocode back end
+
+def expr_pseudo(node: Expr, parent_level: int = -1) -> str:
+    """Render an expression, parenthesising only where precedence demands it."""
+    if isinstance(node, Num):
+        return node.text()
+    if isinstance(node, (Var, PinRef)):
+        return node.name
+    if isinstance(node, Unary):
+        inner = expr_pseudo(node.operand, UNARY_LEVEL)
+        return f"not {inner}" if node.op == "not" else f"-{inner}"
+    if isinstance(node, Binary):
+        level = LEVEL[node.op]
+        # The right operand binds one level tighter so that `a - (b - c)` keeps
+        # its parentheses; without that, re-parsing would give `(a - b) - c`.
+        text = (f"{expr_pseudo(node.left, level)} {node.op} "
+                f"{expr_pseudo(node.right, level + 1)}")
+        return f"({text})" if level < parent_level else text
+    raise TypeError(node)
+
+
+def stmts_pseudo(body: list, depth: int, active_low: dict) -> list[str]:
+    pad = "  " * depth
+    out = []
+    for node in body:
+        if isinstance(node, SetPin):
+            if node.style == "onoff":
+                on = (not node.high) if active_low.get(node.pin) else node.high
+                out.append(f"{pad}turn {'on' if on else 'off'} {node.pin}")
+            else:
+                out.append(f"{pad}set {node.pin} {'high' if node.high else 'low'}")
+        elif isinstance(node, Toggle):
+            out.append(f"{pad}toggle {node.pin}")
+        elif isinstance(node, Wait):
+            out.append(f"{pad}wait {expr_pseudo(node.amount)} {node.unit}")
+        elif isinstance(node, WaitUntil):
+            out.append(f"{pad}wait until {expr_pseudo(node.cond)}")
+        elif isinstance(node, SetVar):
+            out.append(f"{pad}set {node.name} to {expr_pseudo(node.value)}")
+        elif isinstance(node, ChangeVar):
+            out.append(f"{pad}change {node.name} by {expr_pseudo(node.delta)}")
+        elif isinstance(node, Forever):
+            out.append(f"{pad}FOREVER:")
+            out += stmts_pseudo(node.body, depth + 1, active_low)
+        elif isinstance(node, Repeat):
+            out.append(f"{pad}REPEAT {expr_pseudo(node.count)}:")
+            out += stmts_pseudo(node.body, depth + 1, active_low)
+        elif isinstance(node, Loop):
+            keyword = "REPEAT UNTIL" if node.until else "WHILE"
+            out.append(f"{pad}{keyword} {expr_pseudo(node.cond)}:")
+            out += stmts_pseudo(node.body, depth + 1, active_low)
+        elif isinstance(node, If):
+            out.append(f"{pad}IF {expr_pseudo(node.cond)} THEN:")
+            out += stmts_pseudo(node.body, depth + 1, active_low)
+            if node.orelse:
+                out.append(f"{pad}ELSE:")
+                out += stmts_pseudo(node.orelse, depth + 1, active_low)
+        elif isinstance(node, Call):
+            args = ", ".join(expr_pseudo(a) for a in node.args)
+            out.append(f"{pad}{node.name}{' ' + args if args else ''}")
+        elif isinstance(node, Stop):
+            out.append(f"{pad}stop")
+        else:
+            raise TypeError(node)
+    return out
+
+
+def emit_pseudocode(program: Program) -> str:
+    """Walk the AST back to canonical pseudocode.
+
+    Canonical rather than byte-identical to whatever was parsed: comments are
+    gone, DEVICE and CLOCK are always written out, and the layout is
+    normalised. What matters is that it is a *fixed point* -- parsing this and
+    emitting again gives exactly the same text.
+    """
+    active_low = {pin.name: pin.active_low for pin in program.pins.values()}
+    out = [f"DEVICE {program.part.upper()}:", f"  CLOCK {program.clock}"]
+    if program.pins:
+        out.append("")
+        for pin in program.pins.values():
+            polarity = " ACTIVE LOW" if pin.active_low else ""
+            out.append(f"  PIN {pin.name} = P{pin.port}.{pin.bit} "
+                       f"{pin.direction.upper()}{polarity}")
+    for procedure in program.procedures.values():
+        out.append("")
+        params = "".join(f" ({name})" for name in procedure.params)
+        out.append(f"  DEFINE {procedure.name}{params}:")
+        out += stmts_pseudo(procedure.body, 2, active_low)
+    out += ["", "  WHEN started:"]
+    out += stmts_pseudo(program.body, 2, active_low)
+    return "\n".join(out) + "\n"
+
+
+# ================================================================== C back end
+
+def expr_c(node: Expr, pins: dict, parent_level: int = -1) -> str:
+    if isinstance(node, Num):
+        return str(int(node.value))
+    if isinstance(node, Var):
+        return node.name
+    if isinstance(node, PinRef):
+        pin = pins[node.name]
+        if pin.direction == "analog":
+            return f"adc_read({pin.adc_channel})"
+        return f"!{pin.sfr}" if pin.active_low else pin.sfr
+    if isinstance(node, Unary):
+        inner = expr_c(node.operand, pins, UNARY_LEVEL)
+        return f"!({inner})" if node.op == "not" else f"-({inner})"
+    if isinstance(node, Binary):
+        level = LEVEL[node.op]
+        text = (f"{expr_c(node.left, pins, level)} {TO_C[node.op]} "
+                f"{expr_c(node.right, pins, level + 1)}")
+        return f"({text})" if level < parent_level else text
+    raise TypeError(node)
+
+
+def ms_of(node: Wait, pins: dict) -> str:
+    """A Wait in milliseconds, folded to a constant where it can be."""
+    if isinstance(node.amount, Num):
+        value = node.amount.value
+        return str(int(round(value * 1000 if node.unit == "seconds" else value)))
+    inner = expr_c(node.amount, pins, UNARY_LEVEL)
+    return inner if node.unit == "ms" else f"(unsigned int)(({inner}) * 1000)"
+
+
+def stmts_c(body: list, depth: int, pins: dict, procs: dict, counter: list) -> list[str]:
+    pad = "    " * depth
+    out = []
+    for node in body:
+        if isinstance(node, SetPin):
+            out.append(f"{pad}{pins[node.pin].sfr} = {1 if node.high else 0};")
+        elif isinstance(node, Toggle):
+            sfr = pins[node.pin].sfr
+            out.append(f"{pad}{sfr} = !{sfr};")
+        elif isinstance(node, Wait):
+            out.append(f"{pad}delay_ms({ms_of(node, pins)});")
+        elif isinstance(node, WaitUntil):
+            out.append(f"{pad}while (!({expr_c(node.cond, pins)})) ;")
+        elif isinstance(node, SetVar):
+            out.append(f"{pad}{node.name} = {expr_c(node.value, pins)};")
+        elif isinstance(node, ChangeVar):
+            out.append(f"{pad}{node.name} += {expr_c(node.delta, pins)};")
+        elif isinstance(node, Forever):
+            out.append(f"{pad}for (;;) {{")
+            out += stmts_c(node.body, depth + 1, pins, procs, counter)
+            out.append(f"{pad}}}")
+        elif isinstance(node, Repeat):
+            counter[0] += 1
+            var = f"_i{counter[0]}"
+            out.append(f"{pad}{{ unsigned int {var};")
+            out.append(f"{pad}  for ({var} = 0; {var} < "
+                       f"({expr_c(node.count, pins)}); {var}++) {{")
+            out += stmts_c(node.body, depth + 2, pins, procs, counter)
+            out += [f"{pad}  }}", f"{pad}}}"]
+        elif isinstance(node, Loop):
+            test = expr_c(node.cond, pins, UNARY_LEVEL if node.until else -1)
+            if node.until:
+                test = f"!({test})"      # REPEAT UNTIL c  ==  WHILE not c
+            out.append(f"{pad}while ({test}) {{")
+            out += stmts_c(node.body, depth + 1, pins, procs, counter)
+            out.append(f"{pad}}}")
+        elif isinstance(node, If):
+            out.append(f"{pad}if ({expr_c(node.cond, pins)}) {{")
+            out += stmts_c(node.body, depth + 1, pins, procs, counter)
+            if node.orelse:
+                out.append(f"{pad}}} else {{")
+                out += stmts_c(node.orelse, depth + 1, pins, procs, counter)
+            out.append(f"{pad}}}")
+        elif isinstance(node, Call):
+            args = ", ".join(expr_c(a, pins) for a in node.args)
+            out.append(f"{pad}{procs[node.name.lower()].c_name}({args});")
+        elif isinstance(node, Stop):
+            out.append(f"{pad}for (;;) ;   /* stop */")
+        else:
+            raise TypeError(node)
+    return out
+
 
 def emit_c(program: Program) -> str:
+    pins = {pin.name: pin for pin in program.pins.values()}
+    procs = program.procedures
+    counter = [0]
+
     out = [
         "/* Generated from BrickWright pseudocode by stc-compiler.",
         " * Hand edits will be lost; change the pseudocode instead. */",
@@ -520,8 +782,8 @@ def emit_c(program: Program) -> str:
 
     if program.uses_adc:
         out += [
-            "/* 10-bit ADC, polled. Channel n is on P1.n; the conversion is started",
-            " * and the channel selected in one write, as STC's own examples do. */",
+            "/* 10-bit ADC, polled. Channel n is on P1.n; the channel is selected",
+            " * and the conversion started in one write, as STC's examples do. */",
             "static unsigned int adc_read(unsigned char channel)",
             "{",
             "    unsigned char settle;",
@@ -539,23 +801,20 @@ def emit_c(program: Program) -> str:
         out += [f"static int {name} = 0;" for name in program.variables]
         out.append("")
 
-    # Procedures, forward-declared first so definition order never matters.
-    if program.procedures:
-        for procedure in program.procedures.values():
-            params = ", ".join(f"int {name}" for name in procedure.params) or "void"
+    if procs:
+        for procedure in procs.values():
+            params = ", ".join(f"int {p}" for p in procedure.params) or "void"
             out.append(f"static void {procedure.c_name}({params});")
         out.append("")
-        for procedure in program.procedures.values():
-            params = ", ".join(f"int {name}" for name in procedure.params) or "void"
+        for procedure in procs.values():
+            params = ", ".join(f"int {p}" for p in procedure.params) or "void"
             out += [f"/* DEFINE {procedure.name} */",
                     f"static void {procedure.c_name}({params})", "{",
-                    *indent_all(procedure.body), "}", ""]
+                    *stmts_c(procedure.body, 1, pins, procs, counter), "}", ""]
 
     out += ["void main(void)", "{"]
 
-    # Port modes. Outputs go push-pull so a "high" is a real high, not a weak
-    # pull-up; inputs stay quasi-bidirectional so they can still be read.
-    outputs: dict[int, int] = {}
+    outputs: dict = {}
     for pin in program.pins.values():
         if pin.direction == "output":
             outputs[pin.port] = outputs.get(pin.port, 0) | pin.mask
@@ -563,36 +822,41 @@ def emit_c(program: Program) -> str:
         mask = outputs[port]
         out += [f"    P{port}M1 &= ~0x{mask:02X};   /* push-pull */",
                 f"    P{port}M0 |=  0x{mask:02X};"]
-
-    # Safe initial state: everything off, using each pin's own polarity.
     for pin in program.pins.values():
         if pin.direction == "output":
             out.append(f"    {pin.sfr} = {1 if pin.active_low else 0};"
                        f"   /* {pin.name} off */")
 
-    analog_mask = 0
+    analog = 0
     for pin in program.pins.values():
         if pin.direction == "analog":
-            analog_mask |= pin.mask
-    if analog_mask:
+            analog |= pin.mask
+    if analog:
         out += ["",
-                f"    P1ASF = 0x{analog_mask:02X};                 /* analog function on P1 */",
-                "    P1M1 |=  0x%02X;                /* high-impedance input */" % analog_mask,
-                "    P1M0 &= ~0x%02X;" % analog_mask,
+                f"    P1ASF = 0x{analog:02X};                 /* analog function on P1 */",
+                f"    P1M1 |=  0x{analog:02X};                /* high-impedance input */",
+                f"    P1M0 &= ~0x{analog:02X};",
                 "    ADC_CONTR = 0xE0;              /* ADC on, fastest conversion */"]
 
     out += ["",
             "    AUXR &= ~0x80;                 /* Timer 0 at FOSC/12 */",
             "    TMOD  = (TMOD & 0xF0) | 0x01;  /* Timer 0, mode 1 */",
             ""]
-    out += indent_all(program.body)
+    out += stmts_c(program.body, 1, pins, procs, counter)
     out += ["}", ""]
     return "\n".join(out)
 
 
+# ======================================================================= facade
+
 def transpile(source: str) -> tuple[str, Program]:
     program = parse(source)
     return emit_c(program), program
+
+
+def decompile(source: str) -> str:
+    """pseudocode -> AST -> canonical pseudocode. A fixed point by construction."""
+    return emit_pseudocode(parse(source))
 
 
 EXAMPLE = """DEVICE STC12C5A60S2:

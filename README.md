@@ -87,6 +87,12 @@ instruction length. Verified across four programs, 90 distinct opcodes.
 Linear sweep, not a control-flow trace — right for comparing against a compiler
 listing, but data embedded in the code stream would decode as nonsense.
 
+### `POST /decompile`
+
+Pseudocode in, canonical pseudocode out — `parse` followed by
+`emit_pseudocode`. Normalised layout, comments dropped, and a fixed point:
+feeding the result back in returns it unchanged.
+
 ### `POST /transpile`
 
 Pseudocode in, C out, no compiler involved — for seeing exactly what the front
@@ -214,6 +220,24 @@ sinks 20 mA but sources ~230 µA, so LEDs get wired active-low and `turn on`
 has to emit a `0`. The front end knows that, so the pseudocode never has to.
 
 Response includes the generated `c` alongside the image, so nothing is hidden.
+
+**Parsing builds an AST**, and both back ends walk it:
+
+```
+text ──parse──▶ Program (AST) ──emit_c─────────▶ C ──▶ SDCC ──▶ .hex
+                      │
+                      └────────emit_pseudocode─▶ text
+```
+
+That is the shape `sb3-creator` uses, where blocks are the IR and
+`decompile(project)` walks it back — and it is what makes the round-trip
+testable, because `parse` and `emit_pseudocode` have to be inverses.
+`scripts/test-roundtrip.py` checks it the way `transparency.test.mjs` does:
+every hop is compared against the **original**, not merely against the previous
+hop, because a degraded output is a stable fixed point too. 273 checks over
+seven programs, including one built specifically around operator precedence —
+if the right operand of a binary node is not re-emitted one level tighter,
+`a - (b - c)` silently comes back as `(a - b) - c`.
 
 ## Targets
 

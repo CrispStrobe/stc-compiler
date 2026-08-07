@@ -42,11 +42,21 @@ BIT_NAMES = {
 }
 
 
+# Symbolic output is for humans. Turn it off and every operand becomes numeric,
+# which is what an assembler needs -- see scripts/test-reassemble.py, where the
+# disassembly is fed back through sdas8051 and the bytes compared.
+SYMBOLIC = True
+
+
 def direct(address: int) -> str:
+    if not SYMBOLIC:
+        return f"0x{address:02X}"
     return SFR.get(address, f"0x{address:02X}")
 
 
 def bit(address: int) -> str:
+    if not SYMBOLIC:
+        return f"0x{address:02X}"
     if address in BIT_NAMES:
         return BIT_NAMES[address]
     if address >= 0x80:

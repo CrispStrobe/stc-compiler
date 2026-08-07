@@ -275,6 +275,20 @@ async def disassemble_image(req: DisassembleReq):
     }
 
 
+@app.post("/decompile")
+async def decompile_pseudocode(req: CompileReq):
+    """Pseudocode in, canonical pseudocode out.
+
+    The front end's AST is the source of truth, so this is `parse` followed by
+    `emit_pseudocode`: normalised layout, comments dropped, and a fixed point
+    -- feeding the result back in returns it unchanged.
+    """
+    try:
+        return {"success": True, "pseudocode": stc_pseudocode.decompile(req.code)}
+    except stc_pseudocode.PseudocodeError as exc:
+        return {"success": False, "error": str(exc), "line": exc.line}
+
+
 @app.post("/transpile")
 async def transpile_only(req: CompileReq):
     """Pseudocode in, C out. No compiler involved -- useful for seeing exactly
