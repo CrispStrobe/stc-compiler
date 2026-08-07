@@ -305,6 +305,173 @@ async def translate_keil(req: CompileReq):
             "unresolved": result.unresolved, "warnings": result.warnings}
 
 
+class ProjectReq(BaseModel):
+    """A whole Keil project: {relative path: file content}.
+
+    Paths are used for the header map and the -I layout, so keep the project's
+    own directory structure. Non-C files are passed through untouched.
+    """
+    files: dict[str, str]
+    # Also compile every .c and link the project into one image.
+    link: bool = False
+    target: str = "stc12c5a60s2"
+    fosc: int | None = None      # Keil projects usually bake timing themselves
+    defines: dict[str, str | None] = {}
+    options: list[str] = []
+    format: str = "hex"
+    disassemble: bool = False
+
+
+@app.post("/translate-project")
+async def translate_project_endpoint(req: ProjectReq):
+    """Keil project in, SDCC project out — optionally linked into a .hex.
+
+    This exists because two of the Keil/SDCC differences are project-wide, not
+    per-file: include resolution (uVision is case-insensitive and carries a
+    project include path) and interrupt vectors (SDCC only emits one when the
+    handler is visible in main()'s translation unit; Keil links them
+    separately, so a per-file translation compiles cleanly and the interrupt
+    never fires).
+    """
+    total = sum(len(text.encode("utf-8", "replace")) for text in req.files.values())
+    if total > 4 * MAX_SOURCE_BYTES:
+        return {"success": False, "error": "project too large"}
+    for path in req.files:
+        clean = path.replace("\\", "/")
+        if clean.startswith("/") or ".." in clean.split("/") or not clean:
+            return {"success": False, "error": f"bad path: {path!r}"}
+
+    stage_toolchain()
+    result = keil2sdcc.translate_project(req.files)
+    response = {
+        "success": True,
+        "files": result.files,
+        "translated": result.changes or None,
+        "unresolved": result.unresolved or None,
+        "warnings": result.warnings or None,
+        "isr_injected": result.isr_injected or None,
+        "sources": result.sources,          # from the .uvproj, when present
+        "model_flags": result.model_flags or None,
+    }
+    if not req.link:
+        return response
+
+    target = TARGETS.get(req.target.lower())
+    if target is None:
+        return {"success": False,
+                "error": f"unknown target '{req.target}'; "
+                         f"known: {', '.join(sorted(TARGETS))}"}
+    if req.format not in ("ihx", "hex", "bin"):
+        return {"success": False, "error": "format must be ihx, hex or bin"}
+
+    work = os.path.join(tempfile.gettempdir(), f"project-{uuid.uuid4().hex}")
+    try:
+        sources = []
+        include_dirs = set()
+        for path, text in result.files.items():
+            clean = path.replace("\\", "/")
+            dest = os.path.join(work, *clean.split("/"))
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            include_dirs.add(os.path.dirname(dest))
+            in_build = (result.sources is None
+                        or path in result.sources)
+            if clean.lower().endswith(".c") and in_build:
+                # main()'s unit first: sdcc wants the module holding main at
+                # the front of the link line.
+                is_main = bool(keil2sdcc._MAIN_DEF.search(text))
+                sources.append((not is_main, dest))
+        if not sources:
+            return {"success": False, "error": "no .c files in project"}
+
+        base = [os.path.join(STAGE_BIN, "sdcc"), "-mmcs51"]
+        base += result.model_flags       # Keil memory model, via the .uvproj
+        base += keil2sdcc.shim_args()
+        for directory in sorted(include_dirs):
+            base += ["-I", directory]
+        if req.fosc:
+            base.append(f"-DFOSC_HZ={int(req.fosc)}UL")
+        for name, value in req.defines.items():
+            if not name.replace("_", "").isalnum():
+                return {"success": False, "error": f"bad define name: {name!r}"}
+            base.append(f"-D{name}" if value is None else f"-D{name}={value}")
+        for index, opt in enumerate(req.options):
+            opt = str(opt)
+            if opt.startswith("-"):
+                base.append(opt)
+                continue
+            if index == 0 or not VALUE_RE.fullmatch(opt):
+                return {"success": False,
+                        "error": f"options must be flags, or plain values "
+                                 f"following a flag; rejected {opt!r}"}
+            base.append(opt)
+
+        env = dict(os.environ,
+                   PATH=STAGE_BIN + os.pathsep + os.environ.get("PATH", ""))
+        log = ""
+        rels = []
+        for _, source in sorted(sources):
+            rel = source[:-2] + ".rel"
+            run = subprocess.run(
+                base + ["-c", "-o", rel, source], capture_output=True,
+                text=True, timeout=COMPILE_TIMEOUT, cwd=work, env=env)
+            log += ((run.stdout or "") + (run.stderr or "")).replace(
+                work + os.sep, "")
+            if run.returncode != 0:
+                return {**response, "success": False, "log": log,
+                        "error": f"compile failed: "
+                                 f"{os.path.relpath(source, work)}"}
+            rels.append(rel)
+
+        ihx = os.path.join(work, "project.ihx")
+        run = subprocess.run(
+            base + target["flags"] + ["-o", ihx] + rels, capture_output=True,
+            text=True, timeout=COMPILE_TIMEOUT, cwd=work, env=env)
+        log += ((run.stdout or "") + (run.stderr or "")).replace(work + os.sep, "")
+        if run.returncode != 0 or not os.path.exists(ihx):
+            return {**response, "success": False, "log": log,
+                    "error": "link failed"}
+
+        if req.format == "ihx":
+            out, name = ihx, "project.ihx"
+        elif req.format == "hex":
+            out, name = os.path.join(work, "project.hex"), "project.hex"
+            packed = subprocess.run([os.path.join(STAGE_BIN, "packihx"), ihx],
+                                    capture_output=True, text=True, timeout=10)
+            with open(out, "w", encoding="utf-8") as handle:
+                handle.write(packed.stdout)
+        else:
+            out, name = os.path.join(work, "project.bin"), "project.bin"
+            subprocess.run([os.path.join(STAGE_BIN, "makebin"), "-p", ihx, out],
+                           capture_output=True, timeout=10)
+        with open(out, "rb") as handle:
+            blob = handle.read()
+
+        listing = None
+        if req.disassemble:
+            try:
+                with open(ihx, encoding="utf-8") as handle:
+                    listing = stc_disasm.disassemble_hex(handle.read())
+            except (ValueError, OSError) as exc:
+                listing = f"(disassembly failed: {exc})"
+        mem = ""
+        mem_path = os.path.join(work, "project.mem")
+        if os.path.exists(mem_path):
+            with open(mem_path, encoding="utf-8", errors="replace") as handle:
+                mem = handle.read()
+
+        response.update(base64=base64.b64encode(blob).decode("ascii"),
+                        filename=name, bytes=len(blob), log=log, memory=mem,
+                        disassembly=listing)
+        return response
+    except subprocess.TimeoutExpired:
+        return {**response, "success": False,
+                "error": f"compile timed out after {COMPILE_TIMEOUT}s"}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 @app.post("/decompile")
 async def decompile_pseudocode(req: CompileReq):
     """Pseudocode in, canonical pseudocode out.
