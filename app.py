@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import uuid
 
+import stc_disasm
 import stc_pseudocode
 
 from fastapi import FastAPI
@@ -103,6 +104,9 @@ class CompileReq(BaseModel):
     # "ihx" is SDCC's raw output; "hex" runs it through packihx; "bin" through
     # makebin. stcgal accepts hex and bin.
     format: str = "hex"
+    # Also return an 8051 disassembly of the image. Off by default: it is
+    # several KB of text nobody asked for.
+    disassemble: bool = False
 
 
 def build(req: CompileReq) -> dict:
@@ -199,6 +203,14 @@ def build(req: CompileReq) -> dict:
         with open(out, "rb") as handle:
             blob = handle.read()
 
+        listing = None
+        if req.disassemble:
+            try:
+                with open(ihx, encoding="utf-8") as handle:
+                    listing = stc_disasm.disassemble_hex(handle.read())
+            except (ValueError, OSError) as exc:
+                listing = f"(disassembly failed: {exc})"
+
         # SDCC's memory map. Useful enough to hand back that callers can warn
         # before an image silently outgrows the part.
         mem = ""
@@ -210,6 +222,7 @@ def build(req: CompileReq) -> dict:
         return {
             "success": True,
             "c": generated_c,          # None unless language was "pseudocode"
+            "disassembly": listing,     # None unless disassemble was requested
             "base64": base64.b64encode(blob).decode("ascii"),
             "filename": name,
             "bytes": len(blob),
@@ -224,6 +237,42 @@ def build(req: CompileReq) -> dict:
 async def compile_source(req: CompileReq):
     """Compile and return the image base64-encoded inside JSON."""
     return build(req)
+
+
+class DisassembleReq(BaseModel):
+    """An Intel HEX image, as text or base64."""
+    hex: str | None = None
+    base64: str | None = None
+
+
+@app.post("/disassemble")
+async def disassemble_image(req: DisassembleReq):
+    """Intel HEX in, 8051 assembly out.
+
+    Handy for checking what actually landed in the image rather than trusting
+    the compiler -- and for diffing two builds that should be identical.
+    """
+    text = req.hex
+    if text is None and req.base64:
+        try:
+            text = base64.b64decode(req.base64).decode("utf-8", "replace")
+        except Exception as exc:  # noqa: BLE001 - reported to the caller
+            return {"success": False, "error": f"bad base64: {exc}"}
+    if not text:
+        return {"success": False, "error": "provide 'hex' or 'base64'"}
+    try:
+        memory = stc_disasm.parse_hex(text)
+        entries = stc_disasm.disassemble(memory)
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+    return {
+        "success": True,
+        "disassembly": stc_disasm.format_listing(entries),
+        "instructions": len(entries),
+        "bytes": len(memory),
+        "start": min(memory) if memory else 0,
+        "end": max(memory) if memory else 0,
+    }
 
 
 @app.post("/transpile")
@@ -626,6 +675,7 @@ PAGE = r"""<!doctype html>
     <div id=tabs>
       <button class=on data-pane=out>Output</button>
       <button data-pane=cgen hidden>C</button>
+      <button data-pane=asm hidden>Disassembly</button>
       <button data-pane=mem>Memory</button>
       <button data-pane=log>Log</button>
     </div>
@@ -635,6 +685,7 @@ PAGE = r"""<!doctype html>
 
 See <a href="/docs">/docs</a> for the schema and <a href="/health">/health</a> for the SDCC version.</pre>
       <pre id=cgen hidden></pre>
+      <pre id=asm hidden></pre>
       <pre id=mem hidden></pre>
       <pre id=log hidden></pre>
     </div>
@@ -660,7 +711,7 @@ let image = null;          // {bytes: Uint8Array, filename: string}
 document.querySelectorAll('#tabs button').forEach(tab => {
   tab.onclick = () => {
     document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b === tab));
-    ['out', 'cgen', 'mem', 'log'].forEach(p => { $(p).hidden = (p !== tab.dataset.pane); });
+    ['out', 'cgen', 'asm', 'mem', 'log'].forEach(p => { $(p).hidden = (p !== tab.dataset.pane); });
   };
 });
 
@@ -705,6 +756,7 @@ $('go').onclick = async () => {
         target: $('target').value,
         fosc: parseInt($('fosc').value, 10) || null,
         format,
+        disassemble: true,
       })
     });
     const data = await response.json();
@@ -715,6 +767,8 @@ $('go').onclick = async () => {
       $('out').textContent = (format === 'bin')
         ? hexdump(image.bytes)
         : new TextDecoder().decode(image.bytes);
+      $('asm').textContent = data.disassembly || '';
+      document.querySelector('#tabs button[data-pane=asm]').hidden = !data.disassembly;
       $('cgen').textContent = data.c || '';
       document.querySelector('#tabs button[data-pane=cgen]').hidden = !data.c;
       $('mem').textContent = data.memory || '(none)';

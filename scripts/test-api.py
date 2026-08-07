@@ -352,5 +352,41 @@ check("procedures may be called before they are defined",
       post({"code": "WHEN started:\n  beep\nDEFINE beep:\n  wait 1 ms",
             "language": "pseudocode"})[0].get("success") is True)
 
+print("\ndisassembly")
+result, _ = post({"code": FULL, "language": "pseudocode", "format": "ihx",
+                  "disassemble": True})
+asm = result.get("disassembly") or ""
+check("returned with the image", bool(asm))
+check("looks like a listing", bool(re.match(r"^0000  ", asm)), asm.splitlines()[0][:40])
+
+req = urllib.request.Request(f"{BASE}/disassemble",
+                             json.dumps({"base64": result["base64"]}).encode(),
+                             {"Content-Type": "application/json"})
+with urllib.request.urlopen(req, timeout=120) as response:
+    standalone = json.load(response)
+check("/disassemble agrees with the inline one",
+      standalone.get("disassembly") == asm)
+check("reports instruction count", standalone.get("instructions", 0) > 50,
+      str(standalone.get("instructions")))
+check("rejects a corrupt image",
+      json.load(urllib.request.urlopen(urllib.request.Request(
+          f"{BASE}/disassemble", json.dumps({"hex": ":deadbeef"}).encode(),
+          {"Content-Type": "application/json"}), timeout=60)).get("success") is False)
+
+print("\nround-trip")
+first = post({"code": FULL, "language": "pseudocode", "format": "ihx"})[0]["base64"]
+second = post({"code": FULL, "language": "pseudocode", "format": "ihx"})[0]["base64"]
+check("same source compiles to the same image", first == second)
+
+blink = post({"code": PSEUDO, "language": "pseudocode", "format": "ihx",
+              "disassemble": True})[0]["disassembly"]
+for label, needle in [("timer reload low byte", "MOV   TL0,#0x67"),
+                      ("timer reload high byte", "MOV   TH0,#0xFC"),
+                      ("push-pull port mode", "ORL   P1M0,#0x01"),
+                      ("LED driven low", "CLR   P1.0"),
+                      ("LED driven high", "SETB  P1.0"),
+                      ("delay polls the timer flag", "JNB   TF0,")]:
+    check(f"survives to machine code: {label}", needle in blink)
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

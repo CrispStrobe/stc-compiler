@@ -60,6 +60,33 @@ Failure returns `{"success": false, "error": "<compiler output>"}`.
 The `memory` field is worth surfacing to users — it is how you catch an image
 quietly outgrowing 60 KB of flash or 248 bytes of stack.
 
+### `POST /disassemble`
+
+Intel HEX in (as `hex` text or `base64`), 8051 assembly out. `POST /compile`
+also takes `"disassemble": true` to return the listing alongside the image.
+
+```
+0000  02 00 06     LJMP  0x0006
+0006  75 81 09     MOV   SP,#0x09
+00B7  75 8A 67     MOV   TL0,#0x67
+00BA  75 8C FC     MOV   TH0,#0xFC
+00BD  C2 8D        CLR   TF0
+00BF  D2 8C        SETB  TR0
+00C1  30 8D FD     JNB   TF0,0x00C1
+```
+
+SFR and bit addresses are resolved to names, so `MOV TL0,#0x67` reads as itself
+rather than `MOV 0x8A,#0x67`.
+
+**The table is checked against SDCC's own assembler**, not hand-eyeballed:
+`scripts/test-disasm.py <build-dir>` parses SDCC's relocated listing (`.rst`),
+which pairs every emitted byte with the mnemonic `sdas8051` assembled it from,
+and fails if we decode the same bytes differently or desynchronise on a wrong
+instruction length. Verified across four programs, 90 distinct opcodes.
+
+Linear sweep, not a control-flow trace — right for comparing against a compiler
+listing, but data embedded in the code stream would decode as nonsense.
+
 ### `POST /transpile`
 
 Pseudocode in, C out, no compiler involved — for seeing exactly what the front
