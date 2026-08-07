@@ -1,0 +1,4 @@
+sdcc 4.0.0+dfsg-2 (amd64), from Debian bullseye
+source: https://deb.debian.org/debian/pool/main/s/sdcc
+corresponding source: apt-get source sdcc=4.0.0+dfsg-2
+upstream: https://sdcc.sourceforge.net/
