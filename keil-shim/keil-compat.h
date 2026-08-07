@@ -62,9 +62,82 @@ __sbit __at (0xC7) P47;
 #define ADC_SPEEDHH  0x60   /* 90 */
 #define ADC_FLAG     0x10   /* conversion complete */
 #define ADC_START    0x08   /* begin a conversion */
+#define S2SM0        0x80   /* S2CON bit 7 */
+#define S2SM1        0x40   /* S2CON bit 6 */
+#define S2SM2        0x20   /* S2CON bit 5 */
+#define S2REN        0x10   /* S2CON bit 4, receive enable */
+#define S2TB8        0x08   /* S2CON bit 3 */
+#define S2RB8        0x04   /* S2CON bit 2 */
+#define S2TI         0x02   /* S2CON bit 1, transmit flag */
+#define S2RI         0x01   /* S2CON bit 0, receive flag */
+#define ES2          0x01   /* IE2 bit 0, UART2 interrupt enable */
 
 /* Same register, different vendor spelling. */
 #define IPH2         IP2H
+
+/* SDCC's math.h carries only the float-suffixed C99 names, and on
+   mcs51 double is float anyway. Map the double spellings Keil code
+   uses. Function-like on purpose: a variable named exp stays alone. */
+#ifndef fabs
+#define fabs(x) fabsf(x)
+#endif
+#ifndef sqrt
+#define sqrt(x) sqrtf(x)
+#endif
+#ifndef sin
+#define sin(x) sinf(x)
+#endif
+#ifndef cos
+#define cos(x) cosf(x)
+#endif
+#ifndef tan
+#define tan(x) tanf(x)
+#endif
+#ifndef asin
+#define asin(x) asinf(x)
+#endif
+#ifndef acos
+#define acos(x) acosf(x)
+#endif
+#ifndef atan
+#define atan(x) atanf(x)
+#endif
+#ifndef sinh
+#define sinh(x) sinhf(x)
+#endif
+#ifndef cosh
+#define cosh(x) coshf(x)
+#endif
+#ifndef tanh
+#define tanh(x) tanhf(x)
+#endif
+#ifndef exp
+#define exp(x) expf(x)
+#endif
+#ifndef log
+#define log(x) logf(x)
+#endif
+#ifndef log10
+#define log10(x) log10f(x)
+#endif
+#ifndef floor
+#define floor(x) floorf(x)
+#endif
+#ifndef ceil
+#define ceil(x) ceilf(x)
+#endif
+#ifndef atan2
+#define atan2(a, b) atan2f(a, b)
+#endif
+#ifndef pow
+#define pow(a, b) powf(a, b)
+#endif
+#ifndef fmod
+#define fmod(a, b) fmodf(a, b)
+#endif
+#ifndef ldexp
+#define ldexp(a, b) ldexpf(a, b)
+#endif
 
 /* Older vendor headers spell the IAP registers ISP_*. */
 #define ISP_DATA     IAP_DATA

@@ -38,6 +38,17 @@ CONSTANTS = [
     ("ADC_SPEEDHH", "0x60", "90"),
     ("ADC_FLAG", "0x10", "conversion complete"),
     ("ADC_START", "0x08", "begin a conversion"),
+    # S2CON (0x9A) is not bit-addressable, so vendor headers expose its bits
+    # as masks. Layout mirrors SCON (datasheet 7.3, UART2).
+    ("S2SM0", "0x80", "S2CON bit 7"),
+    ("S2SM1", "0x40", "S2CON bit 6"),
+    ("S2SM2", "0x20", "S2CON bit 5"),
+    ("S2REN", "0x10", "S2CON bit 4, receive enable"),
+    ("S2TB8", "0x08", "S2CON bit 3"),
+    ("S2RB8", "0x04", "S2CON bit 2"),
+    ("S2TI", "0x02", "S2CON bit 1, transmit flag"),
+    ("S2RI", "0x01", "S2CON bit 0, receive flag"),
+    ("ES2", "0x01", "IE2 bit 0, UART2 interrupt enable"),
 ]
 
 # Read SDCC's headers only: scanning the shim would include the very file
@@ -78,6 +89,17 @@ out += ["", "/* Same register, different vendor spelling. */"]
 for vendor_name, sdcc_name in ALIASES:
     if vendor_name not in have_sfr:
         out.append(f"#define {vendor_name:<12} {sdcc_name}")
+
+out += ["", "/* SDCC's math.h carries only the float-suffixed C99 names, and on",
+        "   mcs51 double is float anyway. Map the double spellings Keil code",
+        "   uses. Function-like on purpose: a variable named exp stays alone. */"]
+MATH_1 = ("fabs sqrt sin cos tan asin acos atan sinh cosh tanh "
+          "exp log log10 floor ceil").split()
+MATH_2 = ["atan2", "pow", "fmod", "ldexp"]
+for fn in MATH_1:
+    out += [f"#ifndef {fn}", f"#define {fn}(x) {fn}f(x)", "#endif"]
+for fn in MATH_2:
+    out += [f"#ifndef {fn}", f"#define {fn}(a, b) {fn}f(a, b)", "#endif"]
 
 out += ["", "/* Older vendor headers spell the IAP registers ISP_*. */"]
 for name, _ in SFRS:
