@@ -134,7 +134,17 @@ class Translation:
 
 
 def translate(source: str, known: dict[str, int] | None = None,
-              bits: dict[str, int] | None = None) -> Translation:
+              bits: dict[str, int] | None = None,
+              headers: dict[str, str] | None = None) -> Translation:
+    """Translate one Keil C51 file.
+
+    `headers` maps a lowercased header basename to its real on-disk name. Pass
+    it when the whole project is available and include resolution stops being
+    guesswork: Windows is case-insensitive and uVision carries its own include
+    path, so Keil sources routinely `#include "Common.h"` as `common.h`, or
+    reach across the tree with `..\\..\\inc\\Main\\stdafx.h`. Neither
+    resolves on a case-sensitive filesystem with POSIX separators.
+    """
     known = dict(known if known is not None else sfr_addresses())
     bits = provided_bits() if bits is None else bits
     changes: dict[str, int] = {}
@@ -147,15 +157,27 @@ def translate(source: str, known: dict[str, int] | None = None,
 
     # --- includes ---------------------------------------------------------
     def fix_include(match):
-        raw = match.group(2)
+        raw = match.group(2).replace("\\", "/")   # Windows separators
         # Keil projects often qualify the path ("STC/STC12C5A60S2.H"), and the
         # directory means nothing once SDCC's own header is standing in.
         name = re.split(r"[\\/]", raw)[-1].lower()
         target = HEADER_MAP.get(name)
-        if not target:
-            return match.group(0)
-        bump("include")
-        return f"#include <{target}>"
+        if target:
+            bump("include")
+            return f"#include <{target}>"
+        # A project-local header: drop the directory and fix the case, then let
+        # -I find it. Every directory in the project is on the include path, so
+        # the basename alone is both sufficient and more robust than a relative
+        # path that assumed a Windows working directory.
+        if headers and name in headers:
+            actual = headers[name]
+            if actual != match.group(2):
+                bump("include-path")
+                return f'#include "{actual}"'
+        elif raw != match.group(2):
+            bump("include-path")
+            return f'#include {match.group(1)}{raw}{">" if match.group(1) == "<" else chr(34)}'
+        return match.group(0)
 
     source = re.sub(r'#\s*include\s*([<"])([^>"]+)[>"]', fix_include, source)
 
