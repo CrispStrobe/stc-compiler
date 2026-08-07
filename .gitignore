@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .vercel
 .DS_Store
+
+# Agent context: local paths and operational detail, not for the public repo.
+CLAUDE.md
