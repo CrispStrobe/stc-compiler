@@ -10,6 +10,7 @@ extensions can talk to both with the same client code.
 
 import base64
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -33,6 +34,10 @@ SRC_SHARE = os.path.join(BASE_DIR, "share")
 STAGE = "/tmp/sdcc"
 STAGE_BIN = os.path.join(STAGE, "bin")
 STAGE_SHARE = os.path.join(STAGE, "share")
+
+# A bare option value: numbers, identifiers, "0x1F", "a,b". Deliberately
+# excludes '/' and '\\' so a path can never be smuggled in as an input file.
+VALUE_RE = re.compile(r"[A-Za-z0-9_.,=+:-]+")
 
 # Anything beyond this is a runaway, not a program.
 COMPILE_TIMEOUT = 25
@@ -122,7 +127,19 @@ async def compile_source(req: CompileReq):
         if not name.replace("_", "").isalnum():
             return {"success": False, "error": f"bad define name: {name!r}"}
         cmd.append(f"-D{name}" if value is None else f"-D{name}={value}")
-    cmd += [str(opt) for opt in req.options]
+    # Flags, plus the bare values that some of them take ("--code-size", "64").
+    # What we must not allow is a path: sdcc would happily accept it as a
+    # second input file and compile something out of the container.
+    for index, opt in enumerate(req.options):
+        opt = str(opt)
+        if opt.startswith("-"):
+            cmd.append(opt)
+            continue
+        if index == 0 or not VALUE_RE.fullmatch(opt):
+            return {"success": False,
+                    "error": f"options must be flags, or plain values following "
+                             f"a flag; rejected {opt!r}"}
+        cmd.append(opt)
     cmd += ["-o", work + os.sep, src]
 
     env = dict(os.environ, PATH=STAGE_BIN + os.pathsep + os.environ.get("PATH", ""))
@@ -134,7 +151,9 @@ async def compile_source(req: CompileReq):
         shutil.rmtree(work, ignore_errors=True)
         return {"success": False, "error": f"compile timed out after {COMPILE_TIMEOUT}s"}
 
-    log = (result.stdout or "") + (result.stderr or "")
+    # The workspace path is an implementation detail; callers should see the
+    # same "main.c:12: error" they would get compiling locally.
+    log = ((result.stdout or "") + (result.stderr or "")).replace(work + os.sep, "")
     ihx = os.path.join(work, "main.ihx")
 
     if result.returncode != 0 or not os.path.exists(ihx):
