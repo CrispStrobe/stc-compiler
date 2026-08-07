@@ -388,5 +388,57 @@ for label, needle in [("timer reload low byte", "MOV   TL0,#0x67"),
                       ("delay polls the timer flag", "JNB   TF0,")]:
     check(f"survives to machine code: {label}", needle in blink)
 
+print("\nkeil")
+KEIL = """#include <STC12C5A60S2.H>
+sbit LED = P1^0;
+sbit K1  = P3^2;sbit K2 = P3^3;
+data bit flag;
+unsigned char code pattern[2][2] = {1,2,3,4};
+void main(void)
+{
+    LED = 0;
+    while (1) { if (!K1) flag = 1; }
+}
+"""
+req = urllib.request.Request(f"{BASE}/translate",
+                             json.dumps({"code": KEIL, "language": "keil"}).encode(),
+                             {"Content-Type": "application/json"})
+with urllib.request.urlopen(req, timeout=120) as response:
+    translated = json.load(response)
+c = translated.get("c") or ""
+check("sbit resolved via SDCC's table", "__sbit __at (0x90) LED;" in c)
+check("second sbit on one line resolved", "__at (0xB3) K2;" in c)
+check("data bit collapses to __bit", "__bit flag;" in c)
+check("flat 2D initialiser re-braced", "{{1, 2}, {3, 4}}" in c)
+check("vendor include mapped", "keil-stc12.h" in c)
+
+result, _ = post({"code": KEIL, "language": "keil"})
+check("keil source compiles to an image", result.get("success") is True,
+      result.get("error", "")[:70])
+
+ISR_MAIN = "#include <REG52.H>\nvoid main(void) { EA = 1; while (1) ; }\n"
+ISR_FILE = ("#include <REG52.H>\nunsigned char ticks;\n"
+            "void tick(void) interrupt 1 using 2 { ticks++; }\n")
+req = urllib.request.Request(
+    f"{BASE}/translate-project",
+    json.dumps({"files": {"main.c": ISR_MAIN, "timer.c": ISR_FILE},
+                "link": True, "format": "ihx"}).encode(),
+    {"Content-Type": "application/json"})
+with urllib.request.urlopen(req, timeout=120) as response:
+    project = json.load(response)
+check("project translates and links", project.get("success") is True,
+      str(project.get("error", ""))[:70])
+check("ISR prototype injected into main()'s file",
+      any("tick" in note for note in project.get("isr_injected") or []),
+      str(project.get("isr_injected")))
+if project.get("success"):
+    image, errors = code_bytes(base64.b64decode(project["base64"]).decode())
+    check("linked image is valid hex", not errors and len(image) > 20,
+          f"{len(image)} bytes")
+    # Vector 1 (Timer 0) lives at 0x000B; SDCC only emits it when the
+    # injected prototype made the handler visible -- the whole point.
+    check("timer-0 vector emitted at 0x000B", image.get(0x0B) is not None
+          and image.get(0x0B) != 0xFF, hex(image.get(0x0B, -1)))
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
