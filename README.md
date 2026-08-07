@@ -161,13 +161,26 @@ DEVICE STC12C5A60S2:
 | `DEVICE <part>:` | optional wrapper, like `SPRITE Name:` |
 | `CLOCK <hz>` / `CLOCK <n> MHz` | overrides the `fosc` request field |
 | `PIN <name> = P1.0 OUTPUT [ACTIVE LOW]` | `ACTIVE LOW` makes `turn on` drive 0 |
-| `PIN <name> = P3.2 INPUT` | readable in expressions |
+| `PIN <name> = P3.2 INPUT [ACTIVE LOW]` | readable in expressions |
+| `PIN <name> = P1.2 ANALOG` | 10-bit ADC; channel *n* is on `P1.n`, so P1 only |
+| `DEFINE <name> (a) (b):` | procedure; callable as `name 3, 80` or `name(3, 80)` |
 | `WHEN started:` | also accepts `WHEN flag clicked:` |
 | `FOREVER:` · `REPEAT n:` · `IF c THEN:` / `ELSE:` | indentation-scoped |
+| `WHILE c:` · `REPEAT UNTIL c:` · `wait until c` | |
 | `turn on/off <pin>` · `set <pin> high/low` · `toggle <pin>` | |
 | `wait <n> seconds` / `<n> ms` | Timer 0, not a spin loop |
 | `set <v> to <e>` · `change <v> by <e>` | variables are 16-bit `int` |
 | `+ - * / %`, `= != < > <= >=`, `and or not` | `=` compares, as in Scratch |
+
+Procedures may be called before they are defined — the order people actually
+write in — because headers are registered in a first pass. Parameters are
+locals, so they never leak into the global variable list.
+
+`ANALOG` pins read through the ADC wherever they appear in an expression, so
+`IF pot > 512 THEN:` just works: the emitter adds the polled `adc_read()`
+helper, sets `P1ASF`, puts the pin in high-impedance mode and powers the
+converter. Channel *n* lives on `P1.n`, which is why `ANALOG` is rejected on
+any other port.
 
 `ACTIVE LOW` is the point of the whole thing: a quasi-bidirectional 8051 pin
 sinks 20 mA but sources ~230 µA, so LEDs get wired active-low and `turn on`

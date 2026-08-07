@@ -52,8 +52,12 @@ class Pin:
     name: str
     port: int
     bit: int
-    direction: str          # "output" | "input"
+    direction: str          # "output" | "input" | "analog"
     active_low: bool = False
+
+    @property
+    def adc_channel(self) -> int:
+        return self.bit     # ADC channel n is on P1.n
 
     @property
     def sfr(self) -> str:
@@ -65,12 +69,26 @@ class Pin:
 
 
 @dataclass
+class Procedure:
+    name: str
+    params: list[str]
+    body: list[str] = field(default_factory=list)
+
+    @property
+    def c_name(self) -> str:
+        return "bw_" + re.sub(r"\W", "_", self.name)
+
+
+@dataclass
 class Program:
     part: str = "stc12c5a60s2"
     clock: int = 11059200
     pins: dict[str, Pin] = field(default_factory=dict)
     variables: list[str] = field(default_factory=list)
+    procedures: dict = field(default_factory=dict)
+    locals_: set = field(default_factory=set)   # params of the procedure being parsed
     body: list = field(default_factory=list)
+    uses_adc: bool = False
 
 
 # -------------------------------------------------------------------- lexing
@@ -174,6 +192,9 @@ class ExprParser:
         lowered = token.lower()
         if lowered in self.program.pins:
             pin = self.program.pins[lowered]
+            if pin.direction == "analog":
+                self.program.uses_adc = True
+                return f"adc_read({pin.adc_channel})"
             # Reading an active-low input: "pressed" means the pin is low.
             return f"(!{pin.sfr})" if pin.active_low else pin.sfr
         if lowered in ("true", "on", "high"):
@@ -181,6 +202,8 @@ class ExprParser:
         if lowered in ("false", "off", "low"):
             return "0"
         if NAME_RE.match(token):
+            if token in self.program.locals_:
+                return token          # a procedure parameter, not a global
             if token not in self.program.variables:
                 self.program.variables.append(token)
             return token
@@ -228,13 +251,25 @@ def parse_block(lines: list[Line], index: int, parent_indent: int,
             continue
 
         # --- REPEAT n: ----------------------------------------------------
-        repeat = re.fullmatch(r"repeat\s+(.+?)\s*:", lowered)
+        repeat = re.fullmatch(r"repeat\s+(?!until\b)(.+?)\s*:", lowered)
         if repeat:
             count = expression(text[len("repeat"):].rstrip(":").strip(), program, line.number)
             inner, index = parse_block(lines, index + 1, indent, program)
             var = f"_i{indent}"
             body += [f"{{ unsigned int {var}; for ({var} = 0; {var} < ({count}); {var}++) {{",
                      *indent_all(inner), "} }"]
+            continue
+
+        # --- WHILE cond: / REPEAT UNTIL cond: -----------------------------
+        loop = re.fullmatch(r"(while|repeat\s+until)\s+(.+?)\s*:", lowered)
+        if loop:
+            keyword = loop.group(1)
+            raw = text[len(keyword):].strip().rstrip(":").strip()
+            test = expression(raw, program, line.number)
+            if keyword.startswith("repeat"):
+                test = f"!({test})"      # REPEAT UNTIL c  ==  WHILE not c
+            inner, index = parse_block(lines, index + 1, indent, program)
+            body += [f"while ({test}) {{", *indent_all(inner), "}"]
             continue
 
         # --- IF cond THEN: / ELSE: ---------------------------------------
@@ -276,6 +311,11 @@ def simple_statement(text: str, program: Program, line: int) -> str:
             raise PseudocodeError(line, f"{name!r} is an INPUT and cannot be driven")
         return pin
 
+    # wait until <condition>
+    until = re.match(r"wait\s+until\s+(.+)$", text, re.I)
+    if until:
+        return f"while (!({expression(until.group(1), program, line)})) ;"
+
     # wait <n> seconds | wait <n> ms
     wait = re.fullmatch(r"wait\s+(.+?)\s*(seconds?|secs?|s|ms|milliseconds?)", lowered)
     if wait:
@@ -307,14 +347,14 @@ def simple_statement(text: str, program: Program, line: int) -> str:
         name = setv.group(1)
         if name.lower() in program.pins:
             raise PseudocodeError(line, f"{name!r} is a pin; use 'set {name} high/low'")
-        if name not in program.variables:
+        if name not in program.variables and name not in program.locals_:
             program.variables.append(name)
         return f"{name} = {expression(setv.group(2), program, line)};"
 
     change = re.match(r"change\s+([A-Za-z_]\w*)\s+by\s+(.+)$", text, re.I)
     if change:
         name = change.group(1)
-        if name not in program.variables:
+        if name not in program.variables and name not in program.locals_:
             program.variables.append(name)
         return f"{name} += {expression(change.group(2), program, line)};"
 
@@ -326,7 +366,39 @@ def simple_statement(text: str, program: Program, line: int) -> str:
     if lowered in ("stop", "stop all", "halt"):
         return "for (;;) ;   /* stop */"
 
+    # A call to a DEFINEd procedure: `blink 3` or `blink(3)` or `blink 3, 4`.
+    call = re.match(r"([A-Za-z_]\w*)\s*(?:\((.*)\)|\s+(.*))?$", text)
+    if call and call.group(1).lower() in program.procedures:
+        procedure = program.procedures[call.group(1).lower()]
+        raw_args = (call.group(2) or call.group(3) or "").strip()
+        args = split_arguments(raw_args)
+        if len(args) != len(procedure.params):
+            raise PseudocodeError(
+                line, f"{procedure.name!r} takes {len(procedure.params)} "
+                      f"argument(s), got {len(args)}")
+        rendered = ", ".join(expression(a, program, line) for a in args)
+        return f"{procedure.c_name}({rendered});"
+
     raise PseudocodeError(line, f"do not understand {text!r}")
+
+
+def split_arguments(text: str) -> list[str]:
+    """Split on commas (or plain spaces) that are not inside parentheses."""
+    if not text:
+        return []
+    parts, depth, current = [], 0, ""
+    for char in text:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        if char == "," and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += char
+    parts.append(current)
+    return [part.strip() for part in parts if part.strip()]
 
 
 # ---------------------------------------------------------------- the parser
@@ -347,6 +419,18 @@ def parse(source: str) -> Program:
         index = 1
         base_indent = lines[1].indent if len(lines) > 1 else 0
 
+    # Pass one: register every DEFINE header, so a procedure may be called
+    # before its definition appears -- the order people actually write in.
+    define_re = re.compile(r"define\s+(?:fast\s+)?([A-Za-z_]\w*)\s*(.*?):\s*$", re.I)
+    for line in lines:
+        header = define_re.fullmatch(line.text)
+        if header:
+            name, raw_params = header.group(1), header.group(2)
+            params = re.findall(r"\(\s*([A-Za-z_]\w*)\s*\)", raw_params)
+            if name.lower() in program.procedures:
+                raise PseudocodeError(line.number, f"procedure {name!r} defined twice")
+            program.procedures[name.lower()] = Procedure(name, params)
+
     started = False
     while index < len(lines):
         line = lines[index]
@@ -360,16 +444,31 @@ def parse(source: str) -> Program:
             continue
 
         pin = re.fullmatch(
-            r"pin\s+(\w+)\s*=\s*(p[0-4]\.[0-7])\s+(output|input)"
+            r"pin\s+(\w+)\s*=\s*(p[0-4]\.[0-7])\s+(output|input|analog)"
             r"(?:\s+active\s+(low|high))?", lowered)
         if pin and not started:
             name, where, direction, active = pin.groups()
             if name in program.pins:
                 raise PseudocodeError(line.number, f"pin {name!r} declared twice")
             port, bit = PORT_RE.match(where).groups()
+            if direction == "analog" and port != "1":
+                raise PseudocodeError(
+                    line.number,
+                    f"ANALOG is only available on P1.0-P1.7 (ADC0-ADC7), not {where.upper()}")
             program.pins[name] = Pin(name, int(port), int(bit), direction,
                                      active_low=(active == "low"))
             index += 1
+            continue
+
+        header = define_re.fullmatch(text)
+        if header:
+            procedure = program.procedures[header.group(1).lower()]
+            program.locals_ = set(procedure.params)
+            procedure.body, index = parse_block(lines, index + 1, line.indent, program)
+            program.locals_ = set()
+            if not procedure.body:
+                raise PseudocodeError(line.number,
+                                      f"procedure {procedure.name!r} has an empty body")
             continue
 
         if re.fullmatch(r"when\s+(started|flag\s+clicked|powered\s+on)\s*:", lowered):
@@ -419,10 +518,38 @@ def emit_c(program: Program) -> str:
         "",
     ]
 
+    if program.uses_adc:
+        out += [
+            "/* 10-bit ADC, polled. Channel n is on P1.n; the conversion is started",
+            " * and the channel selected in one write, as STC's own examples do. */",
+            "static unsigned int adc_read(unsigned char channel)",
+            "{",
+            "    unsigned char settle;",
+            "    ADC_CONTR = (unsigned char)(0xE8 | channel);  /* power|fast|start|chan */",
+            "    for (settle = 0; settle < 8; settle++) ;      /* let the mux settle */",
+            "    while (!(ADC_CONTR & 0x10)) ;                 /* wait for ADC_FLAG */",
+            "    ADC_CONTR &= ~0x10;                           /* clear it by hand */",
+            "    return ((unsigned int)ADC_RES << 2) | (ADC_RESL & 0x03);",
+            "}",
+            "",
+        ]
+
     if program.variables:
         out.append("/* Variables (16-bit signed, like Scratch's integers). */")
         out += [f"static int {name} = 0;" for name in program.variables]
         out.append("")
+
+    # Procedures, forward-declared first so definition order never matters.
+    if program.procedures:
+        for procedure in program.procedures.values():
+            params = ", ".join(f"int {name}" for name in procedure.params) or "void"
+            out.append(f"static void {procedure.c_name}({params});")
+        out.append("")
+        for procedure in program.procedures.values():
+            params = ", ".join(f"int {name}" for name in procedure.params) or "void"
+            out += [f"/* DEFINE {procedure.name} */",
+                    f"static void {procedure.c_name}({params})", "{",
+                    *indent_all(procedure.body), "}", ""]
 
     out += ["void main(void)", "{"]
 
@@ -442,6 +569,17 @@ def emit_c(program: Program) -> str:
         if pin.direction == "output":
             out.append(f"    {pin.sfr} = {1 if pin.active_low else 0};"
                        f"   /* {pin.name} off */")
+
+    analog_mask = 0
+    for pin in program.pins.values():
+        if pin.direction == "analog":
+            analog_mask |= pin.mask
+    if analog_mask:
+        out += ["",
+                f"    P1ASF = 0x{analog_mask:02X};                 /* analog function on P1 */",
+                "    P1M1 |=  0x%02X;                /* high-impedance input */" % analog_mask,
+                "    P1M0 &= ~0x%02X;" % analog_mask,
+                "    ADC_CONTR = 0xE0;              /* ADC on, fastest conversion */"]
 
     out += ["",
             "    AUXR &= ~0x80;                 /* Timer 0 at FOSC/12 */",

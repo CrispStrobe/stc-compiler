@@ -289,5 +289,68 @@ print("\nUI exposes the front end")
 check("language picker", "id=language" in page and 'value=pseudocode' in page)
 check("C tab for generated source", 'data-pane=cgen' in page)
 
+print("\nprocedures, analog and the other loops")
+FULL = """DEVICE STC12C5A60S2:
+  CLOCK 11059200
+  PIN led = P1.7 OUTPUT ACTIVE LOW
+  PIN pot = P1.2 ANALOG
+  PIN btn = P3.2 INPUT ACTIVE LOW
+
+  DEFINE flash (times) (ms):
+    REPEAT times:
+      turn on led
+      wait ms ms
+      turn off led
+      wait ms ms
+
+  WHEN started:
+    wait until btn
+    FOREVER:
+      set level to pot
+      IF level > 512 THEN:
+        flash 3, 80
+      ELSE:
+        flash 1, 400
+      REPEAT UNTIL btn:
+        wait 50 ms
+"""
+req = urllib.request.Request(f"{BASE}/transpile", json.dumps({"code": FULL}).encode(),
+                             {"Content-Type": "application/json"})
+with urllib.request.urlopen(req, timeout=120) as response:
+    tr = json.load(response)
+check("full program transpiles", tr.get("success") is True, tr.get("error", "")[:60])
+c = tr.get("c", "")
+check("procedure forward-declared", "static void bw_flash(int times, int ms);" in c)
+check("procedure defined", "static void bw_flash(int times, int ms)\n{" in c)
+check("call emitted", "bw_flash(3, 80);" in c)
+check("parameters stay local", tr.get("variables") == ["level"], str(tr.get("variables")))
+check("ADC helper emitted", "static unsigned int adc_read" in c)
+check("analog pin -> channel", "adc_read(2)" in c)
+check("P1ASF set for the channel", "P1ASF = 0x04" in c)
+check("analog pin set high-impedance", "P1M1 |=  0x04" in c)
+check("wait until -> spin", "while (!((!P3_2))) ;" in c)
+check("REPEAT UNTIL -> negated while", "while (!((!P3_2))) {" in c)
+
+result, _ = post({"code": FULL, "language": "pseudocode"})
+check("full program compiles", result.get("success") is True, result.get("error", "")[:60])
+image, errors = code_bytes(base64.b64decode(result["base64"]).decode())
+check("image is valid", not errors and len(image) > 200, f"{len(image)} bytes")
+check("no compiler warnings", not (result.get("log") or "").strip(),
+      (result.get("log") or "").strip()[:60])
+
+for source, expect in [
+    ("PIN p = P2.0 ANALOG\nWHEN started:\n  wait 1 ms", "ANALOG is only available"),
+    ("DEFINE f (a):\n  wait 1 ms\nDEFINE f (b):\n  wait 1 ms\nWHEN started:\n  f 1",
+     "defined twice"),
+    ("DEFINE f (a):\n  wait 1 ms\nWHEN started:\n  f 1, 2", "takes 1 argument"),
+]:
+    result, _ = post({"code": source, "language": "pseudocode"})
+    check(expect[:22], result.get("success") is False and expect in result.get("error", ""),
+          result.get("error", "")[:56])
+
+check("procedures may be called before they are defined",
+      post({"code": "WHEN started:\n  beep\nDEFINE beep:\n  wait 1 ms",
+            "language": "pseudocode"})[0].get("success") is True)
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
