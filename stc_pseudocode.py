@@ -205,18 +205,57 @@ class Procedure:
 
 
 @dataclass
+class Part:
+    """What the C emitter must know about a chip family.
+
+    The whole point of keeping this explicit: an STC12C5A60S2 drops into an
+    STC89C52 socket pin-for-pin, but the 1T core runs software delay loops
+    6-12x too fast. Our generated code never busy-waits -- every delay and
+    every scheduler tick is Timer 0 at FOSC/12, which both families count
+    identically -- so the same pseudocode is timing-correct on either chip.
+    """
+    header: str                 # the SDCC header with this family's registers
+    port_modes: bool            # PxM0/PxM1 exist (STC12); STC89 is quasi-bidi
+    aux_1t_bit: bool            # AUXR.7 selects T0 1T mode and must be cleared
+    adc: bool                   # 10-bit ADC on P1 (STC12 only)
+
+
+PARTS = {
+    "stc12c5a60s2": Part("stc12.h", True, True, True),
+    "stc12c5a16s2": Part("stc12.h", True, True, True),
+    "stc89c52rc": Part("8052.h", False, False, False),
+    "stc89c52": Part("8052.h", False, False, False),
+    # The STC15 borrows stc12.h deliberately: every register the EMITTER
+    # touches (P0-P3, PxM0/PxM1, AUXR, Timer 0, P1ASF, the ADC block) sits at
+    # the same address on the STC15F2K60S2. The famous divergences (Timer 2
+    # at 0xD6/0xD7, S3CON...) are registers this generator never writes.
+    # Keil TRANSLATION of arbitrary STC15 code is a different problem with
+    # its own family shim.
+    "stc15f2k60s2": Part("stc12.h", True, True, True),
+}
+
+
+@dataclass
 class Program:
     part: str = "stc12c5a60s2"
     clock: int = 11059200
     pins: dict = field(default_factory=dict)
     variables: list = field(default_factory=list)
     procedures: dict = field(default_factory=dict)
+    # One entry per `WHEN started:` block. `body` mirrors whens[0] so older
+    # call sites keep working; with several blocks the C back end emits a
+    # cooperative scheduler instead of straight-line code.
+    whens: list = field(default_factory=list)
     body: list = field(default_factory=list)
     locals_: set = field(default_factory=set)
 
     @property
     def uses_adc(self) -> bool:
         return any(pin.direction == "analog" for pin in self.pins.values())
+
+    @property
+    def chip(self) -> Part:
+        return PARTS[self.part]
 
 
 # ====================================================================== lexing
@@ -503,6 +542,11 @@ def parse(source: str) -> Program:
     device = re.fullmatch(r"device\s+([\w-]+)\s*:", lines[0].text, re.I)
     if device:
         program.part = device.group(1).lower()
+        if program.part not in PARTS:
+            raise PseudocodeError(
+                lines[0].number,
+                f"unknown device {device.group(1)!r}; known: "
+                + ", ".join(sorted(PARTS)))
         index = 1
 
     # Pass one: register every DEFINE header, so a procedure may be called
@@ -555,10 +599,11 @@ def parse(source: str) -> Program:
             continue
 
         if WHEN_RE.fullmatch(lowered):
-            if started:
-                raise PseudocodeError(line.number, "only one WHEN block is supported")
             started = True
-            program.body, index = parse_block(lines, index + 1, line.indent, program)
+            block, index = parse_block(lines, index + 1, line.indent, program)
+            if not block:
+                raise PseudocodeError(line.number, "'WHEN started:' block is empty")
+            program.whens.append(block)
             continue
 
         raise PseudocodeError(
@@ -567,8 +612,32 @@ def parse(source: str) -> Program:
 
     if not started:
         raise PseudocodeError(lines[-1].number, "no 'WHEN started:' block")
-    if not program.body:
-        raise PseudocodeError(lines[-1].number, "'WHEN started:' block is empty")
+    program.body = program.whens[0]
+
+    if program.uses_adc and not program.chip.adc:
+        raise PseudocodeError(
+            lines[0].number,
+            f"ANALOG pins need an ADC, and the {program.part} has none")
+
+    if len(program.whens) > 1:
+        # Each WHEN block becomes a cooperative task; a wait inside a
+        # procedure would have to suspend the CALLER's state machine, which
+        # single-level state machines cannot express. Scratch has the same
+        # shape (scripts yield, custom blocks run to completion).
+        def waits(body):
+            for node in body:
+                if isinstance(node, (Wait, WaitUntil)):
+                    return True
+                for inner in ("body", "orelse"):
+                    if waits(getattr(node, inner, [])):
+                        return True
+            return False
+        for procedure in program.procedures.values():
+            if waits(procedure.body):
+                raise PseudocodeError(
+                    lines[0].number,
+                    f"with several WHEN blocks, procedures must not wait -- "
+                    f"{procedure.name!r} does; move the wait into the WHEN block")
     return program
 
 
@@ -660,8 +729,9 @@ def emit_pseudocode(program: Program) -> str:
         params = "".join(f" ({name})" for name in procedure.params)
         out.append(f"  DEFINE {procedure.name}{params}:")
         out += stmts_pseudo(procedure.body, 2, active_low)
-    out += ["", "  WHEN started:"]
-    out += stmts_pseudo(program.body, 2, active_low)
+    for block in program.whens:
+        out += ["", "  WHEN started:"]
+        out += stmts_pseudo(block, 2, active_low)
     return "\n".join(out) + "\n"
 
 
@@ -750,35 +820,169 @@ def stmts_c(body: list, depth: int, pins: dict, procs: dict, counter: list) -> l
     return out
 
 
+def has_wait(body: list) -> bool:
+    for node in body:
+        if isinstance(node, Wait):
+            return True
+        if has_wait(getattr(node, "body", [])) or has_wait(getattr(node, "orelse", [])):
+            return True
+    return False
+
+
+def stmts_task(body: list, depth: int, pins: dict, procs: dict, counter: list,
+               task: str, states: list, statics: list) -> list[str]:
+    """One task's statements as the interior of a Duff's-device state machine.
+
+    The switch sits in the caller; case labels land inside whatever nesting
+    the statements build, which C allows as long as no inner switch appears
+    (we emit none). Every wait AND every loop back-edge is a numbered yield
+    -- the latter is Scratch's own scheduling contract, and it is what makes
+    a busy FOREVER loop unable to starve the other tasks."""
+    pad = "    " * depth
+    out = []
+
+    def yield_state():
+        states[0] += 1
+        return states[0]
+
+    for node in body:
+        if isinstance(node, SetPin):
+            out.append(f"{pad}{pins[node.pin].sfr} = {1 if node.high else 0};")
+        elif isinstance(node, Toggle):
+            sfr = pins[node.pin].sfr
+            out.append(f"{pad}{sfr} = !{sfr};")
+        elif isinstance(node, Wait):
+            state = yield_state()
+            out += [f"{pad}{task}_until = bw_now() + ({ms_of(node, pins)});",
+                    f"{pad}{task}_state = {state};",
+                    f"{pad}case {state}:",
+                    f"{pad}if ((int)(bw_now() - {task}_until) < 0) return;"]
+        elif isinstance(node, WaitUntil):
+            state = yield_state()
+            out += [f"{pad}{task}_state = {state};",
+                    f"{pad}case {state}:",
+                    f"{pad}if (!({expr_c(node.cond, pins)})) return;"]
+        elif isinstance(node, SetVar):
+            out.append(f"{pad}{node.name} = {expr_c(node.value, pins)};")
+        elif isinstance(node, ChangeVar):
+            out.append(f"{pad}{node.name} += {expr_c(node.delta, pins)};")
+        elif isinstance(node, Forever):
+            state = yield_state()
+            out += [f"{pad}{task}_state = {state};", f"{pad}case {state}:"]
+            out += stmts_task(node.body, depth, pins, procs, counter,
+                              task, states, statics)
+            out += [f"{pad}{task}_state = {state};", f"{pad}return;"]
+        elif isinstance(node, Repeat):
+            counter[0] += 1
+            var = f"bw_i{counter[0]}"
+            statics.append(var)
+            state = yield_state()
+            out += [f"{pad}{var} = ({expr_c(node.count, pins)});",
+                    f"{pad}{task}_state = {state};",
+                    f"{pad}case {state}:",
+                    f"{pad}if ({var}) {{"]
+            out += stmts_task(node.body, depth + 1, pins, procs, counter,
+                              task, states, statics)
+            out += [f"{pad}    {var}--;",
+                    f"{pad}    {task}_state = {state};",
+                    f"{pad}    return;",
+                    f"{pad}}}"]
+        elif isinstance(node, Loop):
+            test = expr_c(node.cond, pins, UNARY_LEVEL if node.until else -1)
+            if node.until:
+                test = f"!({test})"
+            state = yield_state()
+            out += [f"{pad}{task}_state = {state};",
+                    f"{pad}case {state}:",
+                    f"{pad}if ({test}) {{"]
+            out += stmts_task(node.body, depth + 1, pins, procs, counter,
+                              task, states, statics)
+            out += [f"{pad}    {task}_state = {state};",
+                    f"{pad}    return;",
+                    f"{pad}}}"]
+        elif isinstance(node, If):
+            out.append(f"{pad}if ({expr_c(node.cond, pins)}) {{")
+            out += stmts_task(node.body, depth + 1, pins, procs, counter,
+                              task, states, statics)
+            if node.orelse:
+                out.append(f"{pad}}} else {{")
+                out += stmts_task(node.orelse, depth + 1, pins, procs, counter,
+                                  task, states, statics)
+            out.append(f"{pad}}}")
+        elif isinstance(node, Call):
+            args = ", ".join(expr_c(a, pins) for a in node.args)
+            out.append(f"{pad}{procs[node.name.lower()].c_name}({args});")
+        elif isinstance(node, Stop):
+            out += [f"{pad}{task}_state = 0xFFFF;   /* stop this script */",
+                    f"{pad}return;"]
+        else:
+            raise TypeError(node)
+    return out
+
+
 def emit_c(program: Program) -> str:
     pins = {pin.name: pin for pin in program.pins.values()}
     procs = program.procedures
     counter = [0]
+    chip = program.chip
+    tasks = len(program.whens) > 1
 
     out = [
         "/* Generated from BrickWright pseudocode by stc-compiler.",
         " * Hand edits will be lost; change the pseudocode instead. */",
-        "#include <stc12.h>",
+        f"#include <{chip.header}>",
         "",
         f"#define FOSC_HZ {program.clock}UL",
         "",
-        "/* Timer 0, mode 1, clocked at FOSC/12 -- accuracy depends only on FOSC. */",
+        "/* Timer 0, mode 1, clocked at FOSC/12 -- accuracy depends only on",
+        " * FOSC, and every supported family counts this mode identically, so",
+        " * the same program is timing-correct on a 12T STC89 and a 1T STC12",
+        " * or STC15. Nothing in the generated code ever busy-waits. */",
         "#define T0_RELOAD (65536UL - (FOSC_HZ / 12UL / 1000UL))",
         "",
-        "static void delay_ms(unsigned int ms)",
-        "{",
-        "    while (ms--) {",
-        "        TL0 = (unsigned char)(T0_RELOAD & 0xFF);",
-        "        TH0 = (unsigned char)(T0_RELOAD >> 8);",
-        "        TF0 = 0;",
-        "        TR0 = 1;",
-        "        while (!TF0) ;",
-        "        TR0 = 0;",
-        "        TF0 = 0;",
-        "    }",
-        "}",
-        "",
     ]
+    if tasks:
+        out += [
+            "/* One WHEN block = one cooperative task. Timer 0 interrupts",
+            " * every millisecond; tasks yield at every wait and at every",
+            " * loop iteration (Scratch's own scheduling contract), so no",
+            " * task can starve the others. */",
+            "static volatile unsigned int bw_ms;",
+            "",
+            "void bw_tick(void) __interrupt(1)",
+            "{",
+            "    TL0 = (unsigned char)(T0_RELOAD & 0xFF);",
+            "    TH0 = (unsigned char)(T0_RELOAD >> 8);",
+            "    bw_ms++;",
+            "}",
+            "",
+            "/* A 16-bit read is not atomic on an 8051; hold the tick off. */",
+            "static unsigned int bw_now(void)",
+            "{",
+            "    unsigned int t;",
+            "    ET0 = 0;",
+            "    t = bw_ms;",
+            "    ET0 = 1;",
+            "    return t;",
+            "}",
+            "",
+        ]
+    else:
+        out += [
+            "static void delay_ms(unsigned int ms)",
+            "{",
+            "    while (ms--) {",
+            "        TL0 = (unsigned char)(T0_RELOAD & 0xFF);",
+            "        TH0 = (unsigned char)(T0_RELOAD >> 8);",
+            "        TF0 = 0;",
+            "        TR0 = 1;",
+            "        while (!TF0) ;",
+            "        TR0 = 0;",
+            "        TF0 = 0;",
+            "    }",
+            "}",
+            "",
+        ]
 
     if program.uses_adc:
         out += [
@@ -812,16 +1016,47 @@ def emit_c(program: Program) -> str:
                     f"static void {procedure.c_name}({params})", "{",
                     *stmts_c(procedure.body, 1, pins, procs, counter), "}", ""]
 
+    task_lines: list[str] = []
+    task_names: list[str] = []
+    if tasks:
+        statics: list[str] = []
+        for number, block in enumerate(program.whens):
+            task = f"bw_task{number}"
+            task_names.append(task)
+            states = [0]
+            body = stmts_task(block, 1, pins, procs, counter, task,
+                              states, statics)
+            head = [f"static unsigned int {task}_state;"]
+            if has_wait(block):
+                head.append(f"static unsigned int {task}_until;")
+            task_lines += head
+            task_lines += [f"/* WHEN started: (script {number + 1}) */",
+                           f"static void {task}(void)", "{",
+                           f"    switch ({task}_state) {{",
+                           "    case 0:",
+                           *body,
+                           "    }",
+                           f"    {task}_state = 0xFFFF;   /* ran to the end */",
+                           "}", ""]
+        if statics:
+            task_lines[0:0] = ["/* REPEAT counters live across yields. */",
+                               *(f"static unsigned int {name};" for name in statics),
+                               ""]
+        out += task_lines
+
     out += ["void main(void)", "{"]
 
     outputs: dict = {}
     for pin in program.pins.values():
         if pin.direction == "output":
             outputs[pin.port] = outputs.get(pin.port, 0) | pin.mask
-    for port in sorted(outputs):
-        mask = outputs[port]
-        out += [f"    P{port}M1 &= ~0x{mask:02X};   /* push-pull */",
-                f"    P{port}M0 |=  0x{mask:02X};"]
+    if chip.port_modes:
+        for port in sorted(outputs):
+            mask = outputs[port]
+            out += [f"    P{port}M1 &= ~0x{mask:02X};   /* push-pull */",
+                    f"    P{port}M0 |=  0x{mask:02X};"]
+    # On a quasi-bidirectional-only part (STC89) there is nothing to set up:
+    # active-low wiring sinks the LED current either way.
     for pin in program.pins.values():
         if pin.direction == "output":
             out.append(f"    {pin.sfr} = {1 if pin.active_low else 0};"
@@ -838,12 +1073,25 @@ def emit_c(program: Program) -> str:
                 f"    P1M0 &= ~0x{analog:02X};",
                 "    ADC_CONTR = 0xE0;              /* ADC on, fastest conversion */"]
 
-    out += ["",
-            "    AUXR &= ~0x80;                 /* Timer 0 at FOSC/12 */",
-            "    TMOD  = (TMOD & 0xF0) | 0x01;  /* Timer 0, mode 1 */",
-            ""]
-    out += stmts_c(program.body, 1, pins, procs, counter)
-    out += ["}", ""]
+    out.append("")
+    if chip.aux_1t_bit:
+        out.append("    AUXR &= ~0x80;                 /* Timer 0 at FOSC/12 */")
+    out.append("    TMOD  = (TMOD & 0xF0) | 0x01;  /* Timer 0, mode 1 */")
+    if tasks:
+        out += ["    TL0 = (unsigned char)(T0_RELOAD & 0xFF);",
+                "    TH0 = (unsigned char)(T0_RELOAD >> 8);",
+                "    ET0 = 1;                       /* millisecond tick */",
+                "    EA  = 1;",
+                "    TR0 = 1;",
+                "",
+                "    for (;;) {",
+                *(f"        {name}();" for name in task_names),
+                "    }",
+                "}", ""]
+    else:
+        out.append("")
+        out += stmts_c(program.body, 1, pins, procs, counter)
+        out += ["}", ""]
     return "\n".join(out)
 
 

@@ -112,6 +112,61 @@ PROGRAMS = {
           change n by 1
     wait 1 ms
 """,
+    # Two scripts: the C back end switches to the cooperative scheduler
+    # (Timer 0 tick + one state machine per WHEN block). The pseudocode side
+    # must stay transparent regardless.
+    "two-scripts": """DEVICE STC12C5A60S2:
+  CLOCK 11059200
+  PIN led1 = P1.0 OUTPUT ACTIVE LOW
+  PIN led2 = P1.1 OUTPUT ACTIVE LOW
+  PIN button = P3.2 INPUT ACTIVE LOW
+  WHEN started:
+    FOREVER:
+      toggle led1
+      wait 300 ms
+  WHEN started:
+    FOREVER:
+      wait until button
+      toggle led2
+      REPEAT 4:
+        wait 50 ms
+      wait until not button
+""",
+    "three-scripts": """WHEN started:
+  set beats to 0
+  FOREVER:
+    change beats by 1
+    wait 100 ms
+WHEN started:
+  FOREVER:
+    WHILE beats < 10:
+      wait 20 ms
+    set beats to 0
+WHEN started:
+  REPEAT 5:
+    wait 1 seconds
+  stop
+""",
+    # A 12T part: no PxM registers, no AUXR, Timer 0 math identical -- the
+    # drop-in-socket scenario where software delays would run 6-12x fast is
+    # exactly what the timer-based emission avoids.
+    "stc89": """DEVICE STC89C52RC:
+  CLOCK 11059200
+  PIN led = P1.0 OUTPUT ACTIVE LOW
+  WHEN started:
+    FOREVER:
+      toggle led
+      wait 500 ms
+""",
+    "stc15": """DEVICE STC15F2K60S2:
+  CLOCK 11059200
+  PIN led = P1.0 OUTPUT ACTIVE LOW
+  PIN pot = P1.3 ANALOG
+  WHEN started:
+    FOREVER:
+      wait pot ms
+      toggle led
+""",
 }
 
 # Hop orders. Only one text hop exists today, so depth is what varies; the

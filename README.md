@@ -87,6 +87,19 @@ instruction length. Verified across four programs, 90 distinct opcodes.
 Linear sweep, not a control-flow trace — right for comparing against a compiler
 listing, but data embedded in the code stream would decode as nonsense.
 
+### `POST /translate-project`
+
+A whole Keil project in one request: `{"files": {"path": "content", ...}}`.
+Every `.c`/`.h` is translated with a shared header map; ISR prototypes are
+injected into `main()`'s file (SDCC only emits a vector when the handler is
+visible there — Keil links vectors separately, so per-file translation
+compiles cleanly and the interrupt never fires); externs whose definitions
+differ only in case are unified (BL51 links case-insensitively, sdld does
+not); `_at_` addresses are stamped onto their extern declarations; and a
+`.uvproj`, when present, selects the real source list and the memory model.
+With `"link": true` the response also carries one linked, flashable image.
+The browser UI's **Keil project…** button is this endpoint.
+
 ### `POST /decompile`
 
 Pseudocode in, canonical pseudocode out — `parse` followed by
@@ -180,25 +193,39 @@ unreachable from an open toolchain. The two disagree on syntax, not semantics.
 | `_nop_`, `_crol_`, … | `keil-shim/intrins.h` |
 
 `sbit` needs the SFR's address to turn `P1^0` into `0x90`. Those come from
-SDCC's own `mcs51/stc12.h` plus any `sfr` the file declares itself — kept in
-separate tables, because a file's own declaration must not look like a
-duplicate of itself.
+SDCC's own headers plus any `sfr` the file declares itself — and the file's
+own declarations are always kept: SDCC accepts an identical redeclaration
+(only a differing address is an error), and in a project the file may be the
+only place its translation unit gets that register from.
 
-Declarations that duplicate one SDCC already provides at the same address are
-dropped rather than emitted: SDCC treats a second declaration of an SFR as an
-error, not a redefinition. `keil-shim/keil-compat.h` is **generated**
-(`generate-compat.py`) with the same filter, so an SDCC release that adds a
-register cannot silently break the shim.
+**Register families.** `reg51.h`/`reg52.h`/`REGX52.H` map onto SDCC's
+8051.h/8052.h — reg52 code expects Timer 2, which the STC12 does not have —
+plus generated STC89 extras. `stc15*.h` maps onto its own family header with
+Timer 2 at the STC15's 0xD6/0xD7. The chip-ambiguous registers (`WDT_CONTR`
+is 0xC1 on an STC12 and 0xE1 on an STC89; `P4` is 0xC0 vs 0xE8) are left to
+the file's own declarations on purpose. All compat headers are **generated**
+(`keil-shim/generate-compat.py`) from datasheet facts, never copied from a
+vendor header.
 
-Bare `data` and `code` are rewritten only where followed by whitespace and a
-type, identifier or `*`. Used as ordinary identifiers they are followed by an
-operator instead — `g(data)`, `code == 3`, `data[i]` — and that asymmetry is
-what makes the rewrite safe without parsing C properly.
+**Beyond syntax, the translator also knows the traps:**
 
-**Measured, not asserted: 65 of 86 (75%)** of the Keil-dialect files in a
-survey of 36 public STC12 projects compile after translation. Remaining
-failures are mostly not dialect: missing project headers, function-pointer
-signatures SDCC rejects, and struct initialiser differences.
+- *ISR vectors*: SDCC only emits one if the handler is visible in `main()`'s
+  file; Keil links vectors separately. Single files get a warning;
+  `POST /translate-project` injects the prototypes and fixes it.
+- *Case*: Keil's BL51 links symbols case-insensitively, uVision resolves
+  includes case-insensitively; project mode unifies both.
+- *Timing*: a 1T part (STC12/STC15) dropped into a 12T socket (STC89) runs
+  software delay loops ~6–12× too fast and breaks bit-banged I2C/1-wire.
+  The translator flags busy-wait loops and `_nop_()` runs so the migration
+  does not fail silently.
+
+**Measured, not asserted: 546 of 597 Keil-dialect files (91%)** across 86
+public 8051 projects (GitHub + Gitee) compile after translation — and on the
+one project of the corpus whose SDCC conversion also exists hand-written,
+the translator converts **31 of 31** programs. Whole projects link to a
+flashable image via `/translate-project` (uVision `.uvproj` respected for
+source list and memory model). Remaining failures are broken sources and
+constructs that need a typed front end.
 
 ## Pseudocode
 
@@ -275,8 +302,8 @@ That is the shape `sb3-creator` uses, where blocks are the IR and
 testable, because `parse` and `emit_pseudocode` have to be inverses.
 `scripts/test-roundtrip.py` checks it the way `transparency.test.mjs` does:
 every hop is compared against the **original**, not merely against the previous
-hop, because a degraded output is a stable fixed point too. 273 checks over
-seven programs, including one built specifically around operator precedence —
+hop, because a degraded output is a stable fixed point too. 429 checks over
+twelve programs — including multi-script schedulers, three chip families, and one built specifically around operator precedence —
 if the right operand of a binary node is not re-emitted one level tighter,
 `a - (b - c)` silently comes back as `(a - b) - c`.
 
@@ -286,10 +313,20 @@ if the right operand of a binary node is not re-emitted one level tighter,
 |---|---|
 | `stc12c5a60s2` | `--iram-size 256 --xram-size 1024 --code-size 61440` |
 | `stc12c5a16s2` | as above, `--code-size 16384` |
+| `stc89c52rc` | `--iram-size 256 --xram-size 256 --code-size 8192` (12T) |
+| `stc15f2k60s2` | `--iram-size 256 --xram-size 1792 --code-size 61440` (1T) |
 | `mcs51` | none — bring your own via `options` |
 
 Every target compiles `-mmcs51 --std-c99`. Adding a part is three lines in
 `TARGETS` in [`app.py`](app.py).
+
+The pseudocode front end is part-aware too: `DEVICE STC89C52RC:` emits code
+without port-mode registers or the AUXR 1T bit, refuses `ANALOG` pins (no
+ADC), and times everything off Timer 0 at FOSC/12 — which 12T and 1T cores
+count identically, so the same program is timing-correct across families.
+Several `WHEN started:` blocks compile to a cooperative scheduler (Timer-0
+millisecond tick, one state machine per script, a yield at every wait and
+every loop iteration — Scratch's own contract).
 
 ---
 

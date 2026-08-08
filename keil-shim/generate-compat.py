@@ -62,6 +62,22 @@ STC12_CONSTANTS = [
     ("ES2", "0x01", "IE2 bit 0, UART2 interrupt enable"),
 ]
 
+# -------------------------------------------------------------- STC15 facts
+# Source: STC15F2K60S2 datasheet (stcmicro.com). Most of the STC15's map
+# matches the STC12's -- which is why the shim can sit on stc12.h -- and the
+# entries here are exactly the divergent/additional ones. Note Timer 2: T2H
+# at 0xD6, T2L at 0xD7, controlled from AUXR bits (no T2CON); this is the
+# register pair that made blanket stc15->stc12 mapping dangerous before the
+# family got its own header.
+STC15_SFRS = [
+    ("T2H", 0xD6), ("T2L", 0xD7),
+    ("INT_CLKO", 0x8F),
+    ("WKTCL", 0xAA), ("WKTCH", 0xAB),
+    ("P5", 0xC8), ("P5M1", 0xC9), ("P5M0", 0xCA),
+    ("P6", 0xE8), ("P6M1", 0xCB), ("P6M0", 0xCC),
+    ("P7", 0xF8), ("P7M1", 0xE1), ("P7M0", 0xE2),
+]
+
 # -------------------------------------------------------------- STC89 facts
 # Source: STC89C51RC/RD+ datasheet (stcmicro.com/datasheet/STC89C51RC-en.pdf).
 # AUXR/AUXR1/IPH sit at the same addresses on the STC12, so SDCC's own
@@ -152,6 +168,17 @@ body += ["", "/* Older vendor headers spell the IAP registers ISP_*. */"]
 body += [f"#define ISP_{n[4:]:<8} {n}" for n, _ in STC12_SFRS
          if n.startswith("IAP_")]
 write("keil-compat-stc12.h", "_KEIL_COMPAT_STC12_H_", body)
+
+# ------------------------------------------------------------------ stc15
+body = ["/* STC15F2K60S2 additions on top of stc12.h (see the generator for",
+        "   why the base is stc12.h: the two maps agree except for these).",
+        "   P5/P6/P7 are bit-addressable where the address allows. */"]
+body += [f"__sfr __at (0x{a:02X}) {n};" for n, a in STC15_SFRS
+         if n not in have_stc12]
+body += ["", "/* Port bit aliases for the extra ports. */"]
+for port, address in (("P5", 0xC8), ("P6", 0xE8), ("P7", 0xF8)):
+    body += port_aliases(port, address, ("plain", "underscore"))
+write("keil-compat-stc15.h", "_KEIL_COMPAT_STC15_H_", body)
 
 # ------------------------------------------------------------------ 8052/STC89
 body = ["/* STC89C5xRC/RD+ extras a reg51/reg52 project expects, restricted",

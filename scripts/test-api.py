@@ -440,5 +440,59 @@ if project.get("success"):
     check("timer-0 vector emitted at 0x000B", image.get(0x0B) is not None
           and image.get(0x0B) != 0xFF, hex(image.get(0x0B, -1)))
 
+print("\nscheduler and families")
+TWO_SCRIPTS = """DEVICE STC12C5A60S2:
+CLOCK 11059200
+PIN led1 = P1.0 OUTPUT ACTIVE LOW
+PIN led2 = P1.1 OUTPUT ACTIVE LOW
+WHEN started:
+  FOREVER:
+    toggle led1
+    wait 300 ms
+WHEN started:
+  FOREVER:
+    toggle led2
+    wait 700 ms
+"""
+result, _ = post({"code": TWO_SCRIPTS, "language": "pseudocode", "format": "ihx"})
+check("two WHEN scripts compile", result.get("success") is True,
+      result.get("error", "")[:70])
+if result.get("success"):
+    image, errors = code_bytes(base64.b64decode(result["base64"]).decode())
+    check("scheduler tick vector at 0x000B", image.get(0x0B) is not None)
+    check("generated C has two task machines",
+          (result.get("c") or "").count("bw_task") >= 2)
+
+STC89 = """DEVICE STC89C52RC:
+CLOCK 11059200
+PIN led = P1.0 OUTPUT ACTIVE LOW
+WHEN started:
+  FOREVER:
+    toggle led
+    wait 500 ms
+"""
+result, _ = post({"code": STC89, "language": "pseudocode",
+                  "target": "stc89c52rc", "format": "ihx"})
+check("STC89 target + device compiles", result.get("success") is True,
+      result.get("error", "")[:70])
+if result.get("success"):
+    c = result.get("c") or ""
+    check("STC89 code avoids STC12-only registers",
+          "P1M0" not in c and "AUXR" not in c and "8052.h" in c)
+
+result, _ = post({"code": "#include <STC15F2K60S2.h>\nvoid main(void)"
+                          "{ T2L = 0x8F; T2H = 0xFD; while (1); }",
+                  "language": "keil", "target": "stc15f2k60s2"})
+check("STC15 Keil family (T2 at 0xD6/0xD7) compiles",
+      result.get("success") is True, result.get("error", "")[:70])
+
+result, _ = post({"code": "#include <reg52.h>\nvoid d(unsigned int t)"
+                          "{ unsigned char j; while(t--) { j=200; while(--j); } }\n"
+                          "void main(void){ d(100); while(1); }",
+                  "language": "keil"})
+check("timing lint flags busy-wait loops",
+      any("busy-wait" in w for w in result.get("warnings") or []),
+      str(result.get("warnings"))[:70])
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

@@ -62,6 +62,16 @@ TARGETS = {
                   "--code-size", "16384"],
         "description": "STC12C5A16S2 — 16 KB flash",
     },
+    "stc89c52rc": {
+        "flags": ["--iram-size", "256", "--xram-size", "256",
+                  "--code-size", "8192"],
+        "description": "STC89C52RC — 8 KB flash, 256 B IRAM, 256 B XRAM, 12T",
+    },
+    "stc15f2k60s2": {
+        "flags": ["--iram-size", "256", "--xram-size", "1792",
+                  "--code-size", "61440"],
+        "description": "STC15F2K60S2 — 60 KB flash, 256 B IRAM, 1792 B XRAM, 1T",
+    },
     # Escape hatch: no size limits, caller supplies everything via `options`.
     "mcs51": {
         "flags": [],
@@ -857,12 +867,15 @@ PAGE = r"""<!doctype html>
     <select id=language>
       <option value=pseudocode>Pseudocode</option>
       <option value=c selected>C</option>
+      <option value=keil>Keil C51</option>
     </select>
   </label>
   <label>target
     <select id=target>
       <option value=stc12c5a60s2>STC12C5A60S2</option>
       <option value=stc12c5a16s2>STC12C5A16S2</option>
+      <option value=stc89c52rc>STC89C52RC</option>
+      <option value=stc15f2k60s2>STC15F2K60S2</option>
       <option value=mcs51>generic 8051</option>
     </select>
   </label>
@@ -875,6 +888,8 @@ PAGE = r"""<!doctype html>
     </select>
   </label>
   <button class=primary id=go>Compile</button>
+  <button class=ghost id=proj title="Pick a whole Keil project's .c/.h/.uvproj files; translate, link and download one image">Keil project&hellip;</button>
+  <input type=file id=projfiles multiple hidden>
   <button class=ghost id=dl disabled>Download</button>
   <button class=ghost id=copy disabled>Copy</button>
   <span id=status class=dim>ready</span>
@@ -997,6 +1012,60 @@ $('go').onclick = async () => {
     $('status').textContent = 'error';
     $('out').textContent = String(err);
   }
+  setBusy(false);
+};
+
+$('proj').onclick = () => $('projfiles').click();
+$('projfiles').onchange = async () => {
+  const picked = Array.from($('projfiles').files);
+  if (!picked.length) return;
+  setBusy(true);
+  $('status').className = 'dim';
+  $('status').textContent = 'translating ' + picked.length + ' files...';
+  image = null;
+  try {
+    const files = {};
+    for (const f of picked) files[f.name] = await f.text();
+    const response = await fetch('/translate-project', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        files, link: true,
+        target: $('target').value,
+        format: $('format').value,
+        disassemble: true,
+      })
+    });
+    const data = await response.json();
+    const notes = []
+      .concat(data.isr_injected ? ['ISR prototypes injected:',
+              ...data.isr_injected.map(s => '  ' + s), ''] : [])
+      .concat(data.warnings ? ['warnings:',
+              ...data.warnings.map(s => '  ' + s), ''] : [])
+      .concat(data.log ? [data.log] : []);
+    $('log').textContent = notes.join('\n') || '(no warnings)';
+    if (data.success && data.base64) {
+      image = {bytes: bytesFromBase64(data.base64), filename: data.filename};
+      $('status').className = 'ok';
+      $('status').textContent = data.bytes + ' bytes → ' + data.filename;
+      $('out').textContent = ($('format').value === 'bin')
+        ? hexdump(image.bytes)
+        : new TextDecoder().decode(image.bytes);
+      $('asm').textContent = data.disassembly || '';
+      document.querySelector('#tabs button[data-pane=asm]').hidden = !data.disassembly;
+      $('mem').textContent = data.memory || '(none)';
+      $('dl').disabled = false;
+      $('copy').disabled = ($('format').value === 'bin');
+    } else {
+      $('status').className = 'err';
+      $('status').textContent = data.success === false ? 'failed' : 'translated, link failed';
+      $('out').textContent = data.error || 'unknown error';
+    }
+  } catch (err) {
+    $('status').className = 'err';
+    $('status').textContent = 'error';
+    $('out').textContent = String(err);
+  }
+  $('projfiles').value = '';
   setBusy(false);
 };
 

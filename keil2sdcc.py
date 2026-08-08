@@ -59,9 +59,14 @@ HEADER_MAP = {
     "stc12c5a60s2_p.h": "keil-stc12.h",
     "stc12c5a60ad.h": "keil-stc12.h",
     "stc12c5a56s2.h": "keil-stc12.h",
-    # Deliberately NOT mapped: stc15*.h. The STC15 puts Timer 2 at 0xD6/0xD7
-    # where the 8052 (and SDCC's stc12.h) has 0xCC/0xCD, so redirecting it here
-    # would produce code that compiles and writes to the wrong registers.
+    # The STC15 gets its OWN family header. Redirecting stc15 code onto plain
+    # stc12.h used to be refused outright -- its Timer 2 (T2H/T2L at
+    # 0xD6/0xD7, no T2CON) is nowhere near the 8052's -- and that is exactly
+    # what keil-compat-stc15.h now declares correctly.
+    "stc15f2k60s2.h": "keil-stc15.h",
+    "stc15.h": "keil-stc15.h",
+    "stc15f2k.h": "keil-stc15.h",
+    "stc15w4k32s4.h": "keil-stc15.h",
     "reg51.h": "keil-reg51.h",
     "reg52.h": "keil-reg52.h",
     "regx51.h": "keil-reg51.h",
@@ -668,6 +673,29 @@ def translate(source: str, known: dict[str, int] | None = None,
             shim = "keil-reg52.h" if used & timer2 else "keil-stc12.h"
             source = f"#include <{shim}>\n" + source
             bump("register-include")
+
+    # --- timing lint --------------------------------------------------------
+    # The classic drop-in-upgrade trap: an STC12 (1T) sits pin-for-pin in an
+    # STC89/8051 (12T) socket, but software delay loops run roughly 6-12x
+    # faster on it, and bit-banged protocols (I2C, 1-wire, DS18B20) stop
+    # working. Timer peripherals are immune (both families count Timer 0 at
+    # FOSC/12 in the default mode). We cannot know which chip this code will
+    # land on, so flag the constructs whose timing is clock-model-bound.
+    busy_loops = len(re.findall(
+        r"\b(?:for|while)\s*\([^;()]*;?[^;()]*;?[^()]*\)\s*(?:;|\{\s*\})",
+        source))
+    busy_loops += len(re.findall(r"while\s*\(\s*--?\s*\w+\s*\)\s*;", source))
+    nop_runs = len(re.findall(r"(?:_nop_\s*\(\s*\)\s*;[\s\\]*){3,}", source))
+    if busy_loops:
+        warnings.append(
+            f"{busy_loops} software busy-wait loop(s): cycle-counted delays "
+            "run ~6-12x faster on a 1T part (STC12/STC15) than on a 12T "
+            "8051/STC89 -- recalibrate or move to timer-based delays if the "
+            "code migrates between families")
+    if nop_runs:
+        warnings.append(
+            f"{nop_runs} run(s) of 3+ _nop_() calls: nop-timed bit-banging is "
+            "12x shorter on a 1T part than on a 12T one")
 
     # --- ISR visibility ---------------------------------------------------
     # SDCC only emits an interrupt vector if the ISR (or a prototype) is visible
