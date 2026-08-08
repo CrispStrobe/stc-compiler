@@ -654,6 +654,245 @@ class ArduinoTarget(Target):
         return out + ["}", ""]
 
 
+# ------------------------------------------------------------------ bare AVR
+
+# The ATmega328P as the board silkscreen labels it. D8-D13 are port B, D0-D7
+# port D, A0-A5 port C -- an ordering that looks arbitrary because it is: it
+# follows the physical layout of the DIP package, not the ports.
+AVR_328P_PINS = {
+    **{f"D{n}": ("D", n) for n in range(8)},
+    **{f"D{8 + n}": ("B", n) for n in range(6)},
+    **{f"A{n}": ("C", n) for n in range(6)},
+}
+AVR_328P_BY_PORT = {location: label for label, location in AVR_328P_PINS.items()}
+
+AVR_PIN_RE = re.compile(r"^(?:([da])(\d{1,2})|p([b-d])(\d))$", re.I)
+
+# Timer 0 prescalers, smallest first, with their CS02:CS00 bits. The tick wants
+# an EXACT millisecond, so the emitter picks the first prescaler that divides
+# the clock evenly into 1 kHz and still fits an 8-bit compare register.
+AVR_PRESCALERS = [(1, "_BV(CS00)"), (8, "_BV(CS01)"),
+                  (64, "_BV(CS01) | _BV(CS00)"), (256, "_BV(CS02)"),
+                  (1024, "_BV(CS02) | _BV(CS00)")]
+
+
+@dataclass
+class AvrPin(Pin):
+    """A port letter and a bit, plus the ADC channel where there is one."""
+    port: str = ""
+    bit: int = 0
+    channel: int | None = None
+
+
+class AvrTarget(Target):
+    """ATmega parts compiled by avr-gcc, with no Arduino core underneath.
+
+    Same boards as the Arduino target -- an ATmega328P *is* an Uno -- and
+    deliberately not the same output. The core's digitalWrite looks up the
+    port in a PROGMEM table and checks whether it has to disable a PWM channel,
+    on every call, at runtime. This generator already knows the pin at emit
+    time, so the same statement becomes one instruction:
+
+        turn on led   ->   PORTB |= _BV(PB5);
+
+    That is the identical discipline the 8051 target uses, it removes the
+    LGPL-licensed core from the output, and it is what lets this service
+    compile the result with a ~25 MB vendored toolchain instead of a 250 MB
+    one. Pins are still written the way the board is labelled (`D13`, `A0`),
+    because that is what the silkscreen says; `PB5` is accepted too.
+    """
+
+    toolchain = "avr-gcc"
+
+    # Our own tick, so we choose the width -- but 16 bits would wrap every 65 s
+    # and these deadlines are compared against a free-running counter, so it is
+    # the same 32-bit choice millis() forces on the Arduino target.
+    time_type = "unsigned long"
+    time_signed = "long"
+
+    def __init__(self, key: str, display: str, mcu: str, flash: int):
+        self.key = key
+        self.display = display
+        self.mcu = mcu              # what avr-gcc wants for -mmcu
+        self.flash = flash          # bytes, for the size check after linking
+
+    # ---- pins -----------------------------------------------------------
+    def resolve_pin(self, program, name, where, direction, active_low, line):
+        match = AVR_PIN_RE.match(where)
+        label = None
+        if match:
+            kind, number, port, bit = match.groups()
+            if kind:
+                label = f"{kind.upper()}{int(number)}"
+            else:
+                label = AVR_328P_BY_PORT.get((port.upper(), int(bit)))
+        if label is None or label not in AVR_328P_PINS:
+            raise PseudocodeError(
+                line, f"{where.upper()} is not a pin on the {self.display}; "
+                      "use D0-D13, A0-A5, or the port name (PB5)")
+
+        port, bit = AVR_328P_PINS[label]
+        channel = int(label[1:]) if label[0] == "A" else None
+        if direction == "analog" and channel is None:
+            raise PseudocodeError(
+                line, f"ANALOG needs an analog input, and {label} is "
+                      f"digital-only on the {self.display}; use A0-A5")
+        return AvrPin(name, label, direction, active_low, port, bit, channel)
+
+    def _bit(self, pin) -> str:
+        return f"_BV(P{pin.port}{pin.bit})"
+
+    def write_pin(self, pin, high):
+        if high:
+            return f"PORT{pin.port} |= {self._bit(pin)};"
+        return f"PORT{pin.port} &= (unsigned char)~{self._bit(pin)};"
+
+    def toggle_pin(self, pin):
+        # Writing a one to a PINx bit toggles PORTxn in hardware (datasheet
+        # 14.2.2) -- one instruction, and no read-modify-write to be
+        # interrupted halfway through.
+        return f"PIN{pin.port} = {self._bit(pin)};"
+
+    def read_pin(self, pin):
+        read = f"(PIN{pin.port} & {self._bit(pin)})"
+        return f"!{read}" if pin.active_low else read
+
+    def read_analog(self, pin):
+        return f"adc_read({pin.channel})"
+
+    # ---- time -----------------------------------------------------------
+    def delay(self, ms):
+        return f"delay_ms({ms});"
+
+    def now(self):
+        return "bw_now()"
+
+    def _tick(self, program) -> tuple[int, str, int]:
+        """Compare value, CS bits and divisor for an exact 1 kHz tick."""
+        for divisor, bits in AVR_PRESCALERS:
+            counts = program.clock / (divisor * 1000)
+            if counts.is_integer() and 1 <= counts <= 256:
+                return int(counts) - 1, bits, divisor
+        raise PseudocodeError(
+            1, f"{program.clock} Hz cannot be divided into an exact "
+               f"millisecond by Timer 0 on the {self.display}; use a clock "
+               f"like 16 MHz, 8 MHz or 1 MHz")
+
+    # ---- the shell ------------------------------------------------------
+    def prologue(self, program):
+        return [
+            "#include <avr/io.h>",
+            "#include <avr/interrupt.h>",
+            "",
+            f"#define F_CPU {program.clock}UL",
+            "",
+        ]
+
+    def runtime(self, program, tasks):
+        compare, _bits, divisor = self._tick(program)
+        out = [
+            "/* Timer 0 in CTC mode, one interrupt per millisecond. Nothing",
+            " * here busy-waits on the clock, so a wait costs no accuracy, and",
+            f" * the tick is exact rather than near: {program.clock} / {divisor}"
+            f" / {compare + 1} = 1000 Hz. */",
+            "static volatile unsigned long bw_ms;",
+            "",
+            "ISR(TIMER0_COMPA_vect)",
+            "{",
+            "    bw_ms++;",
+            "}",
+            "",
+            "/* A 32-bit read is four instructions on an 8-bit core; hold the",
+            " * tick off rather than risk tearing across the increment. */",
+            "static unsigned long bw_now(void)",
+            "{",
+            "    unsigned long t;",
+            "    unsigned char sreg = SREG;",
+            "    cli();",
+            "    t = bw_ms;",
+            "    SREG = sreg;",
+            "    return t;",
+            "}",
+            "",
+        ]
+        if not tasks:
+            out += [
+                "static void delay_ms(unsigned int ms)",
+                "{",
+                "    unsigned long until = bw_now() + ms;",
+                "    while ((long)(bw_now() - until) < 0) ;",
+                "}",
+                "",
+            ]
+        if program.uses_adc:
+            out += [
+                "/* 10-bit ADC, polled, AVcc as reference. The prescaler is set",
+                " * once in main(); this only selects the channel and waits. */",
+                "static unsigned int adc_read(unsigned char channel)",
+                "{",
+                "    ADMUX = (unsigned char)(_BV(REFS0) | (channel & 0x0F));",
+                "    ADCSRA |= _BV(ADSC);",
+                "    while (ADCSRA & _BV(ADSC)) ;",
+                "    return ADC;",
+                "}",
+                "",
+            ]
+        return out
+
+    def setup(self, program):
+        out: list[str] = []
+        for pin in program.pins.values():
+            if pin.direction == "output":
+                out.append(f"    DDR{pin.port} |= {self._bit(pin)};"
+                           f"   /* {pin.name} */")
+            elif pin.direction == "input":
+                out.append(f"    DDR{pin.port} &= (unsigned char)~{self._bit(pin)};")
+                if pin.active_low:
+                    # A button to ground; the internal pull-up is what holds
+                    # the pin high while it is not pressed.
+                    out.append(f"    PORT{pin.port} |= {self._bit(pin)};"
+                               f"   /* {pin.name} pull-up */")
+            else:
+                out.append(f"    DDR{pin.port} &= (unsigned char)~{self._bit(pin)};"
+                           f"   /* {pin.name} analog in */")
+        for pin in program.pins.values():
+            if pin.direction == "output":
+                out.append("    " + self.write_pin(pin, pin.active_low)
+                           + f"   /* {pin.name} off */")
+
+        if program.uses_adc:
+            out += ["",
+                    "    ADCSRA = _BV(ADEN) | _BV(ADPS2) | _BV(ADPS1) | _BV(ADPS0);"]
+
+        compare, bits, _divisor = self._tick(program)
+        out += ["",
+                "    TCCR0A = _BV(WGM01);           /* CTC */",
+                f"    OCR0A  = {compare};" + " " * max(1, 20 - len(str(compare)))
+                + "/* 1 kHz */",
+                "    TIMSK0 = _BV(OCIE0A);",
+                f"    TCCR0B = {bits};",
+                "    sei();"]
+        return out
+
+    def start_scheduler(self, task_names):
+        return ["", "    for (;;) {",
+                *(f"        {name}();" for name in task_names),
+                "    }"]
+
+    def main(self, program, setup_lines, body_lines, task_names):
+        out = ["int main(void)", "{"] + setup_lines
+        if task_names:
+            out += self.start_scheduler(task_names)
+        else:
+            out.append("")
+            out += body_lines
+            # main() must not fall off the end on a bare-metal part: there is
+            # no exit(), and returning lands in avr-libc's infinite loop by
+            # luck rather than intent.
+            out += ["", "    for (;;) ;"]
+        return out + ["}", ""]
+
+
 def _stc(key, display, header, port_modes, aux_1t_bit, adc):
     return Stc8051Target(key, display, header, port_modes, aux_1t_bit, adc)
 
@@ -677,6 +916,13 @@ TARGETS = {
     # because ANALOG is read-only by construction).
     "arduino-uno": ArduinoTarget("arduino-uno", "Arduino Uno", 13, 5),
     "arduino-nano": ArduinoTarget("arduino-nano", "Arduino Nano", 13, 7),
+
+    # The same silicon as an Uno/Nano/Pro Mini, emitted without the Arduino
+    # core -- which is the form this service can actually compile. Pins keep
+    # the board's own labels, so a program moves between `arduino-uno` and
+    # `atmega328p` unchanged and only the generated C differs.
+    "atmega328p": AvrTarget("atmega328p", "ATmega328P", "atmega328p", 32768),
+    "atmega168p": AvrTarget("atmega168p", "ATmega168P", "atmega168p", 16384),
 }
 
 
@@ -1225,7 +1471,12 @@ def stmts_c(body: list, depth: int, ctx: Emit) -> list[str]:
         elif isinstance(node, Wait):
             out.append(pad + ctx.target.delay(ms_of(node, ctx)))
         elif isinstance(node, WaitUntil):
-            out.append(f"{pad}while (!({expr_c(node.cond, ctx)})) ;")
+            # `{ }` rather than a bare `;`: an empty statement after a while
+            # clause is what -Wmisleading-indentation fires on, since the
+            # NEXT generated line is indented as if the loop guarded it. The
+            # braces say "this loop has no body" unambiguously, to the
+            # compiler and to anyone reading the output.
+            out.append(f"{pad}while (!({expr_c(node.cond, ctx)})) {{ }}")
         elif isinstance(node, SetVar):
             out.append(f"{pad}{node.name} = {expr_c(node.value, ctx)};")
         elif isinstance(node, ChangeVar):

@@ -1,0 +1,17 @@
+DEVICE ATMEGA328P:
+  CLOCK 16000000
+
+  PIN slow = D13 OUTPUT
+  PIN fast = D12 OUTPUT ACTIVE LOW
+  PIN btn = D2 INPUT ACTIVE LOW
+  PIN pot = A0 ANALOG
+
+  WHEN started:
+    wait until btn
+    REPEAT 3:
+      toggle slow
+      wait pot ms
+    IF pot > 512 THEN:
+      turn on fast
+    ELSE:
+      turn off fast

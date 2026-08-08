@@ -322,9 +322,15 @@ if the right operand of a binary node is not re-emitted one level tighter,
 | `stc89c52rc` | `--iram-size 256 --xram-size 256 --code-size 8192` (12T) |
 | `stc15f2k60s2` | `--iram-size 256 --xram-size 1792 --code-size 61440` (1T) |
 | `mcs51` | none — bring your own via `options` |
+| `atmega328p` | avr-gcc, `-mmcu=atmega328p`, 32 KB flash |
+| `atmega168p` | avr-gcc, `-mmcu=atmega168p`, 16 KB flash |
 
-Every target compiles `-mmcs51 --std-c99`. Adding a part is three lines in
-`TARGETS` in [`app.py`](app.py).
+The 8051 targets compile `-mmcs51 --std-c99`; adding a part is three lines in
+`TARGETS` in [`app.py`](app.py). The AVR targets route to a second toolchain
+entirely (`AVR_TARGETS`), and `/compile` picks between them from the `DEVICE`
+line for pseudocode, or the `target` field for hand-written C. `/health`
+reports both, and reports the AVR side as absent rather than failing when the
+bundle is not deployed.
 
 The pseudocode front end is part-aware too: `DEVICE STC89C52RC:` emits code
 without port-mode registers or the AUXR 1T bit, refuses `ANALOG` pins (no
@@ -345,10 +351,64 @@ does change is the width of it: `millis()` is 32-bit, so the deadlines and the
 wraparound compare widen with it, and that type comes from the target rather
 than from the AST walker.
 
-**These transpile here; they do not compile here.** This service vendors SDCC,
-which cannot build core C++. `POST /compile` with an Arduino `DEVICE` is
-refused with the toolchain it would need (`arduino-cli`) and returns the
-generated source anyway; `POST /transpile` is the endpoint to use.
+**Core C++ transpiles here; it does not compile here.** SDCC cannot build it
+and `arduino-cli` plus the AVR core is ~250 MB against Vercel's 250 MB
+function limit. `POST /compile` with an Arduino `DEVICE` is refused, naming
+the toolchain it would need, and returns the generated source anyway.
+
+`DEVICE ATMEGA328P:` is the same board **without** the core, and that one does
+compile here — see below.
+
+### AVR: the same boards, compiled
+
+| `DEVICE` / `target` | Emits | Compiles here |
+|---|---|---|
+| `arduino-uno`, `arduino-nano` | Arduino core C++ | no — paste into the IDE |
+| `atmega328p`, `atmega168p` | bare AVR C | **yes**, via avr-gcc |
+
+An ATmega328P *is* an Uno, and pins keep the board's labels (`D13`, `A0`; port
+names like `PB5` are accepted and canonicalised), so a program moves between
+the two devices unchanged and only the generated C differs. What changes is
+what the C does: the generator knows the pin at emit time, so
+
+```
+turn on led     ->   PORTB |= _BV(PB5);        /* one instruction */
+toggle led      ->   PINB = _BV(PB5);          /* hardware toggle, no RMW */
+```
+
+instead of the core's `digitalWrite`, which resolves the port through a
+PROGMEM table and checks for a PWM channel to disable on every call. A
+two-script scheduler with an ADC read comes out at **638 bytes**.
+
+Timer 0 runs in CTC mode at exactly 1 kHz — the emitter picks the prescaler
+and compare value that divide the declared `CLOCK` evenly, and refuses a clock
+that cannot produce an exact millisecond rather than silently drifting.
+
+Building the toolchain bundle:
+
+```bash
+./scripts/fetch-avr-gcc.sh    # ~45 MB: avr-gcc, binutils, avr-libc (avr5 only)
+./scripts/verify-avr.sh       # MUST run on Linux — see below
+```
+
+`fetch-avr-gcc.sh` lifts Debian **bullseye** binaries out of `.deb`s, the same
+trick and the same reason as `fetch-sdcc.sh`: bullseye's `cc1` needs only
+`GLIBC_2.14`, where bookworm's needs 2.36 and would not start on Vercel's
+Amazon Linux 2023 (2.34). `cc1plus` and the other 41 multilibs are dropped;
+nothing here emits C++.
+
+The bundle is Linux x86_64, so **building it on macOS does not verify it**.
+`verify-avr.sh` compiles, links and objcopies a real program using only the
+vendored binaries, and must be run where they can execute:
+
+```bash
+docker run --rm -v "$PWD:/w" -w /w debian:bullseye-slim ./scripts/verify-avr.sh
+```
+
+The Arduino core is deliberately **not** vendored: it is LGPL-2.1, and static
+linking it into an image this service hands back engages the relink
+obligation. avr-libc is BSD-3-Clause, and avr-gcc's runtime carries the GCC
+Runtime Library Exception, so compiled output is unencumbered.
 
 ## Debug symbol tables
 

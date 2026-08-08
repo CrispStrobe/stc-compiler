@@ -5,3 +5,17 @@ __pycache__/
 
 # Agent context: local paths and operational detail, not for the public repo.
 CLAUDE.md
+
+# The vendored AVR toolchain, 45 MB, built by ./scripts/fetch-avr-gcc.sh.
+#
+# Ignored rather than committed ON PURPOSE, and this is a decision to revisit
+# rather than a permanent state: Vercel deploys from git and vercel.json's
+# legacy `builds` config bundles the project directory, so /compile for AVR
+# parts will NOT work in production until this is committed. SDCC's 8 MB
+# bin/ + share/ are committed for exactly that reason.
+#
+# 45 MB is 5.6x that, it lands in git history permanently, and roughly 19 MB
+# of it is avr-libc headers for ~300 parts we do not support. Trimming those
+# to the avr5 family would bring it near 26 MB. Worth choosing deliberately
+# before it becomes irreversible.
+avr/

@@ -187,6 +187,41 @@ WHEN started:
       turn off led
 """,
 
+    # The same board again, this time as bare silicon: no Arduino core, ports
+    # written directly, and a Timer-0 tick we set up ourselves. This is the
+    # form the service can actually compile. `PB4` is deliberately spelled as
+    # a port name and must come back canonicalised to its board label, D12.
+    "avr": """DEVICE ATMEGA328P:
+  CLOCK 16000000
+  PIN slow = D13 OUTPUT
+  PIN fast = PB4 OUTPUT ACTIVE LOW
+  PIN btn = D2 INPUT ACTIVE LOW
+  PIN pot = A0 ANALOG
+  WHEN started:
+    wait until btn
+    REPEAT 3:
+      toggle slow
+      wait pot ms
+    IF pot > 512 THEN:
+      turn on fast
+    ELSE:
+      turn off fast
+""",
+
+    "avr-scripts": """DEVICE ATMEGA328P:
+  CLOCK 16000000
+  PIN slow = D13 OUTPUT
+  PIN fast = D12 OUTPUT ACTIVE LOW
+  WHEN started:
+    FOREVER:
+      toggle slow
+      wait 500 ms
+  WHEN started:
+    FOREVER:
+      toggle fast
+      wait 300 ms
+""",
+
     # The same board with two scripts, which is where the timebase type
     # matters: these deadlines are `unsigned long` because millis() is, and
     # the wraparound compare has to widen with them.

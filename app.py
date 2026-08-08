@@ -79,6 +79,33 @@ TARGETS = {
     },
 }
 
+# ------------------------------------------------------------------ AVR side
+#
+# The second toolchain. avr-gcc is a separate bundle from SDCC's, staged
+# separately and only when an AVR part is actually asked for, so an 8051
+# request never pays for it.
+#
+# What is deliberately NOT here: the Arduino core. Its digitalWrite resolves
+# the port at runtime, it is LGPL-2.1 (static linking into a returned .hex
+# engages the relink obligation), and carrying arduino-cli plus the AVR core
+# would be ~250 MB against Vercel's 250 MB function limit. stc_pseudocode's
+# AvrTarget writes the ports directly instead, which is both smaller and the
+# same discipline the 8051 target already uses.
+SRC_AVR = os.path.join(BASE_DIR, "avr")
+AVR_STAGE = "/tmp/avr"
+AVR_STAGE_BIN = os.path.join(AVR_STAGE, "bin")
+
+AVR_TARGETS = {
+    "atmega328p": {
+        "mcu": "atmega328p", "flash": 32768,
+        "description": "ATmega328P — Arduino Uno/Nano/Pro Mini, 32 KB flash",
+    },
+    "atmega168p": {
+        "mcu": "atmega168p", "flash": 16384,
+        "description": "ATmega168P — 16 KB flash",
+    },
+}
+
 app = FastAPI(title="stc-compiler", docs_url="/docs")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
@@ -97,6 +124,64 @@ def stage_toolchain():
     for name in os.listdir(STAGE_BIN):
         path = os.path.join(STAGE_BIN, name)
         os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _make_executable(directory: str):
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name)
+        if os.path.isfile(path):
+            os.chmod(path, os.stat(path).st_mode
+                     | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def stage_avr() -> tuple[str, list[str]] | None:
+    """(directory holding avr-gcc, extra flags), or None if there is no AVR
+    toolchain reachable at all.
+
+    Two ways this resolves, and both matter. In production the bundle is
+    vendored under avr/ and staged into /tmp exactly as SDCC's is, because
+    Vercel's deployment directory is read-only and drops the executable bit.
+    In local development there is usually a system avr-gcc on PATH (Homebrew's
+    avr-gcc, Debian's gcc-avr), and falling back to it means the AVR path can
+    be exercised and tested without first building a Linux bundle.
+
+    The vendored bundle keeps Debian's own directory layout, so the driver
+    finds cc1 and collect2 by itself (bin/avr-gcc looks for
+    ../lib/gcc/avr/<version>/). What it cannot infer is where avr-libc went,
+    because Debian puts it at lib/avr rather than the <prefix>/avr GCC expects
+    -- hence the explicit -B and -isystem. A system toolchain needs none of
+    this and gets no flags.
+    """
+    if os.path.isdir(SRC_AVR):
+        if not os.path.exists(os.path.join(AVR_STAGE_BIN, "avr-gcc")):
+            os.makedirs(AVR_STAGE, exist_ok=True)
+            for part in os.listdir(SRC_AVR):
+                source = os.path.join(SRC_AVR, part)
+                destination = os.path.join(AVR_STAGE, part)
+                if os.path.isdir(source) and not os.path.isdir(destination):
+                    shutil.copytree(source, destination)
+                elif os.path.isfile(source) and not os.path.exists(destination):
+                    shutil.copy2(source, destination)
+            if os.path.isdir(AVR_STAGE_BIN):
+                _make_executable(AVR_STAGE_BIN)
+            # cc1 and collect2 are fork/exec'd and need the bit too.
+            for root, _dirs, _files in os.walk(os.path.join(AVR_STAGE, "lib", "gcc")):
+                _make_executable(root)
+        if os.path.exists(os.path.join(AVR_STAGE_BIN, "avr-gcc")):
+            version = ""
+            version_file = os.path.join(AVR_STAGE, "GCC_VERSION")
+            if os.path.exists(version_file):
+                with open(version_file, encoding="utf-8") as handle:
+                    version = handle.read().strip()
+            flags = [f"-B{os.path.join(AVR_STAGE, 'lib', 'avr', 'lib')}{os.sep}",
+                     f"-isystem{os.path.join(AVR_STAGE, 'lib', 'avr', 'include')}"]
+            if version:
+                flags.insert(0, "-B" + os.path.join(
+                    AVR_STAGE, "lib", "gcc", "avr", version) + os.sep)
+            return AVR_STAGE_BIN, flags
+
+    found = shutil.which("avr-gcc")
+    return (os.path.dirname(found), []) if found else None
 
 
 class CompileReq(BaseModel):
@@ -121,6 +206,130 @@ class CompileReq(BaseModel):
     disassemble: bool = False
 
 
+def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
+              f_cpu: int | None) -> dict:
+    """Compile C for an ATmega with avr-gcc, and return an Intel HEX image.
+
+    Deliberately the same response shape as the SDCC path -- base64 image,
+    filename, bytes, log, memory -- so a client that already speaks to this
+    service does not learn a second one.
+    """
+    staged = stage_avr()
+    if staged is None:
+        return {"success": False, "stage": "compile",
+                "error": "no AVR toolchain available; the avr/ bundle is not "
+                         "vendored in this deployment and no avr-gcc is on PATH",
+                "c": generated_c}
+    bin_dir, toolchain_flags = staged
+
+    work = os.path.join(tempfile.gettempdir(), f"build-{uuid.uuid4().hex}")
+    os.makedirs(work, exist_ok=True)
+    src = os.path.join(work, "main.c")
+    with open(src, "w", encoding="utf-8") as handle:
+        handle.write(req.code)
+
+    elf = os.path.join(work, "main.elf")
+    cmd = [os.path.join(bin_dir, "avr-gcc"), f"-mmcu={spec['mcu']}",
+           "-Os", "-std=c99", "-Wall", "-Wextra",
+           # The cooperative scheduler is a Duff's device: every yield state
+           # is a `case` the previous statement falls into. That is the
+           # lowering, not a mistake, and SDCC does not warn about it either.
+           "-Wno-implicit-fallthrough",
+           "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections"]
+    cmd += toolchain_flags
+    # Source that already sets its own clock wins: generated code bakes F_CPU
+    # in, and defining it twice from the command line is a warning at best and
+    # a conflicting redefinition at worst.
+    if f_cpu and "F_CPU" not in req.code:
+        cmd.append(f"-DF_CPU={int(f_cpu)}UL")
+    for name, value in req.defines.items():
+        if not name.replace("_", "").isalnum():
+            shutil.rmtree(work, ignore_errors=True)
+            return {"success": False, "error": f"bad define name: {name!r}"}
+        cmd.append(f"-D{name}" if value is None else f"-D{name}={value}")
+    for index, opt in enumerate(req.options):
+        opt = str(opt)
+        if opt.startswith("-"):
+            cmd.append(opt)
+            continue
+        if index == 0 or not VALUE_RE.fullmatch(opt):
+            shutil.rmtree(work, ignore_errors=True)
+            return {"success": False,
+                    "error": f"options must be flags, or plain values following "
+                             f"a flag; rejected {opt!r}"}
+        cmd.append(opt)
+    cmd += ["-o", elf, src]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=COMPILE_TIMEOUT, cwd=work)
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(work, ignore_errors=True)
+        return {"success": False, "error": f"compile timed out after {COMPILE_TIMEOUT}s"}
+
+    log = ((result.stdout or "") + (result.stderr or "")).replace(work + os.sep, "")
+    if result.returncode != 0 or not os.path.exists(elf):
+        shutil.rmtree(work, ignore_errors=True)
+        return {"success": False, "error": log.strip() or "compilation failed",
+                "log": log, "c": generated_c, "stage": "compile"}
+
+    try:
+        objcopy = os.path.join(bin_dir, "avr-objcopy")
+        if req.format == "bin":
+            out, name, args = os.path.join(work, "main.bin"), "main.bin", ["-O", "binary"]
+        else:
+            # "ihx" and "hex" are one format here: avr-objcopy emits Intel HEX
+            # directly, so there is no packihx step to distinguish them.
+            out, name, args = os.path.join(work, "main.hex"), "main.hex", ["-O", "ihex"]
+        subprocess.run([objcopy, *args, "-R", ".eeprom", elf, out],
+                       capture_output=True, timeout=10)
+        if not os.path.exists(out):
+            return {"success": False, "error": "avr-objcopy produced no image",
+                    "log": log, "c": generated_c}
+        with open(out, "rb") as handle:
+            blob = handle.read()
+
+        # avr-size's own report, so a caller can warn before an image outgrows
+        # the part -- the counterpart to SDCC's .mem file.
+        mem = ""
+        try:
+            sized = subprocess.run(
+                [os.path.join(bin_dir, "avr-size"), f"--mcu={spec['mcu']}",
+                 "--format=avr", elf],
+                capture_output=True, text=True, timeout=10)
+            mem = sized.stdout or ""
+        except (OSError, subprocess.SubprocessError):
+            mem = ""
+
+        listing = None
+        if req.disassemble:
+            try:
+                dumped = subprocess.run(
+                    [os.path.join(bin_dir, "avr-objdump"), "-d", "-S", elf],
+                    capture_output=True, text=True, timeout=15)
+                listing = dumped.stdout or f"(objdump failed: {dumped.stderr})"
+            except (OSError, subprocess.SubprocessError) as exc:
+                listing = f"(disassembly failed: {exc})"
+
+        return {
+            "success": True,
+            "c": generated_c,
+            "translated": None,
+            "unresolved": None,
+            "warnings": None,
+            "disassembly": listing,
+            "base64": base64.b64encode(blob).decode("ascii"),
+            "filename": name,
+            "bytes": len(blob),
+            "log": log,
+            "memory": mem,
+            "toolchain": "avr-gcc",
+            "mcu": spec["mcu"],
+        }
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def build(req: CompileReq) -> dict:
     """Compile and return the JSON-shaped result. Shared by both endpoints."""
     if len(req.code.encode("utf-8")) > MAX_SOURCE_BYTES:
@@ -136,20 +345,25 @@ def build(req: CompileReq) -> dict:
         except stc_pseudocode.PseudocodeError as exc:
             return {"success": False, "error": str(exc), "line": exc.line,
                     "stage": "transpile"}
-        # Transpiling is target-agnostic; compiling is not. This service
-        # vendors SDCC and nothing else, so a device whose output SDCC cannot
-        # build is refused here rather than three stages later as a wall of
-        # syntax errors about <Arduino.h>.
+        # Transpiling is target-agnostic; compiling is not. The DEVICE line --
+        # not the request's `target` field -- decides which toolchain the
+        # generated source needs, because it is what decided the dialect.
         chip = program.target
+        req = req.model_copy(update={"code": generated_c})
+        # The pseudocode's own CLOCK wins; the clock is already baked into the
+        # generated C as FOSC_HZ or F_CPU, and defining it twice is a warning
+        # at best.
+        req = req.model_copy(update={"fosc": None})
+        if chip.toolchain == "avr-gcc":
+            return build_avr(req, AVR_TARGETS[chip.key], generated_c, None)
         if chip.toolchain != "sdcc-mcs51":
             return {"success": False, "stage": "compile",
                     "error": f"{chip.display} transpiles here, but building it "
                              f"needs {chip.toolchain}, which this service does "
-                             f"not host. Use /transpile to get the source.",
+                             f"not host. Use /transpile to get the source, or "
+                             f"DEVICE ATMEGA328P: for the same board without "
+                             f"the Arduino core.",
                     "c": generated_c, "toolchain": chip.toolchain}
-        req = req.model_copy(update={"code": generated_c})
-        # The pseudocode's own CLOCK wins; FOSC_HZ is already baked into the C.
-        req = req.model_copy(update={"fosc": None})
     elif req.language.lower() in ("keil", "c51"):
         stage_toolchain()      # SFR addresses come from the staged SDCC headers
         result = keil2sdcc.translate(req.code)
@@ -162,13 +376,25 @@ def build(req: CompileReq) -> dict:
         return {"success": False,
                 "error": f"unknown language '{req.language}'; use 'c' or 'pseudocode'"}
 
-    target = TARGETS.get(req.target.lower())
-    if target is None:
-        return {"success": False,
-                "error": f"unknown target '{req.target}'; "
-                         f"known: {', '.join(sorted(TARGETS))}"}
     if req.format not in ("ihx", "hex", "bin"):
         return {"success": False, "error": "format must be ihx, hex or bin"}
+
+    # Hand-written C reaches an AVR part through the `target` field, since
+    # there is no DEVICE line to read it from. Keil is 8051-only by
+    # definition, so it never routes here.
+    avr = AVR_TARGETS.get(req.target.lower())
+    if avr is not None:
+        if keil_changes:
+            return {"success": False,
+                    "error": "the Keil C51 dialect is 8051-only; it cannot be "
+                             f"compiled for {avr['mcu']}"}
+        return build_avr(req, avr, generated_c, req.fosc)
+
+    target = TARGETS.get(req.target.lower())
+    if target is None:
+        known = sorted(list(TARGETS) + list(AVR_TARGETS))
+        return {"success": False,
+                "error": f"unknown target '{req.target}'; known: {', '.join(known)}"}
 
     stage_toolchain()
 
@@ -766,10 +992,27 @@ async def health():
                                  capture_output=True, text=True, timeout=10).stdout
     except Exception as exc:  # noqa: BLE001 - surfaced to the caller as text
         return {"ok": False, "error": str(exc)}
+    # The AVR side is reported separately and never fails the health check:
+    # a deployment without the avr/ bundle is a perfectly good 8051 compiler,
+    # and saying so plainly beats a red light nobody can act on.
+    staged_avr = stage_avr()
+    avr_bin = staged_avr[0] if staged_avr else None
+    avr_version = ""
+    if avr_bin:
+        try:
+            avr_version = subprocess.run(
+                [os.path.join(avr_bin, "avr-gcc"), "--version"],
+                capture_output=True, text=True, timeout=10).stdout
+        except Exception:  # noqa: BLE001 - absence is reported, not raised
+            avr_version = ""
     return {
         "ok": True,
         "sdcc": version.strip().splitlines()[0] if version else "",
+        "avr_gcc": avr_version.strip().splitlines()[0] if avr_version else None,
         "targets": {name: cfg["description"] for name, cfg in TARGETS.items()},
+        "avr_targets": ({name: cfg["description"] for name, cfg in AVR_TARGETS.items()}
+                        if avr_bin else {}),
+        "devices": sorted(stc_pseudocode.TARGETS),
     }
 
 

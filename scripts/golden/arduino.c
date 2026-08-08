@@ -13,7 +13,7 @@ void setup()
     pinMode(2, INPUT_PULLUP);
     digitalWrite(13, LOW);   /* led off */
 
-    while (!(!digitalRead(2))) ;
+    while (!(!digitalRead(2))) { }
     { unsigned int _i1;
       for (_i1 = 0; _i1 < (4); _i1++) {
             digitalWrite(13, !digitalRead(13));
