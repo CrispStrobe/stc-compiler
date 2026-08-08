@@ -117,6 +117,18 @@ class SetPin(Stmt):
 
 
 @dataclass
+class SetTone(Stmt):
+    """Play a frequency on a tone pin, or silence it with 0.
+
+    Not PWM: a tone needs a settable PERIOD, and every PWM path on this chip
+    has a fixed carrier -- see STC12-PERIPHERAL-MODEL.md 5b for why the
+    obvious PCA route gives 3.9 Hz. This is Timer 1 toggling the pin.
+    """
+    pin: str
+    hz: Expr
+
+
+@dataclass
 class SetPwm(Stmt):
     """Set a PWM pin's duty, as a percentage of time the load is ON.
 
@@ -206,7 +218,7 @@ class Pin:
     """
     name: str
     where: str
-    direction: str              # "output" | "input" | "analog" | "pwm"
+    direction: str              # "output" | "input" | "analog" | "pwm" | "tone"
     active_low: bool = False
 
 
@@ -351,6 +363,14 @@ class Stc8051Target(Target):
                     line, f"P{port}.{bit} is already declared as {other.name!r} "
                           f"({other.direction.upper()}); one pin cannot be two things")
 
+        if direction == "tone":
+            # Any GPIO will do -- software owns the toggle -- but there is only
+            # one Timer 1, so there is only one tone.
+            for other in program.pins.values():
+                if other.direction == "tone":
+                    raise PseudocodeError(
+                        line, f"only one TONE pin is possible ({other.name!r} already "
+                              f"has it): the tone is Timer 1, and there is one of those")
         if direction == "pwm":
             if not self.pwm:
                 raise PseudocodeError(
@@ -383,6 +403,9 @@ class Stc8051Target(Target):
 
     def read_analog(self, pin):
         return f"adc_read({pin.adc_channel})"
+
+    def write_tone(self, pin, hz: str) -> str:
+        return f"tone_set({hz});"
 
     def write_pwm(self, pin, value: str) -> str:
         """Duty, as the percentage of time the LOAD is on.
@@ -478,6 +501,56 @@ class Stc8051Target(Target):
                 "}",
                 "",
             ]
+        tone = program.tone_pin
+        if tone is not None:
+            idle = 1 if tone.active_low else 0
+            out += [
+                "/* Tone on " + tone.name + ". Timer 1 in mode 1 toggles the pin, so the",
+                " * frequency is FOSC/24/(65536 - reload) and the whole audible band is",
+                " * reachable -- roughly 7 Hz upward. The hardware clock outputs (T1CLKO",
+                " * and friends) divide an 8-BIT reload and bottom out at 1800 Hz, which",
+                " * is a beeper rather than a tone; and clocking the PCA from Timer 0 gives",
+                " * 3.9 Hz, because Timer 0 is already the millisecond tick. See",
+                " * STC12-PERIPHERAL-MODEL.md 5b.",
+                " *",
+                " * This costs Timer 1 outright. The debug monitor wants it too, as the",
+                " * wall clock behind skew_ms, so a program with a tone cannot also be run",
+                " * under the monitor. */",
+                "#define BW_TONE_NUM (FOSC_HZ / 24UL)",
+                "",
+                "static unsigned char bw_tone_h, bw_tone_l;",
+                "",
+                "static void bw_tone_isr(void) __interrupt(3)",
+                "{",
+                "    TH1 = bw_tone_h;               /* mode 1 is not auto-reload */",
+                "    TL1 = bw_tone_l;",
+                f"    {tone.sfr} = !{tone.sfr};",
+                "}",
+                "",
+                "static void tone_set(unsigned long hz)",
+                "{",
+                "    unsigned long div;",
+                "    if (hz == 0) {                 /* silence, and park the pin */",
+                "        TR1 = 0;",
+                "        ET1 = 0;",
+                f"        {tone.sfr} = {idle};",
+                "        return;",
+                "    }",
+                "    div = (BW_TONE_NUM + (hz >> 1)) / hz;   /* round, do not truncate: */",
+                "                                       /* truncating puts 1000 Hz at */",
+                "                                       /* 1001.7 rather than 999.6   */",
+                "    if (div < 1UL)     div = 1UL;",
+                "    if (div > 65535UL) div = 65535UL;",
+                "    div = 65536UL - div;",
+                "    bw_tone_h = (unsigned char)(div >> 8);",
+                "    bw_tone_l = (unsigned char)(div & 0xFF);",
+                "    TH1 = bw_tone_h;",
+                "    TL1 = bw_tone_l;",
+                "    ET1 = 1;",
+                "    TR1 = 1;",
+                "}",
+                "",
+            ]
         if program.uses_pwm:
             out += [
                 "/* PCA PWM. The comparator is 9 bits, {EPCnH,CCAPnH} against (0,CL),",
@@ -555,8 +628,16 @@ class Stc8051Target(Target):
 
         out.append("")
         if self.aux_1t_bit:
-            out.append("    AUXR &= ~0x80;                 /* Timer 0 at FOSC/12 */")
+            if program.tone_pin is not None:
+                out.append("    AUXR &= ~0xC0;                 /* Timer 0 AND Timer 1 at FOSC/12 */")
+            else:
+                out.append("    AUXR &= ~0x80;                 /* Timer 0 at FOSC/12 */")
         out.append("    TMOD  = (TMOD & 0xF0) | 0x01;  /* Timer 0, mode 1 */")
+        if program.tone_pin is not None:
+            out += ["    TMOD  = (TMOD & 0x0F) | 0x10;  /* Timer 1, mode 1: the tone */",
+                    "    PT1   = 1;                     /* the tone outranks the tick:",
+                    "                                    * jitter here is audible */",
+                    "    tone_set(0);                   /* silent until asked */"]
         return out
 
     def start_scheduler(self, task_names):
@@ -611,6 +692,13 @@ class Program:
     @property
     def uses_pwm(self) -> bool:
         return any(pin.direction == "pwm" for pin in self.pins.values())
+
+    @property
+    def tone_pin(self):
+        for pin in self.pins.values():
+            if pin.direction == "tone":
+                return pin
+        return None
 
     @property
     def target(self) -> Target:
@@ -799,6 +887,8 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
         pin = program.pins.get(name.lower())
         if pin is None:
             raise PseudocodeError(line, f"unknown pin {name!r}; declare it with PIN")
+        if pin.direction == "tone":
+            return pin.name          # "turn off <tone>" is silence; see below
         if pin.direction != "output":
             what = pin.direction.upper()
             article = "an" if what[0] in "AEIOU" else "a"
@@ -819,12 +909,42 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
     turn = re.fullmatch(r"turn\s+(on|off)\s+(\w+)", lowered)
     if turn:
         pin = program.pins[output_pin(turn.group(2)).lower()]
+        if pin.direction == "tone":
+            if turn.group(1) == "on":
+                raise PseudocodeError(
+                    line, f"{pin.name!r} is a TONE pin and has no 'on'; "
+                          f"use 'set {pin.name} to <n> hz'")
+            return SetTone(pin.name, Num(0))
         on = turn.group(1) == "on"
         return SetPin(pin.name, high=(not on) if pin.active_low else on, style="onoff")
 
     level = re.fullmatch(r"set\s+(\w+)\s+(high|low)", lowered)
     if level:
         return SetPin(output_pin(level.group(1)), high=(level.group(2) == "high"))
+
+    hertz = re.fullmatch(r"set\s+(\w+)\s+to\s+(.+?)\s*(?:hz|hertz)", text.strip(), re.I)
+    if hertz:
+        name = hertz.group(1)
+        pin = program.pins.get(name.lower())
+        if pin is None:
+            raise PseudocodeError(line, f"unknown pin {name!r}; declare it with PIN")
+        if pin.direction != "tone":
+            raise PseudocodeError(
+                line, f"{name!r} is a {pin.direction.upper()} pin; only a TONE pin "
+                      f"takes a frequency")
+        value = expression(hertz.group(2), program, line)
+        if isinstance(value, Num):
+            hz = value.value
+            # 8 Hz to 460 kHz at 11.0592 MHz. Out of range would be CLAMPED at
+            # run time, which sounds like a plausible wrong note rather than
+            # like an error -- so catch the constant case here.
+            lo, hi = program.clock / 24 / 65535, program.clock / 24
+            if hz != 0 and not (lo <= hz <= hi):
+                raise PseudocodeError(
+                    line, f"{hz:g} Hz is outside what Timer 1 can make at "
+                          f"CLOCK {program.clock} ({lo:.0f} Hz to {hi:.0f} Hz); "
+                          f"it would be clamped and sound like the wrong note")
+        return SetTone(pin.name, value)
 
     duty = re.fullmatch(r"set\s+(\w+)\s+to\s+(.+?)\s*(?:percent|%)", text.strip(), re.I)
     if duty:
@@ -833,9 +953,10 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
         if pin is None:
             raise PseudocodeError(line, f"unknown pin {name!r}; declare it with PIN")
         if pin.direction != "pwm":
+            what = pin.direction.upper()
             raise PseudocodeError(
-                line, f"{name!r} is an {pin.direction.upper()} pin; only a PWM pin "
-                      f"takes a percentage")
+                line, f"{name!r} is {'an' if what[0] in 'AEIOU' else 'a'} {what} pin; "
+                      f"only a PWM pin takes a percentage")
         return SetPwm(pin.name, expression(duty.group(2), program, line))
 
     assign = re.match(r"set\s+([A-Za-z_]\w*)\s+to\s+(.+)$", text, re.I)
@@ -903,7 +1024,7 @@ def split_arguments(text: str) -> list[str]:
 
 DEFINE_RE = re.compile(r"define\s+(?:fast\s+)?([A-Za-z_]\w*)\s*(.*?):\s*$", re.I)
 WHEN_RE = re.compile(r"when\s+(started|flag\s+clicked|powered\s+on)\s*:", re.I)
-PIN_RE = re.compile(r"pin\s+(\w+)\s*=\s*(\S+)\s+(output|input|analog|pwm)"
+PIN_RE = re.compile(r"pin\s+(\w+)\s*=\s*(\S+)\s+(output|input|analog|pwm|tone)"
                     r"(?:\s+active\s+(low|high))?", re.I)
 CLOCK_RE = re.compile(r"clock\s+([\d_]+)\s*(hz|mhz)?", re.I)
 
@@ -1035,7 +1156,12 @@ def stmts_pseudo(body: list, depth: int, active_low: dict) -> list[str]:
     pad = "  " * depth
     out = []
     for node in body:
-        if isinstance(node, SetPwm):
+        if isinstance(node, SetTone):
+            if isinstance(node.hz, Num) and node.hz.value == 0:
+                out.append(f"{pad}turn off {node.pin}")
+            else:
+                out.append(f"{pad}set {node.pin} to {expr_pseudo(node.hz)} hz")
+        elif isinstance(node, SetPwm):
             out.append(f"{pad}set {node.pin} to {expr_pseudo(node.value)} percent")
         elif isinstance(node, SetPin):
             if node.style == "onoff":
@@ -1157,6 +1283,9 @@ def stmts_c(body: list, depth: int, ctx: Emit) -> list[str]:
         elif isinstance(node, SetPwm):
             out.append(pad + ctx.target.write_pwm(ctx.pins[node.pin],
                                                   expr_c(node.value, ctx)))
+        elif isinstance(node, SetTone):
+            out.append(pad + ctx.target.write_tone(ctx.pins[node.pin],
+                                                   expr_c(node.hz, ctx)))
         elif isinstance(node, Toggle):
             out.append(pad + ctx.target.toggle_pin(ctx.pins[node.pin]))
         elif isinstance(node, Wait):
@@ -1238,6 +1367,9 @@ def stmts_task(body: list, depth: int, ctx: Emit,
         elif isinstance(node, SetPwm):
             out.append(pad + ctx.target.write_pwm(ctx.pins[node.pin],
                                                   expr_c(node.value, ctx)))
+        elif isinstance(node, SetTone):
+            out.append(pad + ctx.target.write_tone(ctx.pins[node.pin],
+                                                   expr_c(node.hz, ctx)))
         elif isinstance(node, Toggle):
             out.append(pad + ctx.target.toggle_pin(ctx.pins[node.pin]))
         elif isinstance(node, Wait):

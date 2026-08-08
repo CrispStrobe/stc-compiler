@@ -161,12 +161,48 @@ def test_compiles():
                "no instruction writes CCAP0L: the hardware loads it on CL wrap")
 
 
+def test_tone():
+    """A tone is Timer 1 toggling a pin, not PWM. Model 5b says why."""
+    print("tone: a settable period, which no PWM path on this chip has")
+    c = emit(HEAD + "  PIN buzzer = P3.5 TONE\n"
+                    "  WHEN started:\n    set buzzer to 440 hz\n")
+    ok("tone_set(440);" in c, "a frequency, not a duty")
+    ok("__interrupt(3)" in c, "Timer 1's ISR does the toggling")
+    ok("P3_5 = !P3_5;" in c, "and toggles the declared pin, resolved at compile time")
+    ok("TMOD  = (TMOD & 0x0F) | 0x10;" in c, "Timer 1 in mode 1 -- 16-bit, so low notes reach")
+    ok("AUXR &= ~0xC0;" in c, "both timers at FOSC/12")
+    ok("PT1   = 1;" in c, "the tone outranks the tick: jitter here is audible")
+    ok("tone_set(0);" in c, "and it starts silent")
+
+    c = emit(HEAD + "  PIN buzzer = P3.5 TONE\n  WHEN started:\n    turn off buzzer\n")
+    ok("tone_set(0);" in c, "'turn off' is silence")
+
+    # 65536 - FOSC/24/f, worked out by hand.
+    for hz, want in ((440, 64489), (880, 65012), (1000, 65075)):
+        ok(65536 - round(11059200 / 24 / hz) == want, f"{hz} Hz -> reload {want}")
+        # And the generator must agree with that, which it only does if it
+        # rounds. Truncating is off by one at 1000 Hz and audibly sharp.
+        ok(65536 - ((460800 + hz // 2) // hz) == want,
+           f"{hz} Hz: the emitted arithmetic rounds too")
+
+    rejects(HEAD + "  PIN b = P3.5 TONE\n  WHEN started:\n    set b to 2 hz\n",
+            "outside what Timer 1 can make", "a frequency below the 16-bit floor")
+    rejects(HEAD + "  PIN b = P3.5 TONE\n  WHEN started:\n    turn on b\n",
+            "has no 'on'", "turning a tone on rather than giving it a pitch")
+    rejects(HEAD + "  PIN a = P3.5 TONE\n  PIN b = P3.4 TONE\n"
+                   "  WHEN started:\n    turn off a\n",
+            "only one TONE pin", "two tones, one Timer 1")
+    rejects(HEAD + "  PIN b = P3.5 TONE\n  WHEN started:\n    set b to 50 percent\n",
+            "only a PWM pin", "a percentage on a tone pin")
+
+
 def main() -> int:
     test_polarity()
     test_setup()
     test_refusals()
     test_roundtrip()
     test_duty_arithmetic()
+    test_tone()
     test_compiles()
     print(f"\n{checks} checks, {failures} failures")
     return 1 if failures else 0
