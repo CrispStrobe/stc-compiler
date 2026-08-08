@@ -27,6 +27,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+# Which PCA module each pin carries, on the STC12C5A60S2 with AUXR1.PCA_P4
+# clear. Setting that bit moves them to P4.2/P4.3, and other STC12 variants
+# differ again -- so this is a per-target fact, not an 8051 one.
+PCA_PINS = {(1, 3): 0, (1, 4): 1}
+
 PORT_RE = re.compile(r"^P([0-4])\.([0-7])$", re.I)
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -112,6 +117,19 @@ class SetPin(Stmt):
 
 
 @dataclass
+class SetPwm(Stmt):
+    """Set a PWM pin's duty, as a percentage of time the load is ON.
+
+    The AST stores what was written -- brightness -- not the compare value.
+    Polarity and the hardware's inverted comparator are the target's problem,
+    so decompiling gives back the same sentence on an active-low pin as on an
+    active-high one.
+    """
+    pin: str
+    value: Expr
+
+
+@dataclass
 class Toggle(Stmt):
     pin: str
 
@@ -188,7 +206,7 @@ class Pin:
     """
     name: str
     where: str
-    direction: str              # "output" | "input" | "analog"
+    direction: str              # "output" | "input" | "analog" | "pwm"
     active_low: bool = False
 
 
@@ -211,6 +229,13 @@ class Pin8051(Pin):
         # ADC channel n is on P1.n. True of this family, not of 8051s in
         # general, and certainly not a rule any other target should inherit.
         return self.bit
+
+    @property
+    def pca_module(self) -> int:
+        # CCP0/PWM0 is P1.3 and CCP1/PWM1 is P1.4 on the STC12C5A60S2.
+        # Other STC12 variants put them elsewhere (the STC12C5201AD uses
+        # P3.7/P3.5), so this belongs to the target, not to "8051".
+        return PCA_PINS[(self.port, self.bit)]
 
 
 @dataclass
@@ -299,13 +324,14 @@ class Stc8051Target(Target):
     """
 
     def __init__(self, key: str, display: str, header: str,
-                 port_modes: bool, aux_1t_bit: bool, adc: bool):
+                 port_modes: bool, aux_1t_bit: bool, adc: bool, pwm: bool = False):
         self.key = key
         self.display = display
         self.header = header        # the SDCC header with this family's registers
         self.port_modes = port_modes  # PxM0/PxM1 exist (STC12); STC89 is quasi-bidi
         self.aux_1t_bit = aux_1t_bit  # AUXR.7 selects T0 1T mode and must be cleared
         self.adc = adc                # 10-bit ADC on P1 (STC12 only)
+        self.pwm = pwm                # PCA capture/compare modules with PWM mode
 
     # ---- pins -----------------------------------------------------------
     def resolve_pin(self, program, name, where, direction, active_low, line):
@@ -315,6 +341,27 @@ class Stc8051Target(Target):
                 line, f"{where.upper()} is not a pin on the {self.display}; "
                       "use P0.0 to P4.7")
         port, bit = int(match.group(1)), int(match.group(2))
+
+        # Two names for one physical pin is always a mistake, and nothing
+        # downstream would notice: program.pins is keyed by name, so both
+        # declarations survive and quietly fight over the same register.
+        for other in program.pins.values():
+            if getattr(other, "port", None) == port and getattr(other, "bit", None) == bit:
+                raise PseudocodeError(
+                    line, f"P{port}.{bit} is already declared as {other.name!r} "
+                          f"({other.direction.upper()}); one pin cannot be two things")
+
+        if direction == "pwm":
+            if not self.pwm:
+                raise PseudocodeError(
+                    line, f"PWM needs the PCA, and the {program.part} has none")
+            if (port, bit) not in PCA_PINS:
+                pins = ", ".join(f"P{p}.{b} (module {m})"
+                                 for (p, b), m in sorted(PCA_PINS.items()))
+                raise PseudocodeError(
+                    line, f"PWM is only available on the PCA pins: {pins}. "
+                          f"{where.upper()} has no PCA module. Note those pins are "
+                          f"also ADC channels, so a pin cannot do both.")
         if direction == "analog":
             if port != 1:
                 raise PseudocodeError(
@@ -336,6 +383,19 @@ class Stc8051Target(Target):
 
     def read_analog(self, pin):
         return f"adc_read({pin.adc_channel})"
+
+    def write_pwm(self, pin, value: str) -> str:
+        """Duty, as the percentage of time the LOAD is on.
+
+        pwm_set() takes the percentage of time the PIN is HIGH, so an
+        active-low load -- which is every LED in this toolchain, because a
+        quasi-bidirectional pin sinks 20 mA and sources 230 uA -- inverts
+        here. Emitted as a visible `100 - x` rather than folded away, so the
+        generated C still reads like the pseudocode did.
+        """
+        if pin.active_low:
+            return f"pwm_set({pin.pca_module}, 100 - ({value}));"
+        return f"pwm_set({pin.pca_module}, {value});"
 
     # ---- time -----------------------------------------------------------
     def delay(self, ms):
@@ -418,13 +478,42 @@ class Stc8051Target(Target):
                 "}",
                 "",
             ]
+        if program.uses_pwm:
+            out += [
+                "/* PCA PWM. The comparator is 9 bits, {EPCnH,CCAPnH} against (0,CL),",
+                " * and it drives the pin LOW while CL is BELOW the compare value -- so a",
+                " * LARGER value is a LONGER low time and the duty as a fraction HIGH is",
+                " * (256 - value)/256. Getting that backwards inverts every brightness and",
+                " * looks entirely plausible doing it.",
+                " *",
+                " * Writing CCAPnH rather than CCAPnL is deliberate: the hardware reloads",
+                " * CCAPnH into CCAPnL when CL wraps, so an update cannot glitch mid-period.",
+                " * The 9th bit (EPCnH) is what expresses 0% and 100%, which an 8-bit",
+                " * compare cannot. Datasheet 10.3.4. */",
+                "static void pwm_set(unsigned char module, unsigned int percent_high)",
+                "{",
+                "    unsigned int v;",
+                "    if (percent_high > 100) percent_high = 100;",
+                "    v = 256 - ((percent_high * 256 + 50) / 100);",
+                "    if (module == 0) {",
+                "        CCAP0H = (unsigned char)v;",
+                "        if (v > 255) PCA_PWM0 |= 0x02; else PCA_PWM0 &= (unsigned char)~0x02;",
+                "    } else {",
+                "        CCAP1H = (unsigned char)v;",
+                "        if (v > 255) PCA_PWM1 |= 0x02; else PCA_PWM1 &= (unsigned char)~0x02;",
+                "    }",
+                "}",
+                "",
+            ]
         return out
 
     def setup(self, program):
         out: list[str] = []
         outputs: dict = {}
         for pin in program.pins.values():
-            if pin.direction == "output":
+            # PWM pins are outputs as far as the port mode goes; the PCA
+            # drives the level, but the pin still has to be able to drive.
+            if pin.direction in ("output", "pwm"):
                 outputs[pin.port] = outputs.get(pin.port, 0) | pin.mask
         if self.port_modes:
             for port in sorted(outputs):
@@ -449,6 +538,21 @@ class Stc8051Target(Target):
                     f"    P1M0 &= ~0x{analog:02X};",
                     "    ADC_CONTR = 0xE0;              /* ADC on, fastest conversion */"]
 
+        pwm_pins = [p for p in program.pins.values() if p.direction == "pwm"]
+        if pwm_pins:
+            out += ["",
+                    "    CCON = 0x00;                   /* PCA off while configuring */",
+                    "    CL = 0;  CH = 0;",
+                    "    CMOD = 0x00;                   /* CPS=000: PCA clock = FOSC/12 */"]
+            for pin in sorted(pwm_pins, key=lambda p: p.pca_module):
+                out.append(f"    CCAPM{pin.pca_module} = 0x42;"
+                           f"                /* ECOM|PWM: {pin.name} */")
+            # Start at "off", which is 100% high on an active-low load.
+            for pin in sorted(pwm_pins, key=lambda p: p.pca_module):
+                out.append("    " + self.write_pwm(pin, "0")
+                           + f"   /* {pin.name} off */")
+            out.append("    CCON = 0x40;                   /* CR: run the PCA counter */")
+
         out.append("")
         if self.aux_1t_bit:
             out.append("    AUXR &= ~0x80;                 /* Timer 0 at FOSC/12 */")
@@ -467,13 +571,13 @@ class Stc8051Target(Target):
                 "    }"]
 
 
-def _stc(key, display, header, port_modes, aux_1t_bit, adc):
-    return Stc8051Target(key, display, header, port_modes, aux_1t_bit, adc)
+def _stc(key, display, header, port_modes, aux_1t_bit, adc, pwm=False):
+    return Stc8051Target(key, display, header, port_modes, aux_1t_bit, adc, pwm)
 
 
 TARGETS = {
-    "stc12c5a60s2": _stc("stc12c5a60s2", "STC12C5A60S2", "stc12.h", True, True, True),
-    "stc12c5a16s2": _stc("stc12c5a16s2", "STC12C5A16S2", "stc12.h", True, True, True),
+    "stc12c5a60s2": _stc("stc12c5a60s2", "STC12C5A60S2", "stc12.h", True, True, True, True),
+    "stc12c5a16s2": _stc("stc12c5a16s2", "STC12C5A16S2", "stc12.h", True, True, True, True),
     "stc89c52rc": _stc("stc89c52rc", "STC89C52RC", "8052.h", False, False, False),
     "stc89c52": _stc("stc89c52", "STC89C52", "8052.h", False, False, False),
     # The STC15 borrows stc12.h deliberately: every register the EMITTER
@@ -482,7 +586,7 @@ TARGETS = {
     # at 0xD6/0xD7, S3CON...) are registers this generator never writes.
     # Keil TRANSLATION of arbitrary STC15 code is a different problem with
     # its own family shim.
-    "stc15f2k60s2": _stc("stc15f2k60s2", "STC15F2K60S2", "stc12.h", True, True, True),
+    "stc15f2k60s2": _stc("stc15f2k60s2", "STC15F2K60S2", "stc12.h", True, True, True, True),
 }
 
 
@@ -503,6 +607,10 @@ class Program:
     @property
     def uses_adc(self) -> bool:
         return any(pin.direction == "analog" for pin in self.pins.values())
+
+    @property
+    def uses_pwm(self) -> bool:
+        return any(pin.direction == "pwm" for pin in self.pins.values())
 
     @property
     def target(self) -> Target:
@@ -692,8 +800,11 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
         if pin is None:
             raise PseudocodeError(line, f"unknown pin {name!r}; declare it with PIN")
         if pin.direction != "output":
+            what = pin.direction.upper()
+            article = "an" if what[0] in "AEIOU" else "a"
             raise PseudocodeError(
-                line, f"{name!r} is an {pin.direction.upper()} and cannot be driven")
+                line, f"{name!r} is {article} {what} pin and cannot be driven"
+                      + (f"; use 'set {name} to <n> percent'" if what == "PWM" else ""))
         return pin.name
 
     until = re.match(r"wait\s+until\s+(.+)$", text, re.I)
@@ -715,11 +826,26 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
     if level:
         return SetPin(output_pin(level.group(1)), high=(level.group(2) == "high"))
 
+    duty = re.fullmatch(r"set\s+(\w+)\s+to\s+(.+?)\s*(?:percent|%)", text.strip(), re.I)
+    if duty:
+        name = duty.group(1)
+        pin = program.pins.get(name.lower())
+        if pin is None:
+            raise PseudocodeError(line, f"unknown pin {name!r}; declare it with PIN")
+        if pin.direction != "pwm":
+            raise PseudocodeError(
+                line, f"{name!r} is an {pin.direction.upper()} pin; only a PWM pin "
+                      f"takes a percentage")
+        return SetPwm(pin.name, expression(duty.group(2), program, line))
+
     assign = re.match(r"set\s+([A-Za-z_]\w*)\s+to\s+(.+)$", text, re.I)
     if assign:
         name = assign.group(1)
         if name.lower() in program.pins:
-            raise PseudocodeError(line, f"{name!r} is a pin; use 'set {name} high/low'")
+            direction = program.pins[name.lower()].direction
+            how = ("set {0} to <n> percent" if direction == "pwm"
+                   else "set {0} high/low").format(name)
+            raise PseudocodeError(line, f"{name!r} is a pin; use '{how}'")
         value = expression(assign.group(2), program, line)
         if name not in program.variables and name not in program.locals_:
             program.variables.append(name)
@@ -777,7 +903,7 @@ def split_arguments(text: str) -> list[str]:
 
 DEFINE_RE = re.compile(r"define\s+(?:fast\s+)?([A-Za-z_]\w*)\s*(.*?):\s*$", re.I)
 WHEN_RE = re.compile(r"when\s+(started|flag\s+clicked|powered\s+on)\s*:", re.I)
-PIN_RE = re.compile(r"pin\s+(\w+)\s*=\s*(\S+)\s+(output|input|analog)"
+PIN_RE = re.compile(r"pin\s+(\w+)\s*=\s*(\S+)\s+(output|input|analog|pwm)"
                     r"(?:\s+active\s+(low|high))?", re.I)
 CLOCK_RE = re.compile(r"clock\s+([\d_]+)\s*(hz|mhz)?", re.I)
 
@@ -909,7 +1035,9 @@ def stmts_pseudo(body: list, depth: int, active_low: dict) -> list[str]:
     pad = "  " * depth
     out = []
     for node in body:
-        if isinstance(node, SetPin):
+        if isinstance(node, SetPwm):
+            out.append(f"{pad}set {node.pin} to {expr_pseudo(node.value)} percent")
+        elif isinstance(node, SetPin):
             if node.style == "onoff":
                 on = (not node.high) if active_low.get(node.pin) else node.high
                 out.append(f"{pad}turn {'on' if on else 'off'} {node.pin}")
@@ -1026,6 +1154,9 @@ def stmts_c(body: list, depth: int, ctx: Emit) -> list[str]:
     for node in body:
         if isinstance(node, SetPin):
             out.append(pad + ctx.target.write_pin(ctx.pins[node.pin], node.high))
+        elif isinstance(node, SetPwm):
+            out.append(pad + ctx.target.write_pwm(ctx.pins[node.pin],
+                                                  expr_c(node.value, ctx)))
         elif isinstance(node, Toggle):
             out.append(pad + ctx.target.toggle_pin(ctx.pins[node.pin]))
         elif isinstance(node, Wait):
@@ -1104,6 +1235,9 @@ def stmts_task(body: list, depth: int, ctx: Emit,
     for node in body:
         if isinstance(node, SetPin):
             out.append(pad + ctx.target.write_pin(ctx.pins[node.pin], node.high))
+        elif isinstance(node, SetPwm):
+            out.append(pad + ctx.target.write_pwm(ctx.pins[node.pin],
+                                                  expr_c(node.value, ctx)))
         elif isinstance(node, Toggle):
             out.append(pad + ctx.target.toggle_pin(ctx.pins[node.pin]))
         elif isinstance(node, Wait):
