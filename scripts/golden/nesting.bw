@@ -1,0 +1,14 @@
+DEVICE STC12C5A60S2:
+  CLOCK 11059200
+
+  WHEN started:
+    set n to 0
+    FOREVER:
+      REPEAT 3:
+        REPEAT 4:
+          IF n > 5 THEN:
+            WHILE n > 0:
+              change n by -1
+          ELSE:
+            change n by 1
+      wait 1 ms

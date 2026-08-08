@@ -1,0 +1,20 @@
+DEVICE STC12C5A60S2:
+  CLOCK 11059200
+
+  WHEN started:
+    set a to 7
+    set b to 3
+    set c to 2
+    FOREVER:
+      set d to a - (b - c)
+      set e to (a + b) * (a - b)
+      set f to a * b + a / b - a % b
+      set g to a / (b * c)
+      IF a > b and (b > c or a = c) THEN:
+        change a by 1
+      IF not (a = b) THEN:
+        change b by -1
+      WHILE a > 100:
+        set a to a - 100
+      REPEAT UNTIL a < 0:
+        change a by -1

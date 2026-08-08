@@ -1,0 +1,10 @@
+DEVICE STC15F2K60S2:
+  CLOCK 11059200
+
+  PIN led = P1.0 OUTPUT ACTIVE LOW
+  PIN pot = P1.3 ANALOG
+
+  WHEN started:
+    FOREVER:
+      wait pot ms
+      toggle led

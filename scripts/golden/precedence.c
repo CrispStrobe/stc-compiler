@@ -1,0 +1,62 @@
+/* Generated from BrickWright pseudocode by stc-compiler.
+ * Hand edits will be lost; change the pseudocode instead. */
+#include <stc12.h>
+
+#define FOSC_HZ 11059200UL
+
+/* Timer 0, mode 1, clocked at FOSC/12 -- accuracy depends only on
+ * FOSC, and every supported family counts this mode identically, so
+ * the same program is timing-correct on a 12T STC89 and a 1T STC12
+ * or STC15. Nothing in the generated code ever busy-waits. */
+#define T0_RELOAD (65536UL - (FOSC_HZ / 12UL / 1000UL))
+
+static void delay_ms(unsigned int ms)
+{
+    while (ms--) {
+        TL0 = (unsigned char)(T0_RELOAD & 0xFF);
+        TH0 = (unsigned char)(T0_RELOAD >> 8);
+        TF0 = 0;
+        TR0 = 1;
+        while (!TF0) ;
+        TR0 = 0;
+        TF0 = 0;
+    }
+}
+
+/* Variables (16-bit signed, like Scratch's integers). */
+static int a = 0;
+static int b = 0;
+static int c = 0;
+static int d = 0;
+static int e = 0;
+static int f = 0;
+static int g = 0;
+
+void main(void)
+{
+
+    AUXR &= ~0x80;                 /* Timer 0 at FOSC/12 */
+    TMOD  = (TMOD & 0xF0) | 0x01;  /* Timer 0, mode 1 */
+
+    a = 7;
+    b = 3;
+    c = 2;
+    for (;;) {
+        d = a - (b - c);
+        e = (a + b) * (a - b);
+        f = a * b + a / b - a % b;
+        g = a / (b * c);
+        if (a > b && (b > c || a == c)) {
+            a += 1;
+        }
+        if (!((a == b))) {
+            b += -(1);
+        }
+        while (a > 100) {
+            a = a - 100;
+        }
+        while (!((a < 0))) {
+            a += -(1);
+        }
+    }
+}

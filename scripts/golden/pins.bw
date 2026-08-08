@@ -1,0 +1,18 @@
+DEVICE STC12C5A60S2:
+  CLOCK 12000000
+
+  PIN a = P1.0 OUTPUT
+  PIN b = P2.7 OUTPUT ACTIVE LOW
+  PIN c = P3.3 INPUT
+  PIN d = P3.4 INPUT ACTIVE LOW
+
+  WHEN started:
+    FOREVER:
+      set a high
+      turn on b
+      toggle a
+      IF c THEN:
+        set a low
+      ELSE:
+        turn off b
+      wait until d

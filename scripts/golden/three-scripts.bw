@@ -1,0 +1,19 @@
+DEVICE STC12C5A60S2:
+  CLOCK 11059200
+
+  WHEN started:
+    set beats to 0
+    FOREVER:
+      change beats by 1
+      wait 100 ms
+
+  WHEN started:
+    FOREVER:
+      WHILE beats < 10:
+        wait 20 ms
+      set beats to 0
+
+  WHEN started:
+    REPEAT 5:
+      wait 1 seconds
+    stop

@@ -1,0 +1,25 @@
+DEVICE STC12C5A60S2:
+  CLOCK 11059200
+
+  PIN led1 = P1.0 OUTPUT ACTIVE LOW
+  PIN led2 = P1.1 OUTPUT ACTIVE LOW
+
+  WHEN started:
+    set counter to 0
+    FOREVER:
+      REPEAT 6:
+        turn on led1
+        turn off led2
+        wait 0.15 seconds
+        turn off led1
+        turn on led2
+        wait 0.15 seconds
+      change counter by 1
+      IF counter > 2 THEN:
+        turn on led1
+        turn on led2
+        wait 1 seconds
+        turn off led1
+        turn off led2
+        wait 1 seconds
+        set counter to 0

@@ -1,0 +1,19 @@
+DEVICE STC12C5A60S2:
+  CLOCK 11059200
+
+  PIN led = P1.7 OUTPUT ACTIVE LOW
+
+  DEFINE pulse (ms):
+    turn on led
+    wait ms ms
+    turn off led
+    wait ms ms
+
+  DEFINE burst (n) (ms):
+    REPEAT n:
+      pulse ms
+
+  WHEN started:
+    FOREVER:
+      burst 3, 80
+      burst 1, 400

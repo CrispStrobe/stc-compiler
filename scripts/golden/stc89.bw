@@ -1,0 +1,9 @@
+DEVICE STC89C52RC:
+  CLOCK 11059200
+
+  PIN led = P1.0 OUTPUT ACTIVE LOW
+
+  WHEN started:
+    FOREVER:
+      toggle led
+      wait 500 ms

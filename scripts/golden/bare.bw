@@ -1,0 +1,7 @@
+DEVICE STC12C5A60S2:
+  CLOCK 11059200
+
+  WHEN started:
+    set n to 0
+    FOREVER:
+      change n by 1
