@@ -30,6 +30,7 @@ specifier against many as an identifier -- not worth the false positives.
 
 from __future__ import annotations
 
+import functools
 import os
 import pathlib
 import re
@@ -63,20 +64,23 @@ HEADER_MAP = {
     # would produce code that compiles and writes to the wrong registers.
     "reg51.h": "keil-reg51.h",
     "reg52.h": "keil-reg52.h",
+    "regx51.h": "keil-reg51.h",
+    "regx52.h": "keil-reg52.h",
     "at89x51.h": "keil-reg51.h",
     "at89x52.h": "keil-reg52.h",
 }
 
 STORAGE = ("xdata", "idata", "pdata", "bdata", "code")
 
+# Standard headers both toolchains ship. uVision resolves them in any case
+# ("MATH.H"); SDCC's are lowercase and a case-sensitive filesystem cares.
+SYSTEM_HEADERS = {"math.h", "stdio.h", "stdlib.h", "string.h", "ctype.h",
+                  "setjmp.h", "stdarg.h", "limits.h", "float.h", "assert.h"}
+
 
 def provided_bits(include_shim: bool = True) -> dict[str, int]:
-    """Every __sbit SDCC's headers and our compat shim already declare.
-
-    A Keil project routinely declares its own `sbit P13 = P1^3;`. Once the
-    shim provides the same name at the same address, keeping both is a
-    duplicate-symbol error -- so the translator drops the redundant one.
-    """
+    """Every __sbit SDCC's headers and our compat shims declare (first
+    address wins; _dedup_sets() has the full per-family picture)."""
     out: dict[str, int] = {}
     paths = list(SHIM_DIR.glob("*.h")) if (include_shim and SHIM_DIR.is_dir()) else []
     for base in SDCC_INCLUDE_DIRS:
@@ -122,6 +126,41 @@ def sfr_addresses(header: pathlib.Path | None = None) -> dict[str, int]:
     return out
 
 
+@functools.lru_cache(maxsize=None)
+def _dedup_sets() -> tuple[dict, dict]:
+    """name -> frozenset of addresses, across every SDCC family header AND
+    our shims. One name at two addresses is a per-family fact (the STC12's
+    WDT_CONTR is 0xC1, the STC89's 0xE1), so duplicate-vs-collision decisions
+    need the full set. RESOLUTION keeps using the first-address dicts -- a
+    file's own declarations override those anyway."""
+    sfr_sets: dict[str, set] = {}
+    bit_sets: dict[str, set] = {}
+    paths = list(SHIM_DIR.glob("*.h")) if SHIM_DIR.is_dir() else []
+    for base in SDCC_INCLUDE_DIRS:
+        directory = pathlib.Path(base)
+        if directory.is_dir():
+            paths += [directory / "stc12.h", directory / "8052.h",
+                      directory / "8051.h"]
+            break
+    for path in paths:
+        if not path.exists():
+            continue
+        text = path.read_text(errors="replace")
+        for name, value in re.findall(r"SFR\s*\(\s*(\w+)\s*,\s*(0x[0-9A-Fa-f]+)",
+                                      text):
+            sfr_sets.setdefault(name, set()).add(int(value, 16))
+        for value, name in re.findall(
+                r"__sfr\s+__at\s*\(?\s*(0x[0-9A-Fa-f]+)\s*\)?\s*(\w+)", text):
+            sfr_sets.setdefault(name, set()).add(int(value, 16))
+        for value, name in re.findall(
+                r"__sbit\s+__at\s*\(?\s*(0x[0-9A-Fa-f]+)\s*\)?\s*(\w+)", text):
+            bit_sets.setdefault(name, set()).add(int(value, 16))
+        for name, base_addr, index in re.findall(
+                r"SBIT\s*\(\s*(\w+)\s*,\s*(0x[0-9A-Fa-f]+)\s*,\s*(\d+)", text):
+            bit_sets.setdefault(name, set()).add(int(base_addr, 16) + int(index))
+    return sfr_sets, bit_sets
+
+
 class Translation:
     def __init__(self, text: str, changes: dict, unresolved: list,
                  warnings: list | None = None):
@@ -147,6 +186,7 @@ def translate(source: str, known: dict[str, int] | None = None,
     """
     known = dict(known if known is not None else sfr_addresses())
     bits = provided_bits() if bits is None else bits
+    sfr_sets, bit_sets = _dedup_sets()
     changes: dict[str, int] = {}
     unresolved: list[str] = []
     warnings: list[str] = []
@@ -154,6 +194,20 @@ def translate(source: str, known: dict[str, int] | None = None,
     def bump(kind, n=1):
         if n:
             changes[kind] = changes.get(kind, 0) + n
+
+    # C51's preprocessor lets an unknown directive pass -- `#defind` include
+    # guards ship in real projects and build fine under Keil. sdcpp is GCC's
+    # and hard-errors. Mimic Keil: keep the directive as a comment.
+    def fix_directive(match):
+        bump("unknown-directive")
+        warnings.append("unknown preprocessing directive kept as a comment: "
+                        + match.group(0).strip()[:48])
+        return "/* " + match.group(0).strip() + " */"
+
+    source = re.sub(
+        r"^[ \t]*#[ \t]*(?!(?:define|undef|include|if|ifdef|ifndef|else|elif"
+        r"|endif|error|warning|pragma|line)\b|\d)\w+[^\n]*",
+        fix_directive, source, flags=re.M)
 
     # --- includes ---------------------------------------------------------
     def fix_include(match):
@@ -165,6 +219,18 @@ def translate(source: str, known: dict[str, int] | None = None,
         if target:
             bump("include")
             return f"#include <{target}>"
+        # Keil's math.h also carries abs/labs; SDCC keeps those in stdlib.h,
+        # so a math.h include brings stdlib along. (Not unconditionally in
+        # the compat header: corpus code defines its own abs, and an imported
+        # declaration would conflict where Keil saw none.)
+        if name == "math.h":
+            bump("include-math")
+            return "#include <math.h>\n#include <stdlib.h> /* Keil math.h has abs */"
+        # `#include <MATH.H>` resolves under uVision (and on macOS) but not on
+        # a case-sensitive filesystem; SDCC's own headers are lowercase.
+        if name in SYSTEM_HEADERS and raw != name:
+            bump("include-case")
+            return f"#include <{name}>"
         # A project-local header: drop the directory and fix the case, then let
         # -I find it. Every directory in the project is on the include path, so
         # the basename alone is both sufficient and more robust than a relative
@@ -245,9 +311,7 @@ def translate(source: str, known: dict[str, int] | None = None,
 
     # --- sfr / sfr16 ------------------------------------------------------
     # Collected so `sbit X = MYSFR^n;` can resolve an SFR this file declares
-    # itself. Kept apart from `provided`, or the dedup below would see a
-    # file's own declaration as a duplicate of itself and delete it.
-    provided = dict(known)
+    # itself.
     own_names: set[str] = set(bdata_bits)
     for name, value in re.findall(
             r"(?:^|(?<=;))\s*sfr\s+(\w+)\s*=\s*(0x[0-9A-Fa-f]+|\d+)\s*;",
@@ -259,11 +323,13 @@ def translate(source: str, known: dict[str, int] | None = None,
     # corpus code, and a line-start-only anchor silently skips everything
     # after the first semicolon.
     def fix_sfr(match):
-        name, value = match.group(2), int(match.group(3), 0)
-        own_names.add(name)
-        if provided.get(name) == value:
-            bump("sfr-dup")
-            return f"{match.group(1)}/* {name}: already declared by SDCC */"
+        # Always emitted, never deduplicated: SDCC accepts an IDENTICAL
+        # redeclaration of an SFR (only a differing address is an error), and
+        # the file's own declaration may be the only provider its translation
+        # unit has -- an 8052-family TU never sees stc12.h, whatever our
+        # tables know. A genuine address conflict still fails loudly, which
+        # is what a real conflict deserves.
+        own_names.add(match.group(2))
         bump("sfr")
         return f"{match.group(1)}__sfr __at ({match.group(3)}) {match.group(2)};"
 
@@ -281,6 +347,25 @@ def translate(source: str, known: dict[str, int] | None = None,
                     fix_sfr16, source, flags=re.M)
 
     # --- sbit -------------------------------------------------------------
+    sbit_renames: dict[str, str] = {}
+
+    def emit_sbit(indent, name, address):
+        """One resolved sbit, always emitted (an identical redeclaration is
+        fine by SDCC). Exception: a file may reuse a name SDCC's headers
+        provide at a DIFFERENT address (`sbit P2_0 = P3^7;` is real corpus
+        code) -- that duplicate would be fatal wherever the header appears,
+        and renaming is safe in every case, so rename and let every use in
+        the file follow."""
+        if name in bit_sets and address not in bit_sets[name]:
+            renamed = f"{name}_at_0x{address:02X}"
+            sbit_renames[name] = renamed
+            warnings.append(
+                f"sbit {name} points at 0x{address:02X} but SDCC's headers "
+                f"declare that name elsewhere; renamed to {renamed}")
+            name = renamed
+        bump("sbit")
+        return f"{indent}__sbit __at (0x{address:02X}) {name};"
+
     def fix_sbit(match):
         indent, name, rhs = match.group(1), match.group(2), match.group(3).strip()
         own_names.add(name)
@@ -292,26 +377,22 @@ def translate(source: str, known: dict[str, int] | None = None,
                 return (f"{indent}__sbit __at "
                         f"(0x{bdata_bits[base] + index:02X}) {name};")
             if base in known:
-                address = known[base] + index
-                if bits.get(name) == address:
-                    bump("sbit-dup")
-                    return f"{indent}/* {name}: already declared by SDCC */"
-                bump("sbit")
-                return f"{indent}__sbit __at (0x{address:02X}) {name};"
+                return emit_sbit(indent, name, known[base] + index)
             if re.fullmatch(r"0[xX][0-9A-Fa-f]+|\d+", base):
-                bump("sbit")
-                return f"{indent}__sbit __at (0x{int(base, 0) + index:02X}) {name};"
+                return emit_sbit(indent, name, int(base, 0) + index)
             unresolved.append(f"sbit {name} = {rhs}  (unknown SFR {base!r})")
             return match.group(0)
         direct = re.fullmatch(r"0[xX][0-9A-Fa-f]+|\d+", rhs)
         if direct:
-            bump("sbit")
-            return f"{indent}__sbit __at (0x{int(rhs, 0):02X}) {name};"
+            return emit_sbit(indent, name, int(rhs, 0))
         unresolved.append(f"sbit {name} = {rhs}")
         return match.group(0)
 
     source = re.sub(r"((?:^|(?<=;))[ \t]*)sbit\s+(\w+)\s*=\s*([^;]+);",
                     fix_sbit, source, flags=re.M)
+    for old, new in sbit_renames.items():
+        # The declaration already carries the new name; this renames the uses.
+        source = re.sub(rf"\b{re.escape(old)}\b(?!_at_0x)", new, source)
 
     # --- interrupt / using ------------------------------------------------
     def fix_interrupt(match):
@@ -388,29 +469,101 @@ def translate(source: str, known: dict[str, int] | None = None,
     def fix_params(match):
         head, params, tail = match.group(1), match.group(2), match.group(3)
         parts = [p.strip() for p in params.split(",")]
-        if len(parts) < 2 or " " not in parts[0]:
-            return match.group(0)          # a call, or already fully typed
-        last_type = parts[0].rsplit(" ", 1)[0].strip()
-        out, fixed = [parts[0]], False
-        for part in parts[1:]:
-            if re.fullmatch(r"[A-Za-z_]\w*", part):
-                out.append(f"{last_type} {part}")
-                fixed = True
-            else:
-                out.append(part)
-                if " " in part:
-                    last_type = part.rsplit(" ", 1)[0].strip()
-        if not fixed:
+        knr = False
+        if len(parts) >= 2 and " " in parts[0]:
+            last_type = parts[0].rsplit(" ", 1)[0].strip()
+            out = [parts[0]]
+            for part in parts[1:]:
+                if re.fullmatch(r"[A-Za-z_]\w*", part):
+                    out.append(f"{last_type} {part}")
+                    knr = True
+                else:
+                    out.append(part)
+                    if " " in part:
+                        last_type = part.rsplit(" ", 1)[0].strip()
+            parts = out
+        # A `__code` pointer parameter needs `const`: SDCC back-propagates the
+        # implicit constness of a code-space array argument into the recorded
+        # function type, and a later const-less DEFINITION then conflicts
+        # (error 98) -- with the call sitting in between, even identical
+        # spellings lose. `const` is also simply true: code memory is ROM.
+        consted = False
+        for index, part in enumerate(parts):
+            if "__code" in part and "*" in part and not part.startswith("const"):
+                parts[index] = "const " + part
+                consted = True
+        if not (knr or consted):
             return match.group(0)
-        bump("old-style-params")
-        return f"{head}({', '.join(out)}){tail}"
+        bump("old-style-params", knr)
+        bump("const-code-param", consted)
+        return f"{head}({', '.join(parts)}){tail}"
 
-    # The `{` of a definition is routinely on the next line, so the tail must
-    # be allowed to cross a newline -- calls still cannot match, because a
-    # call is never followed by `{` and a call-as-statement's `;` sits inside
-    # the enclosing expression the head fails to match.
-    source = re.sub(r"(\b\w+[ \t*]+\w+[ \t]*)\(([^)(;]*)\)([ \t\r\n]*[;{])",
-                    fix_params, source)
+    # The `{` of a definition is routinely on the next line -- often with a
+    # trailing // comment after the parameter list -- so the tail must be
+    # allowed to cross those. Calls still cannot match: a call is never
+    # followed by `{`, and a call-as-statement's `;` sits inside the
+    # enclosing expression the head fails to match.
+    source = re.sub(
+        r"(\b\w+[ \t*]+\w+[ \t]*)\(([^)(;]*)\)"
+        r"((?:[ \t]*(?://[^\n]*)?\r?\n)*[ \t]*[;{])",
+        fix_params, source)
+
+    # Brace-depth guard for the implicit-int rules below. Counted on a copy
+    # with comments and literals blanked (same length, so offsets hold):
+    # GBK-encoded comments read with errors="replace" keep any ASCII byte a
+    # multibyte character happened to contain, including stray braces.
+    def _blanked(text):
+        return re.sub(
+            r"//[^\n]*|/\*(?:[^*]|\*(?!/))*\*/|\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'",
+            lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+
+    shadow = _blanked(source)
+
+    def at_file_scope(position):
+        before = shadow[:position]
+        return before.count("{") == before.count("}")
+
+    # A DEFINITION with no return type at all -- ` ReadOneChar()  //... {` --
+    # is implicit int to Keil and a syntax error to SDCC.
+    def fix_bare_definition(match):
+        indent, name, params, tail = match.groups()
+        if name in ("if", "while", "for", "switch", "return", "do", "else"):
+            return match.group(0)
+        if not at_file_scope(match.start()):
+            return match.group(0)          # inside a body this is a call
+        bump("implicit-int")
+        return f"{indent}int {name}({params}){tail}"
+
+    source = re.sub(
+        r"^([ \t]*)([A-Za-z_]\w*)[ \t]*\(((?:void)?)\)"
+        r"([ \t]*(?://[^\n]*)?\r?\n[ \t]*\{)",
+        fix_bare_definition, source, flags=re.M)
+
+    # A file-scope prototype with no return type at all -- `ReadOneChar();` --
+    # is implicit int to Keil and a syntax error to SDCC. When the definition
+    # is in the same file, its return type is right there; borrow it.
+    def_types = {name: head.strip() for head, name in re.findall(
+        r"^[ \t]*((?:[A-Za-z_]\w*[ \t]+)+)([A-Za-z_]\w*)[ \t]*\([^;{)]*\)"
+        r"(?:[ \t]*(?://[^\n]*)?\r?\n)*[ \t]*\{", source, re.M)}
+
+    shadow = _blanked(source)      # recomputed: the definition fix resized
+
+    def fix_bare_prototype(match):
+        indent, name, params = match.groups()
+        if name in ("if", "while", "for", "switch", "return", "do", "else"):
+            return match.group(0)
+        rtype = def_types.get(name)
+        if not rtype:
+            return match.group(0)
+        # Inside a function body the same shape is a CALL -- rewriting it
+        # would delete the call. Only file scope qualifies.
+        if not at_file_scope(match.start()):
+            return match.group(0)
+        bump("bare-prototype")
+        return f"{indent}{rtype} {name}({params});"
+
+    source = re.sub(r"^([ \t]*)([A-Za-z_]\w*)[ \t]*\(((?:void)?)\)[ \t]*;",
+                    fix_bare_prototype, source, flags=re.M)
 
     # --- flat aggregate initialisers ---------------------------------------
     # `uchar code t[8][8] = {64 values};` is legal C (brace elision), but SDCC
@@ -495,21 +648,25 @@ def translate(source: str, known: dict[str, int] | None = None,
     bump("reentrant-static", reentrant_static)
 
     # --- register visibility ------------------------------------------------
-    # Two ways a translation unit loses its registers: the dedup above dropped
-    # a declaration SDCC already provides and nothing else includes SDCC's
-    # header, or the original relied on a register header living in Keil's
-    # install directory, which no repo ships. Either way the cure is the same:
-    # make sure the file sees SDCC's declarations. keil-stc12.h is guarded, so
-    # a second include through a mapped vendor header costs nothing.
+    # A file that USES register names but declares none and includes no
+    # register header relied on one living in Keil's install directory,
+    # which no repo ships. Give it SDCC's declarations. The shims are
+    # guarded, so a second include through a mapped vendor header is free.
     if not re.search(r'#\s*include\s*[<"]keil-(?:stc12|reg51|reg52)\.h', source):
         used = set(re.findall(r"\b[A-Za-z_]\w+\b", source))
         # Names of 3+ characters only: EA or OV alone could be anybody's
         # identifier, and a file whose only register use is that short failed
         # before this rule existed too.
-        wanted = {name for name in (set(known) | set(bits)) - own_names
-                  if len(name) >= 3}
-        if changes.get("sfr-dup") or changes.get("sbit-dup") or (used & wanted):
-            source = "#include <keil-stc12.h>\n" + source
+        wanted = {name for name in
+                  (set(known) | set(bits) | set(sfr_sets) | set(bit_sets))
+                  - own_names if len(name) >= 3}
+        if used & wanted:
+            # Family pick for an orphan file: Timer 2 names mean the 8052
+            # family (the STC12 has no Timer 2 at all).
+            timer2 = {"T2CON", "TH2", "TL2", "RCAP2H", "RCAP2L",
+                      "TR2", "TF2", "ET2", "EXEN2", "TCLK", "RCLK"}
+            shim = "keil-reg52.h" if used & timer2 else "keil-stc12.h"
+            source = f"#include <{shim}>\n" + source
             bump("register-include")
 
     # --- ISR visibility ---------------------------------------------------

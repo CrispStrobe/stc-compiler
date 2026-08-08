@@ -49,12 +49,27 @@ def to_asm(entries, memory) -> str:
     frame_sensitive = ("SJMP", "JZ", "JNZ", "JC", "JNC", "JB", "JNB", "JBC",
                        "CJNE", "DJNZ", "AJMP", "ACALL")
 
+    # Contiguous runs: sdld resolves a relative displacement that crosses an
+    # .org discontinuity short by the gap's bookkeeping, so a branch whose
+    # target sits in another run must go out as raw bytes too.
+    run_of: dict[int, int] = {}
+    run = -1
+    next_address = None
+    for address, raw, _ in entries:
+        if address != next_address:
+            run += 1
+        run_of[address] = run
+        next_address = address + len(raw)
+
     lines = [".area CODE (ABS)"]
     expected = None
     for address, raw, text in entries:
         if text.startswith(frame_sensitive):
             operands = re.findall(r"0x([0-9A-F]{4})\b", text)
-            if operands and int(operands[-1], 16) not in targets:
+            target = int(operands[-1], 16) if operands else None
+            if target is not None and (
+                    target not in targets
+                    or run_of.get(target) != run_of.get(address)):
                 text = ".db   " + ", ".join(f"0x{b:02X}" for b in raw)
         if text.startswith(("AJMP", "ACALL")) \
                 and (address + 2) >> 11 != address >> 11:

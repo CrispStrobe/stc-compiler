@@ -4,6 +4,7 @@
 #include <mcs51/stc12.h>  /* mcs51/ prefix: a project header named stc12.h (or STC12.h on a
                              case-insensitive filesystem) must not shadow SDCC's */
 #include "keil-compat.h"
+#include "keil-compat-stc12.h"
 /* Vendor register headers routinely pull in intrins.h themselves;
    code downstream counts on that. */
 #include "intrins.h"
