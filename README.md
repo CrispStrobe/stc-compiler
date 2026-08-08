@@ -328,6 +328,31 @@ Several `WHEN started:` blocks compile to a cooperative scheduler (Timer-0
 millisecond tick, one state machine per script, a yield at every wait and
 every loop iteration — Scratch's own contract).
 
+## Debug symbol tables
+
+That scheduler is also what makes the generated code debuggable, and
+[`stc_symtab.py`](stc_symtab.py) is what lets a debugger find its way around:
+
+```bash
+sdcc -mmcs51 --std-c99 --debug ... -o build/ prog.c
+python3 stc_symtab.py --cdb build/prog.cdb --source prog.c -o symbols.json
+```
+
+The scheduler keeps its position in named statics — `bw_ms`, `<task>_state`,
+`<task>_until` — so "where is the program right now" is three variable reads
+rather than anything that needs instrumenting. This tool pulls their addresses,
+and the code address of every `case` label (each one a yield point), out of
+SDCC's `.cdb` and writes the JSON that three separate debug targets consume: a
+ucsim fork, an emu8051 fork, and an on-chip UART monitor on real silicon. The
+contract they all implement is `stc12c5a60s2-lab/docs/DEBUG-CONTROL-MODEL.md`.
+
+Producing it needs both halves of the problem — what a task looks like, and
+where the linker put it — which is why it lives here and not in either
+emulator. `scripts/test-symtab.py` builds a two-script fixture end to end and
+checks every address against the linker's `.map`, an artefact this tool never
+reads: agreeing with the `.cdb` alone would only prove the parser is
+self-consistent.
+
 ---
 
 ## Calling it
