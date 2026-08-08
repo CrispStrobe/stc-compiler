@@ -264,6 +264,12 @@ DEVICE STC12C5A60S2:
 | `PIN <name> = P1.0 OUTPUT [ACTIVE LOW]` | `ACTIVE LOW` makes `turn on` drive 0 |
 | `PIN <name> = P3.2 INPUT [ACTIVE LOW]` | readable in expressions |
 | `PIN <name> = P1.2 ANALOG` | 10-bit ADC; channel *n* is on `P1.n`, so P1 only |
+
+The location on the right of the `=` is whatever the `DEVICE` calls a pin, and
+the device checks it: `P0.0`–`P4.7` on the 8051 parts, `D0`–`D13` and `A0`–`A5`
+on an Arduino Uno. Asking for something the board cannot do is a parse error
+naming the board, not a miscompile.
+
 | `DEFINE <name> (a) (b):` | procedure; callable as `name 3, 80` or `name(3, 80)` |
 | `WHEN started:` | also accepts `WHEN flag clicked:` |
 | `FOREVER:` · `REPEAT n:` · `IF c THEN:` / `ELSE:` | indentation-scoped |
@@ -327,6 +333,22 @@ count identically, so the same program is timing-correct across families.
 Several `WHEN started:` blocks compile to a cooperative scheduler (Timer-0
 millisecond tick, one state machine per script, a yield at every wait and
 every loop iteration — Scratch's own contract).
+
+### Beyond the 8051
+
+`DEVICE ARDUINO-UNO:` and `DEVICE ARDUINO-NANO:` emit Arduino core C++ —
+`pinMode`/`digitalWrite`/`analogRead`, the script in `setup()`, cooperative
+tasks dispatched from `loop()`. The scheduler contract survives the move
+unchanged, because `millis()` *is* the millisecond tick the 8051 back end had
+to build by hand; the Arduino target ships no runtime of its own at all. What
+does change is the width of it: `millis()` is 32-bit, so the deadlines and the
+wraparound compare widen with it, and that type comes from the target rather
+than from the AST walker.
+
+**These transpile here; they do not compile here.** This service vendors SDCC,
+which cannot build core C++. `POST /compile` with an Arduino `DEVICE` is
+refused with the toolchain it would need (`arduino-cli`) and returns the
+generated source anyway; `POST /transpile` is the endpoint to use.
 
 ## Debug symbol tables
 

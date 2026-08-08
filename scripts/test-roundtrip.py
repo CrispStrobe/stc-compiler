@@ -167,6 +167,45 @@ WHEN started:
       wait pot ms
       toggle led
 """,
+
+    # A target off the 8051 entirely: no registers, no runtime of our own, and
+    # a 32-bit millis(). Straight-line, so the whole script lands in setup()
+    # and loop() stays empty -- a script runs once, as it does in Scratch.
+    "arduino": """DEVICE ARDUINO-UNO:
+  CLOCK 16000000
+  PIN led = D13 OUTPUT
+  PIN btn = D2 INPUT ACTIVE LOW
+  PIN pot = A0 ANALOG
+  WHEN started:
+    wait until btn
+    REPEAT 4:
+      toggle led
+      wait pot ms
+    IF pot > 512 THEN:
+      turn on led
+    ELSE:
+      turn off led
+""",
+
+    # The same board with two scripts, which is where the timebase type
+    # matters: these deadlines are `unsigned long` because millis() is, and
+    # the wraparound compare has to widen with them.
+    "arduino-scripts": """DEVICE ARDUINO-NANO:
+  CLOCK 16000000
+  PIN slow = D13 OUTPUT
+  PIN fast = D12 OUTPUT ACTIVE LOW
+  WHEN started:
+    FOREVER:
+      toggle slow
+      wait 500 ms
+  WHEN started:
+    REPEAT 3:
+      toggle fast
+      wait 150 ms
+    FOREVER:
+      toggle fast
+      wait 300 ms
+""",
 }
 
 # Hop orders. Only one text hop exists today, so depth is what varies; the

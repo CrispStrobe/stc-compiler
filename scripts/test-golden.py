@@ -87,7 +87,16 @@ import inspect  # noqa: E402
 
 FORBIDDEN = ["P1_", "P0_", "P2_", "P3_", "ADC_CONTR", "ADC_RES", "P1ASF",
              "TMOD", "AUXR", "TL0", "TH0", "TR0", "TF0", "ET0",
-             "delay_ms", "adc_read", "bw_now", "bw_ms", "#include", "__interrupt"]
+             "delay_ms", "adc_read", "bw_now", "bw_ms", "#include", "__interrupt",
+             # The shell around the statements belongs to the target too: the
+             # Arduino core owns main() and calls setup()/loop() itself, so a
+             # walker that writes "void main" has quietly excluded that board.
+             "void main",
+             # ...and so does the width of the timebase. `(int)` around a
+             # deadline compare is right for a 16-bit tick and wrong for
+             # millis(); it has to come from the target, not from here.
+             # (the parentheses matter: "milliseconds" is a fine word to use)
+             "(int)", "digitalWrite", "pinMode", "millis()"]
 for function in (sp.expr_c, sp.ms_of, sp.stmts_c, sp.stmts_task, sp.emit_c):
     source = inspect.getsource(function)
     leaked = [token for token in FORBIDDEN if token in source]

@@ -1,0 +1,16 @@
+DEVICE ARDUINO-UNO:
+  CLOCK 16000000
+
+  PIN led = D13 OUTPUT
+  PIN btn = D2 INPUT ACTIVE LOW
+  PIN pot = A0 ANALOG
+
+  WHEN started:
+    wait until btn
+    REPEAT 4:
+      toggle led
+      wait pot ms
+    IF pot > 512 THEN:
+      turn on led
+    ELSE:
+      turn off led

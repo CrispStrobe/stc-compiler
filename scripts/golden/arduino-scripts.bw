@@ -1,0 +1,18 @@
+DEVICE ARDUINO-NANO:
+  CLOCK 16000000
+
+  PIN slow = D13 OUTPUT
+  PIN fast = D12 OUTPUT ACTIVE LOW
+
+  WHEN started:
+    FOREVER:
+      toggle slow
+      wait 500 ms
+
+  WHEN started:
+    REPEAT 3:
+      toggle fast
+      wait 150 ms
+    FOREVER:
+      toggle fast
+      wait 300 ms

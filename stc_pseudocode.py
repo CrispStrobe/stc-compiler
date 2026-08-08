@@ -241,6 +241,20 @@ class Target:
     key = ""                    # canonical device token, as written in DEVICE
     display = ""                # how to name it in an error message
 
+    # Which compiler turns this target's output into an image. Transpiling is
+    # free; compiling is not, and the hosted service vendors SDCC only. Saying
+    # so here lets the caller refuse clearly instead of handing Arduino C++ to
+    # `sdcc -mmcs51` and reporting whatever it makes of that.
+    toolchain = "sdcc-mcs51"
+
+    # The C type a millisecond count lives in, and its signed counterpart for
+    # the scheduler's wraparound-safe deadline compare. 16 bits is right for a
+    # Timer-0 counter we increment ourselves; a target whose clock is the
+    # core's `millis()` gets a 32-bit one whether it wants it or not, and
+    # casting that to a 16-bit int would make every deadline past 32 s wrong.
+    time_type = "unsigned int"
+    time_signed = "int"
+
     # ---- pins -----------------------------------------------------------
     def resolve_pin(self, program, name, where, direction, active_low,
                     line: int) -> Pin:
@@ -285,6 +299,19 @@ class Target:
 
     def start_scheduler(self, task_names: list[str]) -> list[str]:
         """Start the timebase and run the cooperative tasks forever."""
+        raise NotImplementedError
+
+    def main(self, program, setup_lines: list[str], body_lines: list[str],
+             task_names: list[str]) -> list[str]:
+        """The whole shell around the generated statements.
+
+        Not merely main()'s braces: a target is free to have no main() at all.
+        The Arduino core owns main() and calls setup() and loop() from it, so
+        this is two functions there and one here -- a difference the AST
+        walker must not have to know about. `task_names` is empty for a
+        single-script program, and `body_lines` is empty for a multi-script
+        one; exactly one of the two is ever non-empty.
+        """
         raise NotImplementedError
 
 
@@ -466,6 +493,166 @@ class Stc8051Target(Target):
                 *(f"        {name}();" for name in task_names),
                 "    }"]
 
+    def main(self, program, setup_lines, body_lines, task_names):
+        out = ["void main(void)", "{"] + setup_lines
+        if task_names:
+            out += self.start_scheduler(task_names)
+        else:
+            out.append("")
+            out += body_lines
+        return out + ["}", ""]
+
+
+ARDUINO_PIN_RE = re.compile(r"^(?:d(\d{1,2})|a(\d{1,2})|(\d{1,2}))$", re.I)
+
+
+@dataclass
+class ArduinoPin(Pin):
+    """The Arduino view: whatever expression the core's functions accept.
+
+    A digital pin is its bare number; an analog one is the `A0` macro, which
+    is also a perfectly good argument to digitalWrite. So one string covers
+    both, and nothing here needs to know about a port or a register.
+    """
+    ref: str = ""
+
+
+class ArduinoTarget(Target):
+    """Boards programmed through the Arduino core, emitted as core C++.
+
+    This target writes almost no runtime of its own, and that is the point.
+    The scheduler contract the 8051 back end had to build by hand -- a
+    millisecond tick that never busy-waits, so cooperative tasks can share the
+    processor -- is what `millis()` already is. So `runtime()` is empty, and
+    the generated code is the AST lowering and nothing else.
+
+    The debt is at the other end: `millis()` is 32-bit, so the deadline
+    statics and the wraparound compare have to widen with it (see
+    `time_type`). Truncating it to 16 bits would look right and would break
+    every wait longer than 32 seconds.
+    """
+
+    # millis() is `unsigned long`, and the deadline arithmetic must match it.
+    time_type = "unsigned long"
+    time_signed = "long"
+
+    # Core C++ needs the Arduino build system; SDCC cannot touch it.
+    toolchain = "arduino-cli"
+
+    def __init__(self, key: str, display: str, digital_max: int, analog_max: int):
+        self.key = key
+        self.display = display
+        self.digital_max = digital_max
+        self.analog_max = analog_max
+
+    # ---- pins -----------------------------------------------------------
+    def resolve_pin(self, program, name, where, direction, active_low, line):
+        match = ARDUINO_PIN_RE.match(where)
+        if not match:
+            raise PseudocodeError(
+                line, f"{where.upper()} is not a pin on the {self.display}; "
+                      f"use D0-D{self.digital_max} or A0-A{self.analog_max}")
+        digital, analog, bare = match.groups()
+
+        if analog is not None:
+            number = int(analog)
+            if number > self.analog_max:
+                raise PseudocodeError(
+                    line, f"the {self.display} has A0-A{self.analog_max}, "
+                          f"not A{number}")
+            # An analog pin is still a perfectly good digital one, so this
+            # deliberately does not check the direction.
+            return ArduinoPin(name, f"A{number}", direction, active_low,
+                              f"A{number}")
+
+        number = int(digital if digital is not None else bare)
+        if number > self.digital_max:
+            raise PseudocodeError(
+                line, f"the {self.display} has D0-D{self.digital_max}, "
+                      f"not D{number}")
+        if direction == "analog":
+            raise PseudocodeError(
+                line, f"ANALOG needs an analog input, and D{number} is "
+                      f"digital-only on the {self.display}; "
+                      f"use A0-A{self.analog_max}")
+        return ArduinoPin(name, f"D{number}", direction, active_low, str(number))
+
+    def write_pin(self, pin, high):
+        return f"digitalWrite({pin.ref}, {'HIGH' if high else 'LOW'});"
+
+    def toggle_pin(self, pin):
+        return f"digitalWrite({pin.ref}, !digitalRead({pin.ref}));"
+
+    def read_pin(self, pin):
+        read = f"digitalRead({pin.ref})"
+        return f"!{read}" if pin.active_low else read
+
+    def read_analog(self, pin):
+        return f"analogRead({pin.ref})"
+
+    # ---- time -----------------------------------------------------------
+    def delay(self, ms):
+        return f"delay({ms});"
+
+    def now(self):
+        return "millis()"
+
+    # ---- the shell ------------------------------------------------------
+    def prologue(self, program):
+        return [
+            "#include <Arduino.h>",
+            "",
+            "/* No clock constant here on purpose: millis() and delay() are",
+            " * already correct for whatever the board is actually clocked at,",
+            " * so a CLOCK line in the pseudocode is carried for the other",
+            " * targets and deliberately ignored on this one. */",
+            "",
+        ]
+
+    def runtime(self, program, tasks):
+        # Nothing to emit. The timebase, the blocking delay and the ADC are
+        # all in the core already -- which is the whole reason this target is
+        # cheap, and the reason it is a good check on the interface: a target
+        # that needs no runtime at all still has to fit through it.
+        return []
+
+    def setup(self, program):
+        out: list[str] = []
+        for pin in program.pins.values():
+            if pin.direction == "output":
+                out.append(f"    pinMode({pin.ref}, OUTPUT);")
+            elif pin.direction == "input":
+                # An ACTIVE LOW input is a button wired to ground, which is
+                # exactly what the internal pull-up is for. An active-high one
+                # needs its own external pull-down, and enabling the pull-up
+                # would fight it.
+                mode = "INPUT_PULLUP" if pin.active_low else "INPUT"
+                out.append(f"    pinMode({pin.ref}, {mode});")
+            # An analog pin needs no pinMode: analogRead configures the mux.
+        for pin in program.pins.values():
+            if pin.direction == "output":
+                level = "HIGH" if pin.active_low else "LOW"
+                out.append(f"    digitalWrite({pin.ref}, {level});"
+                           f"   /* {pin.name} off */")
+        return out
+
+    def start_scheduler(self, task_names):
+        # loop() *is* the forever loop; wrapping another one inside it would
+        # starve the core's own housekeeping (serialEventRun between calls).
+        return [f"    {name}();" for name in task_names]
+
+    def main(self, program, setup_lines, body_lines, task_names):
+        out = ["void setup()", "{"] + setup_lines
+        if body_lines:
+            # A single script runs once, so it belongs in setup(). Scratch
+            # semantics: the script is not restarted when it finishes.
+            out.append("")
+            out += body_lines
+        out += ["}", "", "void loop()", "{"]
+        out += (self.start_scheduler(task_names) if task_names else
+                ["    /* the script ran once, in setup(); nothing repeats here */"])
+        return out + ["}", ""]
+
 
 def _stc(key, display, header, port_modes, aux_1t_bit, adc):
     return Stc8051Target(key, display, header, port_modes, aux_1t_bit, adc)
@@ -483,6 +670,13 @@ TARGETS = {
     # Keil TRANSLATION of arbitrary STC15 code is a different problem with
     # its own family shim.
     "stc15f2k60s2": _stc("stc15f2k60s2", "STC15F2K60S2", "stc12.h", True, True, True),
+
+    # Both are ATmega328P boards and differ here only in how many analog pins
+    # the package brings out: the Uno's header stops at A5, the Nano carries
+    # A6 and A7 as well (input-only, which this generator never violates
+    # because ANALOG is read-only by construction).
+    "arduino-uno": ArduinoTarget("arduino-uno", "Arduino Uno", 13, 5),
+    "arduino-nano": ArduinoTarget("arduino-nano", "Arduino Nano", 13, 7),
 }
 
 
@@ -1111,7 +1305,8 @@ def stmts_task(body: list, depth: int, ctx: Emit,
             out += [f"{pad}{task}_until = {ctx.target.now()} + ({ms_of(node, ctx)});",
                     f"{pad}{task}_state = {state};",
                     f"{pad}case {state}:",
-                    f"{pad}if ((int)({ctx.target.now()} - {task}_until) < 0) return;"]
+                    f"{pad}if (({ctx.target.time_signed})"
+                    f"({ctx.target.now()} - {task}_until) < 0) return;"]
         elif isinstance(node, WaitUntil):
             state = yield_state()
             out += [f"{pad}{task}_state = {state};",
@@ -1215,7 +1410,7 @@ def emit_c(program: Program) -> str:
             body = stmts_task(block, 1, ctx, task, states, statics)
             head = [f"static unsigned int {task}_state;"]
             if has_wait(block):
-                head.append(f"static unsigned int {task}_until;")
+                head.append(f"static {target.time_type} {task}_until;")
             task_lines += head
             task_lines += [f"/* WHEN started: (script {number + 1}) */",
                            f"static void {task}(void)", "{",
@@ -1231,14 +1426,10 @@ def emit_c(program: Program) -> str:
                                ""]
         out += task_lines
 
-    out += ["void main(void)", "{"]
-    out += target.setup(program)
-    if tasks:
-        out += target.start_scheduler(task_names)
-    else:
-        out.append("")
-        out += stmts_c(program.body, 1, ctx)
-    out += ["}", ""]
+    # Exactly one of these is non-empty; the target decides what shell they go
+    # in, because "the program starts here" is not `main()` everywhere.
+    body_lines = [] if tasks else stmts_c(program.body, 1, ctx)
+    out += target.main(program, target.setup(program), body_lines, task_names)
     return "\n".join(out)
 
 

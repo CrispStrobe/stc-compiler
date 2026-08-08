@@ -136,6 +136,17 @@ def build(req: CompileReq) -> dict:
         except stc_pseudocode.PseudocodeError as exc:
             return {"success": False, "error": str(exc), "line": exc.line,
                     "stage": "transpile"}
+        # Transpiling is target-agnostic; compiling is not. This service
+        # vendors SDCC and nothing else, so a device whose output SDCC cannot
+        # build is refused here rather than three stages later as a wall of
+        # syntax errors about <Arduino.h>.
+        chip = program.target
+        if chip.toolchain != "sdcc-mcs51":
+            return {"success": False, "stage": "compile",
+                    "error": f"{chip.display} transpiles here, but building it "
+                             f"needs {chip.toolchain}, which this service does "
+                             f"not host. Use /transpile to get the source.",
+                    "c": generated_c, "toolchain": chip.toolchain}
         req = req.model_copy(update={"code": generated_c})
         # The pseudocode's own CLOCK wins; FOSC_HZ is already baked into the C.
         req = req.model_copy(update={"fosc": None})
@@ -509,8 +520,13 @@ async def transpile_only(req: CompileReq):
         "c": code,
         "part": program.part,
         "clock": program.clock,
-        "pins": {name: {"sfr": pin.sfr, "direction": pin.direction,
-                        "active_low": pin.active_low}
+        # `where` is the target-neutral location token ("P1.0", "D13", "A0").
+        # `sfr` is reported only by targets that have one, so an 8051 consumer
+        # keeps the field it already reads and a non-8051 device does not have
+        # to invent a register name to fill it.
+        "pins": {name: {"where": pin.where, "direction": pin.direction,
+                        "active_low": pin.active_low,
+                        **({"sfr": pin.sfr} if hasattr(pin, "sfr") else {})}
                  for name, pin in program.pins.items()},
         "variables": program.variables,
     }
