@@ -79,5 +79,24 @@ if UPDATE:
     print(f"goldens updated: {written} file(s) written to {GOLDEN}")
     sys.exit(0)
 
+# The seam itself, checked rather than trusted. The control-flow lowering is
+# only portable for as long as nobody reaches past the target for "just this
+# one register" -- which is exactly how such a split rots. Reading the source
+# is crude, and it is also the only check that fails the moment it happens.
+import inspect  # noqa: E402
+
+FORBIDDEN = ["P1_", "P0_", "P2_", "P3_", "ADC_CONTR", "ADC_RES", "P1ASF",
+             "TMOD", "AUXR", "TL0", "TH0", "TR0", "TF0", "ET0",
+             "delay_ms", "adc_read", "bw_now", "bw_ms", "#include", "__interrupt"]
+for function in (sp.expr_c, sp.ms_of, sp.stmts_c, sp.stmts_task, sp.emit_c):
+    source = inspect.getsource(function)
+    leaked = [token for token in FORBIDDEN if token in source]
+    if leaked:
+        failed += 1
+        print(f"  \033[31mFAIL\033[0m  {function.__name__} names {', '.join(leaked)} "
+              f"directly — that belongs to the target")
+    else:
+        passed += 1
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

@@ -1,6 +1,11 @@
 """
 stc_pseudocode — BrickWright-style pseudocode ⇄ C for the STC12 / 8051.
 
+Parsing is target-neutral and so is the control-flow lowering; everything that
+knows about a chip lives behind `Target` (registers, headers, the timebase,
+what a pin location token even means). See that class for where the seam runs
+and why it runs there.
+
 The dialect follows the conventions already used by sb3-creator's pseudocode
 (`SPRITE Name:` / `WHEN flag clicked:` / `REPEAT n:` / `IF x > y THEN:` /
 `set v to n`): UPPERCASE for structure and control flow, lowercase for
@@ -174,11 +179,24 @@ class Stop(Stmt):
 
 @dataclass
 class Pin:
+    """A declared pin, in terms every target shares.
+
+    `where` is the token exactly as the target canonicalised it -- "P1.0" on an
+    8051, "D13" or "A0" on an Arduino. The AST stores that string and nothing
+    about ports, bits or registers: those are the target's business, and a
+    target that has no registers at all still has to fit here.
+    """
     name: str
-    port: int
-    bit: int
+    where: str
     direction: str              # "output" | "input" | "analog"
     active_low: bool = False
+
+
+@dataclass
+class Pin8051(Pin):
+    """The 8051 view: a port and a bit, which is what the registers are named for."""
+    port: int = 0
+    bit: int = 0
 
     @property
     def sfr(self) -> str:
@@ -190,7 +208,9 @@ class Pin:
 
     @property
     def adc_channel(self) -> int:
-        return self.bit         # ADC channel n is on P1.n
+        # ADC channel n is on P1.n. True of this family, not of 8051s in
+        # general, and certainly not a rule any other target should inherit.
+        return self.bit
 
 
 @dataclass
@@ -204,34 +224,265 @@ class Procedure:
         return "bw_" + re.sub(r"\W", "_", self.name)
 
 
-@dataclass
-class Part:
-    """What the C emitter must know about a chip family.
+# ============================================================ target interface
 
-    The whole point of keeping this explicit: an STC12C5A60S2 drops into an
-    STC89C52 socket pin-for-pin, but the 1T core runs software delay loops
-    6-12x too fast. Our generated code never busy-waits -- every delay and
-    every scheduler tick is Timer 0 at FOSC/12, which both families count
-    identically -- so the same pseudocode is timing-correct on either chip.
+class Target:
+    """Everything below the AST: what a pin is, how you drive it, what a
+    millisecond costs, and what has to happen before main()'s first statement.
+
+    The control-flow lowering (`stmts_c`, `stmts_task`) is portable and must
+    stay that way, so it never formats a register name -- it asks the target
+    for a statement or an expression and pastes that in. The seam is drawn
+    here rather than one layer down because targets differ at *statement*
+    level too, not only in primitives: a target with no `goto` cannot use the
+    Duff's-device lowering at all and has to schedule some other way.
     """
-    header: str                 # the SDCC header with this family's registers
-    port_modes: bool            # PxM0/PxM1 exist (STC12); STC89 is quasi-bidi
-    aux_1t_bit: bool            # AUXR.7 selects T0 1T mode and must be cleared
-    adc: bool                   # 10-bit ADC on P1 (STC12 only)
+
+    key = ""                    # canonical device token, as written in DEVICE
+    display = ""                # how to name it in an error message
+
+    # ---- pins -----------------------------------------------------------
+    def resolve_pin(self, program, name, where, direction, active_low,
+                    line: int) -> Pin:
+        """Turn the declaration's opaque location token into a Pin, or explain
+        why this target cannot offer what was asked for."""
+        raise NotImplementedError
+
+    def write_pin(self, pin: Pin, high: bool) -> str:
+        raise NotImplementedError
+
+    def toggle_pin(self, pin: Pin) -> str:
+        raise NotImplementedError
+
+    def read_pin(self, pin: Pin) -> str:
+        raise NotImplementedError
+
+    def read_analog(self, pin: Pin) -> str:
+        raise NotImplementedError
+
+    # ---- time -----------------------------------------------------------
+    def delay(self, ms: str) -> str:
+        """A blocking wait, as a statement. Only the straight-line back end
+        uses it; tasks yield instead."""
+        raise NotImplementedError
+
+    def now(self) -> str:
+        """Milliseconds since boot, as an expression."""
+        raise NotImplementedError
+
+    # ---- the shell around the generated statements -----------------------
+    def prologue(self, program) -> list[str]:
+        raise NotImplementedError
+
+    def runtime(self, program, tasks: bool) -> list[str]:
+        """The tick/now/delay machinery and any peripheral helpers. A target
+        whose language already provides a timebase returns nothing."""
+        raise NotImplementedError
+
+    def setup(self, program) -> list[str]:
+        """The first statements of main(): pin directions, peripherals, timer."""
+        raise NotImplementedError
+
+    def start_scheduler(self, task_names: list[str]) -> list[str]:
+        """Start the timebase and run the cooperative tasks forever."""
+        raise NotImplementedError
 
 
-PARTS = {
-    "stc12c5a60s2": Part("stc12.h", True, True, True),
-    "stc12c5a16s2": Part("stc12.h", True, True, True),
-    "stc89c52rc": Part("8052.h", False, False, False),
-    "stc89c52": Part("8052.h", False, False, False),
+class Stc8051Target(Target):
+    """The 8051 families, which differ from each other only in three flags.
+
+    An STC12C5A60S2 drops into an STC89C52 socket pin-for-pin, but the 1T core
+    runs software delay loops 6-12x too fast. Our generated code never
+    busy-waits -- every delay and every scheduler tick is Timer 0 at FOSC/12,
+    which both families count identically -- so the same pseudocode is
+    timing-correct on either chip.
+    """
+
+    def __init__(self, key: str, display: str, header: str,
+                 port_modes: bool, aux_1t_bit: bool, adc: bool):
+        self.key = key
+        self.display = display
+        self.header = header        # the SDCC header with this family's registers
+        self.port_modes = port_modes  # PxM0/PxM1 exist (STC12); STC89 is quasi-bidi
+        self.aux_1t_bit = aux_1t_bit  # AUXR.7 selects T0 1T mode and must be cleared
+        self.adc = adc                # 10-bit ADC on P1 (STC12 only)
+
+    # ---- pins -----------------------------------------------------------
+    def resolve_pin(self, program, name, where, direction, active_low, line):
+        match = PORT_RE.match(where)
+        if not match:
+            raise PseudocodeError(
+                line, f"{where.upper()} is not a pin on the {self.display}; "
+                      "use P0.0 to P4.7")
+        port, bit = int(match.group(1)), int(match.group(2))
+        if direction == "analog":
+            if port != 1:
+                raise PseudocodeError(
+                    line, "ANALOG is only available on P1.0-P1.7 "
+                          f"(ADC0-ADC7), not {where.upper()}")
+            if not self.adc:
+                raise PseudocodeError(
+                    line, f"ANALOG pins need an ADC, and the {program.part} has none")
+        return Pin8051(name, f"P{port}.{bit}", direction, active_low, port, bit)
+
+    def write_pin(self, pin, high):
+        return f"{pin.sfr} = {1 if high else 0};"
+
+    def toggle_pin(self, pin):
+        return f"{pin.sfr} = !{pin.sfr};"
+
+    def read_pin(self, pin):
+        return f"!{pin.sfr}" if pin.active_low else pin.sfr
+
+    def read_analog(self, pin):
+        return f"adc_read({pin.adc_channel})"
+
+    # ---- time -----------------------------------------------------------
+    def delay(self, ms):
+        return f"delay_ms({ms});"
+
+    def now(self):
+        return "bw_now()"
+
+    # ---- the shell ------------------------------------------------------
+    def prologue(self, program):
+        return [
+            f"#include <{self.header}>",
+            "",
+            f"#define FOSC_HZ {program.clock}UL",
+            "",
+            "/* Timer 0, mode 1, clocked at FOSC/12 -- accuracy depends only on",
+            " * FOSC, and every supported family counts this mode identically, so",
+            " * the same program is timing-correct on a 12T STC89 and a 1T STC12",
+            " * or STC15. Nothing in the generated code ever busy-waits. */",
+            "#define T0_RELOAD (65536UL - (FOSC_HZ / 12UL / 1000UL))",
+            "",
+        ]
+
+    def runtime(self, program, tasks):
+        out = []
+        if tasks:
+            out += [
+                "/* One WHEN block = one cooperative task. Timer 0 interrupts",
+                " * every millisecond; tasks yield at every wait and at every",
+                " * loop iteration (Scratch's own scheduling contract), so no",
+                " * task can starve the others. */",
+                "static volatile unsigned int bw_ms;",
+                "",
+                "void bw_tick(void) __interrupt(1)",
+                "{",
+                "    TL0 = (unsigned char)(T0_RELOAD & 0xFF);",
+                "    TH0 = (unsigned char)(T0_RELOAD >> 8);",
+                "    bw_ms++;",
+                "}",
+                "",
+                "/* A 16-bit read is not atomic on an 8051; hold the tick off. */",
+                "static unsigned int bw_now(void)",
+                "{",
+                "    unsigned int t;",
+                "    ET0 = 0;",
+                "    t = bw_ms;",
+                "    ET0 = 1;",
+                "    return t;",
+                "}",
+                "",
+            ]
+        else:
+            out += [
+                "static void delay_ms(unsigned int ms)",
+                "{",
+                "    while (ms--) {",
+                "        TL0 = (unsigned char)(T0_RELOAD & 0xFF);",
+                "        TH0 = (unsigned char)(T0_RELOAD >> 8);",
+                "        TF0 = 0;",
+                "        TR0 = 1;",
+                "        while (!TF0) ;",
+                "        TR0 = 0;",
+                "        TF0 = 0;",
+                "    }",
+                "}",
+                "",
+            ]
+        if program.uses_adc:
+            out += [
+                "/* 10-bit ADC, polled. Channel n is on P1.n; the channel is selected",
+                " * and the conversion started in one write, as STC's examples do. */",
+                "static unsigned int adc_read(unsigned char channel)",
+                "{",
+                "    unsigned char settle;",
+                "    ADC_CONTR = (unsigned char)(0xE8 | channel);  /* power|fast|start|chan */",
+                "    for (settle = 0; settle < 8; settle++) ;      /* let the mux settle */",
+                "    while (!(ADC_CONTR & 0x10)) ;                 /* wait for ADC_FLAG */",
+                "    ADC_CONTR &= ~0x10;                           /* clear it by hand */",
+                "    return ((unsigned int)ADC_RES << 2) | (ADC_RESL & 0x03);",
+                "}",
+                "",
+            ]
+        return out
+
+    def setup(self, program):
+        out: list[str] = []
+        outputs: dict = {}
+        for pin in program.pins.values():
+            if pin.direction == "output":
+                outputs[pin.port] = outputs.get(pin.port, 0) | pin.mask
+        if self.port_modes:
+            for port in sorted(outputs):
+                mask = outputs[port]
+                out += [f"    P{port}M1 &= ~0x{mask:02X};   /* push-pull */",
+                        f"    P{port}M0 |=  0x{mask:02X};"]
+        # On a quasi-bidirectional-only part (STC89) there is nothing to set up:
+        # active-low wiring sinks the LED current either way.
+        for pin in program.pins.values():
+            if pin.direction == "output":
+                out.append(f"    {pin.sfr} = {1 if pin.active_low else 0};"
+                           f"   /* {pin.name} off */")
+
+        analog = 0
+        for pin in program.pins.values():
+            if pin.direction == "analog":
+                analog |= pin.mask
+        if analog:
+            out += ["",
+                    f"    P1ASF = 0x{analog:02X};                 /* analog function on P1 */",
+                    f"    P1M1 |=  0x{analog:02X};                /* high-impedance input */",
+                    f"    P1M0 &= ~0x{analog:02X};",
+                    "    ADC_CONTR = 0xE0;              /* ADC on, fastest conversion */"]
+
+        out.append("")
+        if self.aux_1t_bit:
+            out.append("    AUXR &= ~0x80;                 /* Timer 0 at FOSC/12 */")
+        out.append("    TMOD  = (TMOD & 0xF0) | 0x01;  /* Timer 0, mode 1 */")
+        return out
+
+    def start_scheduler(self, task_names):
+        return ["    TL0 = (unsigned char)(T0_RELOAD & 0xFF);",
+                "    TH0 = (unsigned char)(T0_RELOAD >> 8);",
+                "    ET0 = 1;                       /* millisecond tick */",
+                "    EA  = 1;",
+                "    TR0 = 1;",
+                "",
+                "    for (;;) {",
+                *(f"        {name}();" for name in task_names),
+                "    }"]
+
+
+def _stc(key, display, header, port_modes, aux_1t_bit, adc):
+    return Stc8051Target(key, display, header, port_modes, aux_1t_bit, adc)
+
+
+TARGETS = {
+    "stc12c5a60s2": _stc("stc12c5a60s2", "STC12C5A60S2", "stc12.h", True, True, True),
+    "stc12c5a16s2": _stc("stc12c5a16s2", "STC12C5A16S2", "stc12.h", True, True, True),
+    "stc89c52rc": _stc("stc89c52rc", "STC89C52RC", "8052.h", False, False, False),
+    "stc89c52": _stc("stc89c52", "STC89C52", "8052.h", False, False, False),
     # The STC15 borrows stc12.h deliberately: every register the EMITTER
     # touches (P0-P3, PxM0/PxM1, AUXR, Timer 0, P1ASF, the ADC block) sits at
     # the same address on the STC15F2K60S2. The famous divergences (Timer 2
     # at 0xD6/0xD7, S3CON...) are registers this generator never writes.
     # Keil TRANSLATION of arbitrary STC15 code is a different problem with
     # its own family shim.
-    "stc15f2k60s2": Part("stc12.h", True, True, True),
+    "stc15f2k60s2": _stc("stc15f2k60s2", "STC15F2K60S2", "stc12.h", True, True, True),
 }
 
 
@@ -254,8 +505,8 @@ class Program:
         return any(pin.direction == "analog" for pin in self.pins.values())
 
     @property
-    def chip(self) -> Part:
-        return PARTS[self.part]
+    def target(self) -> Target:
+        return TARGETS[self.part]
 
 
 # ====================================================================== lexing
@@ -526,7 +777,7 @@ def split_arguments(text: str) -> list[str]:
 
 DEFINE_RE = re.compile(r"define\s+(?:fast\s+)?([A-Za-z_]\w*)\s*(.*?):\s*$", re.I)
 WHEN_RE = re.compile(r"when\s+(started|flag\s+clicked|powered\s+on)\s*:", re.I)
-PIN_RE = re.compile(r"pin\s+(\w+)\s*=\s*(p[0-4]\.[0-7])\s+(output|input|analog)"
+PIN_RE = re.compile(r"pin\s+(\w+)\s*=\s*(\S+)\s+(output|input|analog)"
                     r"(?:\s+active\s+(low|high))?", re.I)
 CLOCK_RE = re.compile(r"clock\s+([\d_]+)\s*(hz|mhz)?", re.I)
 
@@ -542,11 +793,11 @@ def parse(source: str) -> Program:
     device = re.fullmatch(r"device\s+([\w-]+)\s*:", lines[0].text, re.I)
     if device:
         program.part = device.group(1).lower()
-        if program.part not in PARTS:
+        if program.part not in TARGETS:
             raise PseudocodeError(
                 lines[0].number,
                 f"unknown device {device.group(1)!r}; known: "
-                + ", ".join(sorted(PARTS)))
+                + ", ".join(sorted(TARGETS)))
         index = 1
 
     # Pass one: register every DEFINE header, so a procedure may be called
@@ -577,13 +828,10 @@ def parse(source: str) -> Program:
             name, where, direction, active = pin.groups()
             if name in program.pins:
                 raise PseudocodeError(line.number, f"pin {name!r} declared twice")
-            port, bit = PORT_RE.match(where).groups()
-            if direction == "analog" and port != "1":
-                raise PseudocodeError(
-                    line.number, "ANALOG is only available on P1.0-P1.7 "
-                                 f"(ADC0-ADC7), not {where.upper()}")
-            program.pins[name] = Pin(name, int(port), int(bit), direction,
-                                     active_low=(active == "low"))
+            # The target decides what that location token means, and whether
+            # it can offer the requested direction there at all.
+            program.pins[name] = program.target.resolve_pin(
+                program, name, where, direction, active == "low", line.number)
             index += 1
             continue
 
@@ -613,11 +861,6 @@ def parse(source: str) -> Program:
     if not started:
         raise PseudocodeError(lines[-1].number, "no 'WHEN started:' block")
     program.body = program.whens[0]
-
-    if program.uses_adc and not program.chip.adc:
-        raise PseudocodeError(
-            lines[0].number,
-            f"ANALOG pins need an ADC, and the {program.part} has none")
 
     if len(program.whens) > 1:
         # Each WHEN block becomes a cooperative task; a wait inside a
@@ -722,7 +965,7 @@ def emit_pseudocode(program: Program) -> str:
         out.append("")
         for pin in program.pins.values():
             polarity = " ACTIVE LOW" if pin.active_low else ""
-            out.append(f"  PIN {pin.name} = P{pin.port}.{pin.bit} "
+            out.append(f"  PIN {pin.name} = {pin.where} "
                        f"{pin.direction.upper()}{polarity}")
     for procedure in program.procedures.values():
         out.append("")
@@ -737,82 +980,91 @@ def emit_pseudocode(program: Program) -> str:
 
 # ================================================================== C back end
 
-def expr_c(node: Expr, pins: dict, parent_level: int = -1) -> str:
+@dataclass
+class Emit:
+    """What every walker in the C back end needs, gathered so that adding a
+    target does not mean threading another parameter through six functions."""
+    target: Target
+    pins: dict
+    procs: dict
+    counter: list = field(default_factory=lambda: [0])
+
+
+def expr_c(node: Expr, ctx: Emit, parent_level: int = -1) -> str:
     if isinstance(node, Num):
         return str(int(node.value))
     if isinstance(node, Var):
         return node.name
     if isinstance(node, PinRef):
-        pin = pins[node.name]
+        pin = ctx.pins[node.name]
         if pin.direction == "analog":
-            return f"adc_read({pin.adc_channel})"
-        return f"!{pin.sfr}" if pin.active_low else pin.sfr
+            return ctx.target.read_analog(pin)
+        return ctx.target.read_pin(pin)
     if isinstance(node, Unary):
-        inner = expr_c(node.operand, pins, UNARY_LEVEL)
+        inner = expr_c(node.operand, ctx, UNARY_LEVEL)
         return f"!({inner})" if node.op == "not" else f"-({inner})"
     if isinstance(node, Binary):
         level = LEVEL[node.op]
-        text = (f"{expr_c(node.left, pins, level)} {TO_C[node.op]} "
-                f"{expr_c(node.right, pins, level + 1)}")
+        text = (f"{expr_c(node.left, ctx, level)} {TO_C[node.op]} "
+                f"{expr_c(node.right, ctx, level + 1)}")
         return f"({text})" if level < parent_level else text
     raise TypeError(node)
 
 
-def ms_of(node: Wait, pins: dict) -> str:
+def ms_of(node: Wait, ctx: Emit) -> str:
     """A Wait in milliseconds, folded to a constant where it can be."""
     if isinstance(node.amount, Num):
         value = node.amount.value
         return str(int(round(value * 1000 if node.unit == "seconds" else value)))
-    inner = expr_c(node.amount, pins, UNARY_LEVEL)
+    inner = expr_c(node.amount, ctx, UNARY_LEVEL)
     return inner if node.unit == "ms" else f"(unsigned int)(({inner}) * 1000)"
 
 
-def stmts_c(body: list, depth: int, pins: dict, procs: dict, counter: list) -> list[str]:
+def stmts_c(body: list, depth: int, ctx: Emit) -> list[str]:
     pad = "    " * depth
     out = []
     for node in body:
         if isinstance(node, SetPin):
-            out.append(f"{pad}{pins[node.pin].sfr} = {1 if node.high else 0};")
+            out.append(pad + ctx.target.write_pin(ctx.pins[node.pin], node.high))
         elif isinstance(node, Toggle):
-            sfr = pins[node.pin].sfr
-            out.append(f"{pad}{sfr} = !{sfr};")
+            out.append(pad + ctx.target.toggle_pin(ctx.pins[node.pin]))
         elif isinstance(node, Wait):
-            out.append(f"{pad}delay_ms({ms_of(node, pins)});")
+            out.append(pad + ctx.target.delay(ms_of(node, ctx)))
         elif isinstance(node, WaitUntil):
-            out.append(f"{pad}while (!({expr_c(node.cond, pins)})) ;")
+            out.append(f"{pad}while (!({expr_c(node.cond, ctx)})) ;")
         elif isinstance(node, SetVar):
-            out.append(f"{pad}{node.name} = {expr_c(node.value, pins)};")
+            out.append(f"{pad}{node.name} = {expr_c(node.value, ctx)};")
         elif isinstance(node, ChangeVar):
-            out.append(f"{pad}{node.name} += {expr_c(node.delta, pins)};")
+            out.append(f"{pad}{node.name} += {expr_c(node.delta, ctx)};")
         elif isinstance(node, Forever):
             out.append(f"{pad}for (;;) {{")
-            out += stmts_c(node.body, depth + 1, pins, procs, counter)
+            out += stmts_c(node.body, depth + 1, ctx)
             out.append(f"{pad}}}")
         elif isinstance(node, Repeat):
-            counter[0] += 1
-            var = f"_i{counter[0]}"
+            ctx.counter[0] += 1
+            var = f"_i{ctx.counter[0]}"
             out.append(f"{pad}{{ unsigned int {var};")
             out.append(f"{pad}  for ({var} = 0; {var} < "
-                       f"({expr_c(node.count, pins)}); {var}++) {{")
-            out += stmts_c(node.body, depth + 2, pins, procs, counter)
+                       f"({expr_c(node.count, ctx)}); {var}++) {{")
+            out += stmts_c(node.body, depth + 2, ctx)
             out += [f"{pad}  }}", f"{pad}}}"]
         elif isinstance(node, Loop):
-            test = expr_c(node.cond, pins, UNARY_LEVEL if node.until else -1)
+            test = expr_c(node.cond, ctx, UNARY_LEVEL if node.until else -1)
             if node.until:
                 test = f"!({test})"      # REPEAT UNTIL c  ==  WHILE not c
             out.append(f"{pad}while ({test}) {{")
-            out += stmts_c(node.body, depth + 1, pins, procs, counter)
+            out += stmts_c(node.body, depth + 1, ctx)
             out.append(f"{pad}}}")
         elif isinstance(node, If):
-            out.append(f"{pad}if ({expr_c(node.cond, pins)}) {{")
-            out += stmts_c(node.body, depth + 1, pins, procs, counter)
+            out.append(f"{pad}if ({expr_c(node.cond, ctx)}) {{")
+            out += stmts_c(node.body, depth + 1, ctx)
             if node.orelse:
                 out.append(f"{pad}}} else {{")
-                out += stmts_c(node.orelse, depth + 1, pins, procs, counter)
+                out += stmts_c(node.orelse, depth + 1, ctx)
             out.append(f"{pad}}}")
         elif isinstance(node, Call):
-            args = ", ".join(expr_c(a, pins) for a in node.args)
-            out.append(f"{pad}{procs[node.name.lower()].c_name}({args});")
+            args = ", ".join(expr_c(a, ctx) for a in node.args)
+            out.append(f"{pad}{ctx.procs[node.name.lower()].c_name}({args});")
         elif isinstance(node, Stop):
             out.append(f"{pad}for (;;) ;   /* stop */")
         else:
@@ -829,7 +1081,7 @@ def has_wait(body: list) -> bool:
     return False
 
 
-def stmts_task(body: list, depth: int, pins: dict, procs: dict, counter: list,
+def stmts_task(body: list, depth: int, ctx: Emit,
                task: str, states: list, statics: list) -> list[str]:
     """One task's statements as the interior of a Duff's-device state machine.
 
@@ -837,7 +1089,11 @@ def stmts_task(body: list, depth: int, pins: dict, procs: dict, counter: list,
     the statements build, which C allows as long as no inner switch appears
     (we emit none). Every wait AND every loop back-edge is a numbered yield
     -- the latter is Scratch's own scheduling contract, and it is what makes
-    a busy FOREVER loop unable to starve the other tasks."""
+    a busy FOREVER loop unable to starve the other tasks.
+
+    This lowering is what a target without `goto` -- MicroPython, say -- cannot
+    use, and that is the reason the seam runs through statements and not only
+    through primitives."""
     pad = "    " * depth
     out = []
 
@@ -847,71 +1103,65 @@ def stmts_task(body: list, depth: int, pins: dict, procs: dict, counter: list,
 
     for node in body:
         if isinstance(node, SetPin):
-            out.append(f"{pad}{pins[node.pin].sfr} = {1 if node.high else 0};")
+            out.append(pad + ctx.target.write_pin(ctx.pins[node.pin], node.high))
         elif isinstance(node, Toggle):
-            sfr = pins[node.pin].sfr
-            out.append(f"{pad}{sfr} = !{sfr};")
+            out.append(pad + ctx.target.toggle_pin(ctx.pins[node.pin]))
         elif isinstance(node, Wait):
             state = yield_state()
-            out += [f"{pad}{task}_until = bw_now() + ({ms_of(node, pins)});",
+            out += [f"{pad}{task}_until = {ctx.target.now()} + ({ms_of(node, ctx)});",
                     f"{pad}{task}_state = {state};",
                     f"{pad}case {state}:",
-                    f"{pad}if ((int)(bw_now() - {task}_until) < 0) return;"]
+                    f"{pad}if ((int)({ctx.target.now()} - {task}_until) < 0) return;"]
         elif isinstance(node, WaitUntil):
             state = yield_state()
             out += [f"{pad}{task}_state = {state};",
                     f"{pad}case {state}:",
-                    f"{pad}if (!({expr_c(node.cond, pins)})) return;"]
+                    f"{pad}if (!({expr_c(node.cond, ctx)})) return;"]
         elif isinstance(node, SetVar):
-            out.append(f"{pad}{node.name} = {expr_c(node.value, pins)};")
+            out.append(f"{pad}{node.name} = {expr_c(node.value, ctx)};")
         elif isinstance(node, ChangeVar):
-            out.append(f"{pad}{node.name} += {expr_c(node.delta, pins)};")
+            out.append(f"{pad}{node.name} += {expr_c(node.delta, ctx)};")
         elif isinstance(node, Forever):
             state = yield_state()
             out += [f"{pad}{task}_state = {state};", f"{pad}case {state}:"]
-            out += stmts_task(node.body, depth, pins, procs, counter,
-                              task, states, statics)
+            out += stmts_task(node.body, depth, ctx, task, states, statics)
             out += [f"{pad}{task}_state = {state};", f"{pad}return;"]
         elif isinstance(node, Repeat):
-            counter[0] += 1
-            var = f"bw_i{counter[0]}"
+            ctx.counter[0] += 1
+            var = f"bw_i{ctx.counter[0]}"
             statics.append(var)
             state = yield_state()
-            out += [f"{pad}{var} = ({expr_c(node.count, pins)});",
+            out += [f"{pad}{var} = ({expr_c(node.count, ctx)});",
                     f"{pad}{task}_state = {state};",
                     f"{pad}case {state}:",
                     f"{pad}if ({var}) {{"]
-            out += stmts_task(node.body, depth + 1, pins, procs, counter,
-                              task, states, statics)
+            out += stmts_task(node.body, depth + 1, ctx, task, states, statics)
             out += [f"{pad}    {var}--;",
                     f"{pad}    {task}_state = {state};",
                     f"{pad}    return;",
                     f"{pad}}}"]
         elif isinstance(node, Loop):
-            test = expr_c(node.cond, pins, UNARY_LEVEL if node.until else -1)
+            test = expr_c(node.cond, ctx, UNARY_LEVEL if node.until else -1)
             if node.until:
                 test = f"!({test})"
             state = yield_state()
             out += [f"{pad}{task}_state = {state};",
                     f"{pad}case {state}:",
                     f"{pad}if ({test}) {{"]
-            out += stmts_task(node.body, depth + 1, pins, procs, counter,
-                              task, states, statics)
+            out += stmts_task(node.body, depth + 1, ctx, task, states, statics)
             out += [f"{pad}    {task}_state = {state};",
                     f"{pad}    return;",
                     f"{pad}}}"]
         elif isinstance(node, If):
-            out.append(f"{pad}if ({expr_c(node.cond, pins)}) {{")
-            out += stmts_task(node.body, depth + 1, pins, procs, counter,
-                              task, states, statics)
+            out.append(f"{pad}if ({expr_c(node.cond, ctx)}) {{")
+            out += stmts_task(node.body, depth + 1, ctx, task, states, statics)
             if node.orelse:
                 out.append(f"{pad}}} else {{")
-                out += stmts_task(node.orelse, depth + 1, pins, procs, counter,
-                                  task, states, statics)
+                out += stmts_task(node.orelse, depth + 1, ctx, task, states, statics)
             out.append(f"{pad}}}")
         elif isinstance(node, Call):
-            args = ", ".join(expr_c(a, pins) for a in node.args)
-            out.append(f"{pad}{procs[node.name.lower()].c_name}({args});")
+            args = ", ".join(expr_c(a, ctx) for a in node.args)
+            out.append(f"{pad}{ctx.procs[node.name.lower()].c_name}({args});")
         elif isinstance(node, Stop):
             out += [f"{pad}{task}_state = 0xFFFF;   /* stop this script */",
                     f"{pad}return;"]
@@ -921,111 +1171,48 @@ def stmts_task(body: list, depth: int, pins: dict, procs: dict, counter: list,
 
 
 def emit_c(program: Program) -> str:
-    pins = {pin.name: pin for pin in program.pins.values()}
-    procs = program.procedures
-    counter = [0]
-    chip = program.chip
+    """Walk the AST to C, asking the target for everything chip-specific.
+
+    What stays here is the portable part: declaration order, the shape of the
+    scheduler, which statements become which control flow. What the target
+    supplies is every line that names a register, a header or a timebase."""
+    target = program.target
+    ctx = Emit(target, {pin.name: pin for pin in program.pins.values()},
+               program.procedures)
     tasks = len(program.whens) > 1
 
     out = [
         "/* Generated from BrickWright pseudocode by stc-compiler.",
         " * Hand edits will be lost; change the pseudocode instead. */",
-        f"#include <{chip.header}>",
-        "",
-        f"#define FOSC_HZ {program.clock}UL",
-        "",
-        "/* Timer 0, mode 1, clocked at FOSC/12 -- accuracy depends only on",
-        " * FOSC, and every supported family counts this mode identically, so",
-        " * the same program is timing-correct on a 12T STC89 and a 1T STC12",
-        " * or STC15. Nothing in the generated code ever busy-waits. */",
-        "#define T0_RELOAD (65536UL - (FOSC_HZ / 12UL / 1000UL))",
-        "",
     ]
-    if tasks:
-        out += [
-            "/* One WHEN block = one cooperative task. Timer 0 interrupts",
-            " * every millisecond; tasks yield at every wait and at every",
-            " * loop iteration (Scratch's own scheduling contract), so no",
-            " * task can starve the others. */",
-            "static volatile unsigned int bw_ms;",
-            "",
-            "void bw_tick(void) __interrupt(1)",
-            "{",
-            "    TL0 = (unsigned char)(T0_RELOAD & 0xFF);",
-            "    TH0 = (unsigned char)(T0_RELOAD >> 8);",
-            "    bw_ms++;",
-            "}",
-            "",
-            "/* A 16-bit read is not atomic on an 8051; hold the tick off. */",
-            "static unsigned int bw_now(void)",
-            "{",
-            "    unsigned int t;",
-            "    ET0 = 0;",
-            "    t = bw_ms;",
-            "    ET0 = 1;",
-            "    return t;",
-            "}",
-            "",
-        ]
-    else:
-        out += [
-            "static void delay_ms(unsigned int ms)",
-            "{",
-            "    while (ms--) {",
-            "        TL0 = (unsigned char)(T0_RELOAD & 0xFF);",
-            "        TH0 = (unsigned char)(T0_RELOAD >> 8);",
-            "        TF0 = 0;",
-            "        TR0 = 1;",
-            "        while (!TF0) ;",
-            "        TR0 = 0;",
-            "        TF0 = 0;",
-            "    }",
-            "}",
-            "",
-        ]
-
-    if program.uses_adc:
-        out += [
-            "/* 10-bit ADC, polled. Channel n is on P1.n; the channel is selected",
-            " * and the conversion started in one write, as STC's examples do. */",
-            "static unsigned int adc_read(unsigned char channel)",
-            "{",
-            "    unsigned char settle;",
-            "    ADC_CONTR = (unsigned char)(0xE8 | channel);  /* power|fast|start|chan */",
-            "    for (settle = 0; settle < 8; settle++) ;      /* let the mux settle */",
-            "    while (!(ADC_CONTR & 0x10)) ;                 /* wait for ADC_FLAG */",
-            "    ADC_CONTR &= ~0x10;                           /* clear it by hand */",
-            "    return ((unsigned int)ADC_RES << 2) | (ADC_RESL & 0x03);",
-            "}",
-            "",
-        ]
+    out += target.prologue(program)
+    out += target.runtime(program, tasks)
 
     if program.variables:
         out.append("/* Variables (16-bit signed, like Scratch's integers). */")
         out += [f"static int {name} = 0;" for name in program.variables]
         out.append("")
 
-    if procs:
-        for procedure in procs.values():
+    if ctx.procs:
+        for procedure in ctx.procs.values():
             params = ", ".join(f"int {p}" for p in procedure.params) or "void"
             out.append(f"static void {procedure.c_name}({params});")
         out.append("")
-        for procedure in procs.values():
+        for procedure in ctx.procs.values():
             params = ", ".join(f"int {p}" for p in procedure.params) or "void"
             out += [f"/* DEFINE {procedure.name} */",
                     f"static void {procedure.c_name}({params})", "{",
-                    *stmts_c(procedure.body, 1, pins, procs, counter), "}", ""]
+                    *stmts_c(procedure.body, 1, ctx), "}", ""]
 
-    task_lines: list[str] = []
     task_names: list[str] = []
     if tasks:
+        task_lines: list[str] = []
         statics: list[str] = []
         for number, block in enumerate(program.whens):
             task = f"bw_task{number}"
             task_names.append(task)
             states = [0]
-            body = stmts_task(block, 1, pins, procs, counter, task,
-                              states, statics)
+            body = stmts_task(block, 1, ctx, task, states, statics)
             head = [f"static unsigned int {task}_state;"]
             if has_wait(block):
                 head.append(f"static unsigned int {task}_until;")
@@ -1045,53 +1232,13 @@ def emit_c(program: Program) -> str:
         out += task_lines
 
     out += ["void main(void)", "{"]
-
-    outputs: dict = {}
-    for pin in program.pins.values():
-        if pin.direction == "output":
-            outputs[pin.port] = outputs.get(pin.port, 0) | pin.mask
-    if chip.port_modes:
-        for port in sorted(outputs):
-            mask = outputs[port]
-            out += [f"    P{port}M1 &= ~0x{mask:02X};   /* push-pull */",
-                    f"    P{port}M0 |=  0x{mask:02X};"]
-    # On a quasi-bidirectional-only part (STC89) there is nothing to set up:
-    # active-low wiring sinks the LED current either way.
-    for pin in program.pins.values():
-        if pin.direction == "output":
-            out.append(f"    {pin.sfr} = {1 if pin.active_low else 0};"
-                       f"   /* {pin.name} off */")
-
-    analog = 0
-    for pin in program.pins.values():
-        if pin.direction == "analog":
-            analog |= pin.mask
-    if analog:
-        out += ["",
-                f"    P1ASF = 0x{analog:02X};                 /* analog function on P1 */",
-                f"    P1M1 |=  0x{analog:02X};                /* high-impedance input */",
-                f"    P1M0 &= ~0x{analog:02X};",
-                "    ADC_CONTR = 0xE0;              /* ADC on, fastest conversion */"]
-
-    out.append("")
-    if chip.aux_1t_bit:
-        out.append("    AUXR &= ~0x80;                 /* Timer 0 at FOSC/12 */")
-    out.append("    TMOD  = (TMOD & 0xF0) | 0x01;  /* Timer 0, mode 1 */")
+    out += target.setup(program)
     if tasks:
-        out += ["    TL0 = (unsigned char)(T0_RELOAD & 0xFF);",
-                "    TH0 = (unsigned char)(T0_RELOAD >> 8);",
-                "    ET0 = 1;                       /* millisecond tick */",
-                "    EA  = 1;",
-                "    TR0 = 1;",
-                "",
-                "    for (;;) {",
-                *(f"        {name}();" for name in task_names),
-                "    }",
-                "}", ""]
+        out += target.start_scheduler(task_names)
     else:
         out.append("")
-        out += stmts_c(program.body, 1, pins, procs, counter)
-        out += ["}", ""]
+        out += stmts_c(program.body, 1, ctx)
+    out += ["}", ""]
     return "\n".join(out)
 
 
