@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 # differ again -- so this is a per-target fact, not an 8051 one.
 PCA_PINS = {(1, 3): 0, (1, 4): 1}
 
+BW_BAUD = 9600          # the console rate; not settable from the dialect yet
+
 PORT_RE = re.compile(r"^P([0-4])\.([0-7])$", re.I)
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -114,6 +116,18 @@ class SetPin(Stmt):
     # How it was written, so decompiling gives back the same sentence:
     # "turn on/off" reads better for LEDs, "set high/low" for logic levels.
     style: str = "level"        # "level" | "onoff"
+
+
+@dataclass
+class Print(Stmt):
+    """Write a line to the serial console.
+
+    Either a literal or a number, never both and never concatenated: string
+    building on a part with 256 bytes of RAM is a bigger feature than it looks,
+    and two `print`s cost nothing.
+    """
+    text: str = ""              # a literal, when value is None
+    value: Expr = None          # a number, when text is ""
 
 
 @dataclass
@@ -344,6 +358,12 @@ class Stc8051Target(Target):
         self.aux_1t_bit = aux_1t_bit  # AUXR.7 selects T0 1T mode and must be cleared
         self.adc = adc                # 10-bit ADC on P1 (STC12 only)
         self.pwm = pwm                # PCA capture/compare modules with PWM mode
+        # Where UART1's baud rate comes from. The STC12 has a dedicated
+        # baud-rate timer; the STC89 has to spend Timer 1 on it, which is the
+        # same Timer 1 a TONE pin wants -- so on that family the two features
+        # are mutually exclusive, and saying so is better than a silent
+        # fight over TMOD.
+        self.baud_from_brt = port_modes
 
     # ---- pins -----------------------------------------------------------
     def resolve_pin(self, program, name, where, direction, active_low, line):
@@ -403,6 +423,11 @@ class Stc8051Target(Target):
 
     def read_analog(self, pin):
         return f"adc_read({pin.adc_channel})"
+
+    def write_print(self, node) -> str:
+        if node.value is None:
+            return f'bw_print("{node.text}");'
+        return f"bw_print_num({node.value});"
 
     def write_tone(self, pin, hz: str) -> str:
         return f"tone_set({hz});"
@@ -498,6 +523,49 @@ class Stc8051Target(Target):
                 "    while (!(ADC_CONTR & 0x10)) ;                 /* wait for ADC_FLAG */",
                 "    ADC_CONTR &= ~0x10;                           /* clear it by hand */",
                 "    return ((unsigned int)ADC_RES << 2) | (ADC_RESL & 0x03);",
+                "}",
+                "",
+            ]
+        if program.uses_uart:
+            out += [
+                "/* Serial console on UART1, 8N1 at " + str(BW_BAUD) + " baud.",
+                " *",
+                " * P3.0/P3.1 are also the ISP pins, so you cannot hold a terminal open",
+                " * while flashing -- and the debug monitor owns this same UART, which is",
+                " * why a program that prints cannot currently run under it.",
+                " *",
+                " * Blocking on TI is deliberate. A ring buffer would need RAM this part",
+                " * does not have to spare, and a dropped diagnostic is worse than a slow",
+                " * one: at " + str(BW_BAUD) + " baud a character costs about "
+                + f"{1000000 * 10 // BW_BAUD} us. */",
+                "static void bw_putc(char c)",
+                "{",
+                "    SBUF = c;",
+                "    while (!TI)",
+                "        ;",
+                "    TI = 0;",
+                "}",
+                "",
+                "static void bw_print(const char *s)",
+                "{",
+                "    while (*s)",
+                "        bw_putc(*s++);",
+                "    bw_putc('\\r');",
+                "    bw_putc('\\n');",
+                "}",
+                "",
+                "static void bw_print_num(int v)",
+                "{",
+                "    unsigned char digits[6];",
+                "    unsigned char n = 0;",
+                "    unsigned int u;",
+                "    if (v < 0) { bw_putc('-'); u = (unsigned int)(-v); }",
+                "    else       { u = (unsigned int)v; }",
+                "    do { digits[n++] = (unsigned char)('0' + u % 10); u /= 10; } while (u);",
+                "    while (n)",
+                "        bw_putc((char)digits[--n]);",
+                "    bw_putc('\\r');",
+                "    bw_putc('\\n');",
                 "}",
                 "",
             ]
@@ -611,6 +679,21 @@ class Stc8051Target(Target):
                     f"    P1M0 &= ~0x{analog:02X};",
                     "    ADC_CONTR = 0xE0;              /* ADC on, fastest conversion */"]
 
+        if program.uses_uart:
+            out += ["", "    SCON = 0x50;                   /* UART mode 1, 8-bit, RX on */"]
+            if self.baud_from_brt:
+                div = program.clock // (32 * BW_BAUD)
+                out += [f"    BRT  = {256 - div};"
+                        f"                     /* {BW_BAUD} baud from the BRT */",
+                        "    AUXR |= 0x15;                  /* BRTR, BRTx12, S1BRS */"]
+            else:
+                div = program.clock // (12 * 32 * BW_BAUD)
+                out += [f"    TH1  = TL1 = {256 - div};"
+                        f"               /* {BW_BAUD} baud from Timer 1 */",
+                        "    TMOD = (TMOD & 0x0F) | 0x20;   /* Timer 1, mode 2 */",
+                        "    TR1  = 1;"]
+            out.append("    TI = 0;  RI = 0;")
+
         pwm_pins = [p for p in program.pins.values() if p.direction == "pwm"]
         if pwm_pins:
             out += ["",
@@ -692,6 +775,22 @@ class Program:
     @property
     def uses_pwm(self) -> bool:
         return any(pin.direction == "pwm" for pin in self.pins.values())
+
+    @property
+    def uses_uart(self) -> bool:
+        def walk(body):
+            for node in body:
+                if isinstance(node, Print):
+                    return True
+                for attr in ("body", "then", "otherwise"):
+                    inner = getattr(node, attr, None)
+                    if inner and walk(inner):
+                        return True
+            return False
+        # whens are plain statement lists; procedures carry theirs on .body.
+        return (walk(self.body)
+                or any(walk(w) for w in self.whens)
+                or any(walk(getattr(pr, "body", [])) for pr in self.procedures.values()))
 
     @property
     def tone_pin(self):
@@ -922,6 +1021,13 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
     if level:
         return SetPin(output_pin(level.group(1)), high=(level.group(2) == "high"))
 
+    say = re.match(r'print\s+"([^"]*)"\s*$', text.strip(), re.I)
+    if say:
+        return Print(text=say.group(1))
+    say = re.match(r"print\s+(.+)$", text.strip(), re.I)
+    if say:
+        return Print(value=expression(say.group(1), program, line))
+
     hertz = re.fullmatch(r"set\s+(\w+)\s+to\s+(.+?)\s*(?:hz|hertz)", text.strip(), re.I)
     if hertz:
         name = hertz.group(1)
@@ -1128,6 +1234,19 @@ def parse(source: str) -> Program:
                     lines[0].number,
                     f"with several WHEN blocks, procedures must not wait -- "
                     f"{procedure.name!r} does; move the wait into the WHEN block")
+    # One Timer 1, two claimants. On a part whose baud rate comes from Timer 1
+    # -- the STC89 -- a serial console and a TONE pin both want it, and they
+    # want it in different MODES, so the loser is decided by whichever line of
+    # setup runs last. Refuse instead. The STC12 is fine: its baud comes from
+    # the dedicated BRT, leaving Timer 1 for the tone.
+    if (program.uses_uart and program.tone_pin is not None
+            and not program.target.baud_from_brt):
+        raise PseudocodeError(
+            0, f"on the {program.part} the serial console and a TONE pin both need "
+               f"Timer 1, in different modes -- {program.tone_pin.name!r} cannot sound "
+               f"while the program prints. The STC12 has a dedicated baud-rate timer "
+               f"and can do both.")
+
     return program
 
 
@@ -1156,7 +1275,10 @@ def stmts_pseudo(body: list, depth: int, active_low: dict) -> list[str]:
     pad = "  " * depth
     out = []
     for node in body:
-        if isinstance(node, SetTone):
+        if isinstance(node, Print):
+            out.append(f'{pad}print "{node.text}"' if node.value is None
+                       else f"{pad}print {expr_pseudo(node.value)}")
+        elif isinstance(node, SetTone):
             if isinstance(node.hz, Num) and node.hz.value == 0:
                 out.append(f"{pad}turn off {node.pin}")
             else:
@@ -1286,6 +1408,10 @@ def stmts_c(body: list, depth: int, ctx: Emit) -> list[str]:
         elif isinstance(node, SetTone):
             out.append(pad + ctx.target.write_tone(ctx.pins[node.pin],
                                                    expr_c(node.hz, ctx)))
+        elif isinstance(node, Print):
+            rendered = Print(text=node.text,
+                             value=None if node.value is None else expr_c(node.value, ctx))
+            out.append(pad + ctx.target.write_print(rendered))
         elif isinstance(node, Toggle):
             out.append(pad + ctx.target.toggle_pin(ctx.pins[node.pin]))
         elif isinstance(node, Wait):
@@ -1370,6 +1496,10 @@ def stmts_task(body: list, depth: int, ctx: Emit,
         elif isinstance(node, SetTone):
             out.append(pad + ctx.target.write_tone(ctx.pins[node.pin],
                                                    expr_c(node.hz, ctx)))
+        elif isinstance(node, Print):
+            rendered = Print(text=node.text,
+                             value=None if node.value is None else expr_c(node.value, ctx))
+            out.append(pad + ctx.target.write_print(rendered))
         elif isinstance(node, Toggle):
             out.append(pad + ctx.target.toggle_pin(ctx.pins[node.pin]))
         elif isinstance(node, Wait):

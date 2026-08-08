@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test-pwm — PWM pins, from the pseudocode down to the compare register.
+test-peripherals — PWM, tone and the serial console, from pseudocode to register.
 
 The hardware detail this is really guarding is in
 `stc12c5a60s2-lab/docs/STC12-PERIPHERAL-MODEL.md` §5.3: the PCA comparator
@@ -196,6 +196,34 @@ def test_tone():
             "only a PWM pin", "a percentage on a tone pin")
 
 
+def test_uart():
+    print("serial console, and the Timer 1 it may or may not contend for")
+    c = emit(HEAD + "  WHEN started:\n    print \"ready\"\n    print 42\n")
+    ok('bw_print("ready");' in c, "a literal prints as a literal")
+    ok("bw_print_num(42);" in c, "a number goes through the integer path")
+    ok("SCON = 0x50;" in c, "UART mode 1, receiver enabled")
+    # STC12: 256 - 11059200/(32*9600) = 220, from the dedicated BRT.
+    ok("BRT  = 220;" in c, "STC12 takes its baud from the BRT, leaving Timer 1 free")
+    ok("AUXR |= 0x15;" in c, "BRTR | BRTx12 | S1BRS")
+
+    # STC89: 256 - 11059200/(12*32*9600) = 253, the classic 0xFD.
+    c89 = emit("DEVICE STC89C52RC:\n  CLOCK 11059200\n"
+               "  WHEN started:\n    print \"hi\"\n")
+    ok("TH1  = TL1 = 253;" in c89, "STC89 spends Timer 1 on baud: the classic 0xFD")
+    ok("TMOD = (TMOD & 0x0F) | 0x20;" in c89, "Timer 1 in mode 2 for baud")
+
+    rejects("DEVICE STC89C52RC:\n  CLOCK 11059200\n  PIN b = P3.5 TONE\n"
+            "  WHEN started:\n    print \"hi\"\n    set b to 440 hz\n",
+            "both need Timer 1",
+            "console + tone on a part whose baud comes from Timer 1")
+
+    # ...but the STC12 can do both, because its baud comes from the BRT.
+    both = emit(HEAD + "  PIN b = P3.5 TONE\n"
+                       "  WHEN started:\n    print \"hi\"\n    set b to 440 hz\n")
+    ok("tone_set(440);" in both and 'bw_print("hi");' in both,
+       "on the STC12 a console and a tone coexist")
+
+
 def main() -> int:
     test_polarity()
     test_setup()
@@ -203,6 +231,7 @@ def main() -> int:
     test_roundtrip()
     test_duty_arithmetic()
     test_tone()
+    test_uart()
     test_compiles()
     print(f"\n{checks} checks, {failures} failures")
     return 1 if failures else 0
