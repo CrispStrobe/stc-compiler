@@ -201,6 +201,13 @@ done
 find "$WORK/x/usr/lib/avr/lib" -maxdepth 1 -type f \
      -exec cp {} "$ROOT/avr/lib/avr/lib/" \;
 
+# ld's own linker scripts (924 KB, all cores). They sit in a DIRECTORY beside
+# the multilibs, so copying "the files at depth 1 plus the multilibs we want"
+# silently skips them -- and the failure is a link-time
+# "cannot open linker script file ldscripts/avr5.xn", well past the point
+# where anything looks wrong. Kept whole: they are small, and one per core.
+cp -R "$WORK/x/usr/lib/avr/lib/ldscripts" "$ROOT/avr/lib/avr/lib/ldscripts"
+
 # A stock avr-gcc build would look in <prefix>/avr instead of <prefix>/lib/avr.
 # One symlink satisfies that reading as well, so the bundle does not depend on
 # which way the compiler was configured.
