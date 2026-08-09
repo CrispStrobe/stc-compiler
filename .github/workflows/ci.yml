@@ -38,6 +38,18 @@ jobs:
         run: python3 ./scripts/test-peripherals.py
       - name: Tables and whole-port I/O
         run: python3 ./scripts/test-tables-ports.py
+      # A pin number inside the board's range is still not always a pin that
+      # can do what was asked -- the Nano's A6/A7 reach the pad with no
+      # digital buffer at all, so digitalWrite to one is accepted everywhere
+      # and does nothing.
+      - name: Pin maps — what each package actually brings out
+        run: python3 ./scripts/test-pinmap.py
+      - name: A wait too short for the target is refused
+        run: python3 ./scripts/test-wait-floor.py
+      # Last, because it checks the steps above exist: a test that is written
+      # and never run reads as coverage and is not.
+      - name: Every test is wired into CI, or says why not
+        run: python3 ./scripts/test-wiring.py
 
   # The real verification: build the vendored AVR toolchain from Debian and
   # prove it compiles, links and emits an image using ONLY those binaries.
