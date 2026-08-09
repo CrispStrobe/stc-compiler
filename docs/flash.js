@@ -206,21 +206,49 @@ export async function pulseReset(port) {
  * `open` lets a test supply a port without touching navigator.serial.
  */
 export async function flashAvr(port, hexText, {
-  baud = 115200, pageSize = 128, log = () => {}, verify = true,
+  baud = [115200, 57600], pageSize = 128, log = () => {}, verify = true,
 } = {}) {
+  // A list, not a number. An Uno and a modern Nano run optiboot at 115200,
+  // but a Nano with the older bootloader runs at 57600 -- and the symptom is
+  // identical to a board that is not there: no sync. avrdude users learn to
+  // pass -b 57600 by folklore; probing is cheaper than folklore.
+  const rates = Array.isArray(baud) ? baud : [baud];
   const { image, highest } = parseIntelHex(hexText);
   log(`image: ${highest + 1} bytes`);
-  await port.open({ baudRate: baud });
-  const io = serialTransport(port);
-  try {
-    if (port.setSignals) {
-      log('resetting the board (DTR)…');
-      await pulseReset(port);
-      await io.drain();
+
+  let io = null, stk = null, chosen = null, lastError = null;
+  for (const rate of rates) {
+    await port.open({ baudRate: rate });
+    // Short reads while probing: a wrong rate fails by silence, and the only
+    // cost of guessing wrong should be a second, not fifteen.
+    io = serialTransport(port, { timeout: rates.length > 1 ? 1500 : 3000 });
+    try {
+      if (port.setSignals) {
+        log(`resetting the board (DTR), ${rate} baud…`);
+        await pulseReset(port);
+        await io.drain();
+      }
+      stk = new Stk500(io, { pageSize, log });
+      await stk.sync(rates.length > 1 ? 3 : 5);
+      chosen = rate;
+      break;
+    } catch (err) {
+      lastError = err;
+      await io.close();
+      try { await port.close(); } catch {}
+      io = null;
+      stk = null;
+      if (rates.length > 1) log(`  nothing at ${rate} baud`);
     }
-    log('waiting for the bootloader…');
-    await new Stk500(io, { pageSize, log }).sync();
-    const stk = new Stk500(io, { pageSize, log });
+  }
+  if (!chosen) {
+    throw new Error(
+      `no bootloader answered at ${rates.join(' or ')} baud` +
+      (lastError ? `: ${lastError.message}` : ''));
+  }
+
+  try {
+    log(`bootloader answered at ${chosen} baud`);
     log('programming…');
     await stk.program(image);
     if (verify) {
@@ -228,13 +256,12 @@ export async function flashAvr(port, hexText, {
       await stk.verify(image);
     }
     log(`done: ${highest + 1} bytes written${verify ? ' and verified' : ''}`);
-    return { bytes: highest + 1 };
+    return { bytes: highest + 1, baud: chosen };
   } finally {
     await io.close();
     try { await port.close(); } catch {}
   }
 }
-
 
 // ------------------------------------------------- micro:bit and Pico
 //

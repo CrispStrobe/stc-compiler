@@ -180,7 +180,9 @@ It also means a micro:bit needs no compile step at all — *Flash* is enabled
 straight after *Transpile*.
 
 *Flash* pulses DTR to reset the board into its bootloader, then programs and
-verifies it page by page. Web Serial is Chromium-only and needs a secure
+verifies it page by page. It probes 115200 and then 57600, because an Uno and a
+modern Nano run optiboot at the first and an older Nano at the second — and a
+wrong rate fails exactly like an absent board. Web Serial is Chromium-only and needs a secure
 context, which Pages provides; other browsers are told why rather than given a
 dead button.
 

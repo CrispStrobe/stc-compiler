@@ -37,6 +37,8 @@ class FakeBootloader {
   }
 
   feed(bytes) {
+    // A board listening at another rate sees line noise, not commands.
+    if (this.deaf) return;
     for (const b of bytes) this.inbox.push(b);
     for (;;) {
       const consumed = this.step();
@@ -107,13 +109,21 @@ class FakeBootloader {
   }
 }
 
-/** A Web Serial-shaped port wrapping the fake bootloader. */
-function fakePort(boot) {
+/** A Web Serial-shaped port wrapping the fake bootloader.
+ *  `speaksAt` models a board that only answers at one rate, which is the
+ *  whole difference between an Uno and an older Nano. */
+function fakePort(boot, speaksAt = null) {
   let opened = false;
   const signals = [];
+  const opens = [];
   return {
     signals,
-    async open() { opened = true; },
+    opens,
+    async open(options) {
+      opened = true;
+      opens.push(options && options.baudRate);
+      boot.deaf = speaksAt !== null && options && options.baudRate !== speaksAt;
+    },
     async close() { opened = false; },
     async setSignals(s) { signals.push(s); },
     get writable() {
@@ -224,6 +234,31 @@ ok('nothing written past the end of the image (word addressing)',
    tail.every(b => b === 0xff),
    tail.every(b => b === 0xff) ? ''
      : 'something landed above the image -- byte addresses sent as word ones?');
+
+// --- an older Nano: 57600, and silence at 115200 --------------------------
+const nano = new FakeBootloader();
+const nanoPort = fakePort(nano, 57600);
+const nanoResult = await flashAvr(nanoPort, hexText, { log: () => {} });
+ok('falls back to 57600 when nothing answers at 115200',
+   nanoResult.baud === 57600, `answered at ${nanoResult.baud}`);
+ok('...having actually tried 115200 first',
+   nanoPort.opens[0] === 115200 && nanoPort.opens[1] === 57600,
+   JSON.stringify(nanoPort.opens));
+let nanoMismatch = -1;
+for (let i = 0; i < expected.length; i++) {
+  if (nano.flash[i] !== expected[i]) { nanoMismatch = i; break; }
+}
+ok('...and programmed it correctly at that rate', nanoMismatch === -1,
+   nanoMismatch === -1 ? `${expected.length} bytes` : `differs at 0x${nanoMismatch.toString(16)}`);
+
+// A board that answers nowhere must say so, naming both rates it tried.
+let deafError = null;
+try {
+  await flashAvr(fakePort(new FakeBootloader(), 9600), hexText, { log: () => {} });
+} catch (e) { deafError = e; }
+ok('a board that answers at neither rate names both',
+   deafError && /115200 or 57600/.test(deafError.message),
+   deafError ? deafError.message.slice(0, 58) : 'it succeeded!');
 
 // --- a board that answers late -------------------------------------------
 const noisy = new FakeBootloader({ quirk: 'noisy' });
