@@ -436,7 +436,9 @@ class MicrobitTarget(MicroPythonTarget):
             if direction != "input":
                 raise sp.PseudocodeError(
                     line, f"{button.upper()} is a button and can only be an "
-                          f"INPUT, not an {direction.upper()}")
+                          f"INPUT, not "
+                          + ("an " if direction[0] in "aeiou" else "a ")
+                          + direction.upper())
             return MicrobitPin(name, button.upper(), direction, active_low,
                                button.lower())
 

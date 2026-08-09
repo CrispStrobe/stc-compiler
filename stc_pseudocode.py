@@ -1149,11 +1149,17 @@ class ArduinoTarget(Target):
                     "core, and that one does compile here.")
     source_extension = "ino"
 
-    def __init__(self, key: str, display: str, digital_max: int, analog_max: int):
+    def __init__(self, key: str, display: str, digital_max: int, analog_max: int,
+                 analog_only: frozenset = frozenset()):
         self.key = key
         self.display = display
         self.digital_max = digital_max
         self.analog_max = analog_max
+        # Analog inputs with no digital buffer behind them. On the Nano's
+        # TQFP/QFN package, ADC6 and ADC7 are exactly that: digitalWrite to
+        # one does nothing at all, quietly, which is the worst way for a pin
+        # to be wrong.
+        self.analog_only = analog_only
 
     # ---- pins -----------------------------------------------------------
     def resolve_pin(self, program, name, where, direction, active_low, line):
@@ -1170,8 +1176,15 @@ class ArduinoTarget(Target):
                 raise PseudocodeError(
                     line, f"the {self.display} has A0-A{self.analog_max}, "
                           f"not A{number}")
-            # An analog pin is still a perfectly good digital one, so this
-            # deliberately does not check the direction.
+            # An analog pin is usually a perfectly good digital one -- but not
+            # always, and where it is not, saying so beats a pin that reads as
+            # working and does nothing.
+            if direction != "analog" and number in self.analog_only:
+                raise PseudocodeError(
+                    line, f"A{number} on the {self.display} is analog-IN only: "
+                          f"the package brings out the ADC channel without a "
+                          f"digital buffer, so it cannot be an "
+                          f"{direction.upper()}. Use A0-A5 or a D pin.")
             return ArduinoPin(name, f"A{number}", direction, active_low,
                               f"A{number}")
 
@@ -1853,7 +1866,10 @@ TARGETS = {
     # A6 and A7 as well (input-only, which this generator never violates
     # because ANALOG is read-only by construction).
     "arduino-uno": ArduinoTarget("arduino-uno", "Arduino Uno", 13, 5),
-    "arduino-nano": ArduinoTarget("arduino-nano", "Arduino Nano", 13, 7),
+    # A6 and A7 exist on the Nano and are analog-in only -- the TQFP package
+    # brings out the ADC channels without a digital buffer.
+    "arduino-nano": ArduinoTarget("arduino-nano", "Arduino Nano", 13, 7,
+                                  analog_only=frozenset({6, 7})),
 
     # The same silicon as an Uno/Nano/Pro Mini, emitted without the Arduino
     # core -- which is the form this service can actually compile. Pins keep
