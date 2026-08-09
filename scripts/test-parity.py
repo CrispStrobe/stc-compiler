@@ -147,6 +147,25 @@ for device in DEVICES:
             cells.append("-")
     print(f"{device:16}" + "".join(f"{c:>8}" for c in cells))
 
+# A program that does not say CLOCK must still work on every device. The
+# default used to be 11.0592 MHz for all of them -- an 8051 crystal, chosen
+# because it divides into exact UART baud rates -- so `DEVICE ATMEGA328P:`
+# without a CLOCK line failed complaining about millisecond division rather
+# than about the clock it had silently inherited.
+print()
+for device in DEVICES:
+    spec = DEVICES[device]
+    source = (f"DEVICE {device}:\n  PIN d = {spec['out']} OUTPUT\n"
+              "  WHEN started:\n    FOREVER:\n      toggle d\n      wait 500 ms\n")
+    try:
+        program = sp.parse(source)
+        sp.emit(program)
+        check(f"{device} works with no CLOCK line", True)
+        check(f"{device} default clock is plausible for the board",
+              program.clock in (11059200, 16000000), str(program.clock))
+    except sp.PseudocodeError as exc:
+        check(f"{device} works with no CLOCK line", False, str(exc)[:78])
+
 print()
 print("  yes = claimed and exercised end to end")
 print("  -   = refused at parse time, naming the board")

@@ -64,6 +64,11 @@ class MicrobitTarget(sp.Target):
     key = "microbit"
     display = "BBC micro:bit"
     toolchain = "uflash"
+    # Unused -- running_time() and sleep() are the runtime's, so CLOCK means
+    # nothing here. It still has to be something the board plausibly runs at,
+    # because the pseudocode back end writes it back out and an 8051 crystal
+    # on a micro:bit would read as a mistake.
+    default_clock = 16000000
 
     # PORT and PART are not here on purpose. A PORT is eight bits of one
     # register written at once, and a PART is a 74HC595 wired to P0.0-style

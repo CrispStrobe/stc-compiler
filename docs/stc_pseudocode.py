@@ -440,6 +440,13 @@ class Target:
     # an Arduino and nonsense for a micro:bit.
     compile_hint = ""
 
+    # What CLOCK means when the program does not say. 11.0592 MHz is an 8051
+    # crystal chosen because it divides into exact UART baud rates -- it is
+    # not a sensible default for a board that has never seen one, and
+    # inheriting it made `DEVICE ATMEGA328P:` without a CLOCK line fail with a
+    # complaint about millisecond division that never named the real problem.
+    default_clock = 11059200
+
     # Extension for the generated source when it is handed back as a file.
     # Not always "c": Arduino core source wants .ino so the IDE opens it as a
     # sketch, and a micro:bit target emits Python.
@@ -1093,6 +1100,7 @@ class ArduinoTarget(Target):
 
     # Core C++ needs the Arduino build system; SDCC cannot touch it.
     toolchain = "arduino-cli"
+    default_clock = 16000000
 
     # PORT stays out: eight bits of one register is exactly what the core
     # hides behind digitalWrite, and reaching past it would give up the
@@ -1378,6 +1386,7 @@ class AvrTarget(Target):
     """
 
     toolchain = "avr-gcc"
+    default_clock = 16000000       # what an Uno, a Nano and a Pro Mini run at
 
     # Everything the 8051 has. PORT is PORTB/PORTC/PORTD, and a PART is three
     # ordinary output pins bit-banged in the right order.
@@ -2279,6 +2288,10 @@ def parse(source: str) -> Program:
     device = re.fullmatch(r"device\s+([\w-]+)\s*:", lines[0].text, re.I)
     if device:
         program.part = device.group(1).lower()
+        if program.part in TARGETS:
+            # The device decides what CLOCK means when the program is silent.
+            # A later CLOCK line still wins.
+            program.clock = TARGETS[program.part].default_clock
         if program.part not in TARGETS:
             raise PseudocodeError(
                 lines[0].number,
