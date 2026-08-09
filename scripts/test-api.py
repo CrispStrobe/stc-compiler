@@ -575,6 +575,11 @@ for source, want_name, want_tool in ((MICROBIT, "main.py", "uflash"),
 
 check("the UI offers the AVR parts",
       "atmega328p" in page and "optgroup" in page)
+# Without this branch the browser shows "failed" for a micro:bit or an Arduino
+# and leaves Download disabled, so the generated source is unreachable from
+# the page the service is served on.
+check("the UI treats source-only as a result, not a failure",
+      "source only, needs" in page and "data.c && data.toolchain" in page)
 
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

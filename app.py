@@ -1309,6 +1309,24 @@ $('go').onclick = async () => {
       $('log').textContent = data.log || '(no warnings)';
       $('dl').disabled = false;
       $('copy').disabled = (format === 'bin');
+    } else if (data.c && data.toolchain) {
+      // Transpiled fine; this service just cannot BUILD it -- a micro:bit is
+      // interpreted, an Arduino sketch needs the Arduino build system. The
+      // source is the result, so this is a success with a different artefact,
+      // not a failure. Download hands back main.py / main.ino.
+      image = {bytes: new TextEncoder().encode(data.c),
+               filename: data.filename || 'main.txt'};
+      $('status').className = 'ok';
+      $('status').textContent = image.filename + ' \u2014 source only, needs '
+                              + data.toolchain;
+      $('out').textContent = data.c;
+      $('cgen').textContent = data.c;
+      document.querySelector('#tabs button[data-pane=cgen]').hidden = false;
+      document.querySelector('#tabs button[data-pane=asm]').hidden = true;
+      $('mem').textContent = '(nothing was compiled)';
+      $('log').textContent = data.error || '';
+      $('dl').disabled = false;
+      $('copy').disabled = false;
     } else {
       $('status').className = 'err';
       $('status').textContent = 'failed';

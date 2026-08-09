@@ -402,6 +402,31 @@ program against a stub `microbit` module and checks that the generators
 actually interleave, that a 100 ms wait lasts about 100 ms, and that
 `ACTIVE LOW` reaches the pin inverted.
 
+#### Getting the `.ino` (or the `.py`)
+
+**Browser:** choose `Pseudocode`, paste a program starting `DEVICE ARDUINO-UNO:`,
+press Compile. The status line reads `main.ino — source only, needs
+arduino-cli`, the source appears in the output pane, and **Download** gives you
+the file. A micro:bit behaves the same way and yields `main.py`.
+
+**curl:**
+
+```bash
+curl -X POST https://stc-compiler.vercel.app/download \
+     -H 'Content-Type: application/json' \
+     -d '{"language":"pseudocode","code":"DEVICE ARDUINO-UNO:\n  PIN led = D13 OUTPUT\n  WHEN started:\n    FOREVER:\n      toggle led\n      wait 500 ms\n"}' \
+     -OJ
+# -> main.ino
+```
+
+Two things about the file itself:
+
+- **The Arduino IDE wants a sketch in a folder of the same name**, so `main.ino`
+  belongs in `main/`. The IDE offers to move it there when you open it.
+- `#include <Arduino.h>` is emitted even though the IDE would add it. That is
+  deliberate: the same file then also builds with `arduino-cli` or a plain C++
+  toolchain, instead of only inside the IDE.
+
 ### AVR: the same boards, compiled
 
 | `DEVICE` / `target` | Emits | Compiles here |
