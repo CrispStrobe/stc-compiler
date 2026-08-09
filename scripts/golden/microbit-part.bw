@@ -1,0 +1,11 @@
+DEVICE MICROBIT:
+  CLOCK 16000000
+
+  PART sr = 74HC595 DATA P6 CLOCK P7 LATCH P8
+
+  WHEN started:
+    FOREVER:
+      set sr to 170
+      wait 100 ms
+      set sr to 85
+      wait 100 ms

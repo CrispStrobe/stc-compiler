@@ -69,7 +69,10 @@ class MicrobitTarget(sp.Target):
     # register written at once, and a PART is a 74HC595 wired to P0.0-style
     # pins; both are 8051 shapes with no micro:bit equivalent, and `require()`
     # refuses them by name rather than emitting something that looks close.
-    supports = frozenset({"pwm", "tone", "print", "table"})
+    # PORT is the only one left out, and it is a real absence rather than a
+    # gap: MicroPython has no whole-port write, and eight separate
+    # write_digital calls would not land as the one store a PORT promises.
+    supports = frozenset({"pwm", "tone", "print", "table", "part"})
     source_extension = "py"
     compile_hint = ("MicroPython is interpreted on the device, so there is "
                     "nothing to compile: flash the .py with uflash, or paste "
@@ -144,6 +147,30 @@ class MicrobitTarget(sp.Target):
     def now(self):
         return "running_time()"
 
+    def shift_helper(self, part) -> list[str]:
+        """The 74HC595 bit-banger in MicroPython.
+
+        Same edges in the same order as every other target -- the part cares
+        about their sequence and not their timing -- but the shared C version
+        is not reusable here, for the same reason the scheduler is not.
+        """
+        return [
+            f"# {part.kind.upper()}: eight outputs for three pins. Data is",
+            "# sampled on the rising edge of the shift clock, the latch",
+            "# transfers on its own. MSB first.",
+            f"def bw_part_{part.name}(value):",
+            f"    {part.clock.obj}.write_digital(0)",
+            f"    {part.latch.obj}.write_digital(0)",
+            "    for _ in range(8):",
+            f"        {part.data.obj}.write_digital(1 if value & 0x80 else 0)",
+            "        value = (value << 1) & 0xFF",
+            f"        {part.clock.obj}.write_digital(1)",
+            f"        {part.clock.obj}.write_digital(0)",
+            f"    {part.latch.obj}.write_digital(1)   # transfer to the outputs",
+            f"    {part.latch.obj}.write_digital(0)",
+            "",
+        ]
+
     # ---- the emitter ----------------------------------------------------
     def emit(self, program) -> str:
         pins = {pin.name: pin for pin in program.pins.values()}
@@ -193,6 +220,9 @@ class MicrobitTarget(sp.Target):
         used_display = sorted(
             {pin.number for pin in program.pins.values()
              if pin.number in DISPLAY_PINS})
+
+        for part in program.parts.values():
+            out += self.shift_helper(part)
 
         for procedure in program.procedures.values():
             params = ", ".join(procedure.params)
@@ -312,6 +342,12 @@ class MicrobitTarget(sp.Target):
                         f"{pad}    music.pitch(_hz, -1, {obj}, False)",
                         f"{pad}else:",
                         f"{pad}    music.stop({obj})"]
+            elif isinstance(node, sp.SetPart):
+                part = program.parts[node.part]
+                value = self._expr(node.value, pins)
+                inner = (f"(~({value})) & 0xFF" if part.active_low
+                         else f"({value}) & 0xFF")
+                out.append(f"{pad}bw_part_{part.name}({inner})")
             elif isinstance(node, sp.Print):
                 if node.value is None:
                     out.append(f"{pad}print({node.text!r})")

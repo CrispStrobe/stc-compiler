@@ -90,7 +90,8 @@ jobs:
           for mcu in atmega328p atmega168p; do
             for f in scripts/golden/avr.c scripts/golden/avr-scripts.c \
                      scripts/golden/avr-parity.c \
-                     scripts/golden/avr-port.c; do
+                     scripts/golden/avr-port.c \
+                     scripts/golden/avr-part.c; do
               echo "== $mcu  $f"
               # -Werror is the point: generated code that needs a warning
               # suppressed at the call site is generated code with a defect.

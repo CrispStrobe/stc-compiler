@@ -41,15 +41,20 @@ def check(name, ok, detail=""):
 # spellings that device actually uses.
 DEVICES = {
     "STC12C5A60S2": dict(out="P1.0", pwm="P1.3", tone="P1.5", ana="P1.2",
-                         port="P2", clock="11059200"),
+                         port="P2", part="P1.0 CLOCK P1.1 LATCH P1.2",
+                         clock="11059200"),
     "STC89C52RC":   dict(out="P1.0", pwm=None,   tone="P1.5", ana=None,
-                         port="P2", clock="11059200"),
+                         port="P2", part="P1.0 CLOCK P1.1 LATCH P1.2",
+                         clock="11059200"),
     "ARDUINO-UNO":  dict(out="D13",  pwm="D9",   tone="D8",   ana="A0",
-                         port=None,  clock="16000000"),
+                         port=None,  part="D4 CLOCK D5 LATCH D6",
+                         clock="16000000"),
     "ATMEGA328P":   dict(out="D13",  pwm="D11",  tone="D9",   ana="A0",
-                         port="D",   clock="16000000"),
+                         port="D",   part="D4 CLOCK D5 LATCH D6",
+                         clock="16000000"),
     "MICROBIT":     dict(out="P0",   pwm="P1",   tone="P2",   ana="P4",
-                         port=None,  clock="16000000"),
+                         port=None,  part="P6 CLOCK P7 LATCH P8",
+                         clock="16000000"),
 }
 
 FEATURES = ["pwm", "tone", "print", "table", "port", "part"]
@@ -82,7 +87,7 @@ def program(device, feature):
         return head + (f"  PORT k = {spec['port']} OUTPUT\n"
                        "  WHEN started:\n    set k to 255\n")
     if feature == "part":
-        return head + ("  PART sr = 74HC595 DATA P1.0 CLOCK P1.1 LATCH P1.2\n"
+        return head + (f"  PART sr = 74HC595 DATA {spec['part']}\n"
                        "  WHEN started:\n    set sr to 170\n")
     raise ValueError(feature)
 

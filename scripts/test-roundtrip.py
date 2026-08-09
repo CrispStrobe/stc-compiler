@@ -267,6 +267,33 @@ WHEN started:
       wait 200 ms
 """,
 
+    # A 74HC595 on a board that is not an 8051. Three ordinary output pins
+    # bit-banged in the right order -- the part has no minimum clock period
+    # any of these cores could violate, so only the sequence matters.
+    "avr-part": """DEVICE ATMEGA328P:
+  NAME expander
+  CLOCK 16000000
+  TABLE font = 0x3F, 0x06, 0x5B
+  PART sr = 74HC595 DATA D4 CLOCK D7 LATCH D8 ACTIVE LOW
+  WHEN started:
+    set i to 0
+    FOREVER:
+      set sr to font[i]
+      wait 200 ms
+      change i by 1
+""",
+
+    "microbit-part": """DEVICE MICROBIT:
+  CLOCK 16000000
+  PART sr = 74HC595 DATA P6 CLOCK P7 LATCH P8
+  WHEN started:
+    FOREVER:
+      set sr to 170
+      wait 100 ms
+      set sr to 85
+      wait 100 ms
+""",
+
     # A target off C entirely. MicroPython has no goto, so the cooperative
     # scheduler is generators rather than a Duff's device -- the case the
     # target interface was drawn to allow.

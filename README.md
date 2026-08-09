@@ -439,6 +439,33 @@ Two things about the file itself:
 | `atmega328p`, `atmega168p` | bare AVR C | **yes**, via avr-gcc |
 | `microbit` | MicroPython | nothing to compile — see above |
 
+### What works where
+
+`scripts/test-parity.py` prints this and asserts it, in both directions: a
+feature a target claims must survive parse *and* leave recognisable evidence
+in the output, and one it does not claim must be refused at parse time naming
+the board.
+
+| device | pwm | tone | print | table | port | part |
+|---|---|---|---|---|---|---|
+| STC12C5A60S2 / STC15 | yes | yes | yes | yes | yes | yes |
+| STC89C52RC | n/a¹ | yes | yes | yes | yes | yes |
+| ATmega328P / 168P | yes | yes | yes | yes | yes | yes |
+| Arduino Uno / Nano | yes | yes | yes | yes | no² | yes |
+| micro:bit | yes | yes | yes | yes | no³ | yes |
+
+¹ no PCA, so there is no PWM pin to declare.
+² the Arduino core hides ports behind `digitalWrite`; reaching past it would
+give up the portability that is the reason to emit core C++.
+³ MicroPython has no whole-port write, and eight `write_digital` calls would
+not land as the single store a `PORT` promises.
+
+The hardware constraints are refusals, not footnotes. On an ATmega, PWM is
+offered on D9/D10 (Timer 1) and D11/D3 (Timer 2) — **not** D5/D6, which are
+Timer 0 and therefore the millisecond tick every `wait` is measured against.
+The tone is Timer 1 toggling OC1A, so it is D9 and takes the timer outright,
+and PWM on D9 or D10 in the same program is refused pointing at D11 or D3.
+
 An ATmega328P *is* an Uno, and pins keep the board's labels (`D13`, `A0`; port
 names like `PB5` are accepted and canonicalised), so a program moves between
 the two devices unchanged and only the generated C differs. What changes is

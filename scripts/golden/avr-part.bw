@@ -1,0 +1,14 @@
+DEVICE ATMEGA328P:
+  NAME expander
+  CLOCK 16000000
+
+  TABLE font = 0x3F, 0x06, 0x5B
+
+  PART sr = 74HC595 DATA D4 CLOCK D7 LATCH D8 ACTIVE LOW
+
+  WHEN started:
+    set i to 0
+    FOREVER:
+      set sr to font[i]
+      wait 200 ms
+      change i by 1

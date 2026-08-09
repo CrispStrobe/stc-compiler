@@ -340,18 +340,19 @@ class ShiftPart:
     """
     name: str
     kind: str                   # "74hc595"
-    data: tuple                 # (port, bit)
-    clock: tuple
-    latch: tuple
+    data: Pin                   # three OUTPUT pins, resolved by the target
+    clock: Pin
+    latch: Pin
     active_low: bool = False
-
-    def sfr(self, which) -> str:
-        port, bit = getattr(self, which)
-        return f"P{port}_{bit}"
 
     @property
     def claimed(self) -> list:
         return [self.data, self.clock, self.latch]
+
+    @property
+    def claimed_where(self) -> list:
+        """The three locations as the target spells them, for clash checks."""
+        return [pin.where for pin in self.claimed]
 
 
 @dataclass
@@ -453,6 +454,40 @@ class Target:
     time_signed = "int"
 
     # ---- pins -----------------------------------------------------------
+    def shift_helper(self, part) -> list[str]:
+        """The 74HC595 bit-banger, in terms of this target's pin writes.
+
+        Nothing about shifting a byte out on three pins is chip-specific --
+        the part is specified into the tens of megahertz and has no minimum
+        clock period any of these cores could violate, so only the ORDER of
+        the edges matters. That is why one implementation serves every target
+        that can write a pin at all.
+        """
+        return [
+            f"/* {part.kind.upper()}: eight outputs for three pins. Data is",
+            " * sampled on the rising edge of the shift clock, and the latch",
+            " * transfers on its own rising edge.",
+            " *",
+            " * MSB first, so the byte reads left to right on the outputs. */",
+            f"static void bw_part_{part.name}(unsigned char value)",
+            "{",
+            "    unsigned char i;",
+            "    " + self.write_pin(part.clock, False),
+            "    " + self.write_pin(part.latch, False),
+            "    for (i = 0; i < 8; i++) {",
+            "        if (value & 0x80) { " + self.write_pin(part.data, True) + " }",
+            "        else { " + self.write_pin(part.data, False) + " }",
+            "        value = (unsigned char)(value << 1);",
+            "        " + self.write_pin(part.clock, True),
+            "        " + self.write_pin(part.clock, False),
+            "    }",
+            "    " + self.write_pin(part.latch, True)
+            + "      /* transfer to the outputs */",
+            "    " + self.write_pin(part.latch, False),
+            "}",
+            "",
+        ]
+
     def resolve_port(self, program, name, where, direction, active_low,
                      line: int) -> "Port":
         """Turn a whole-port declaration's location token into a Port.
@@ -588,7 +623,7 @@ class Stc8051Target(Target):
         # And the other way round: a PORT writes all eight bits at once, so a
         # PIN inside it would be clobbered by every port write.
         for prev in program.parts.values():
-            if (port, bit) in prev.claimed:
+            if f"P{port}.{bit}" in prev.claimed_where:
                 raise PseudocodeError(
                     line, f"P{port}.{bit} is claimed by the part {prev.name!r}")
         for whole in program.ports.values():
@@ -756,16 +791,16 @@ class Stc8051Target(Target):
                 f"static void bw_part_{part.name}(unsigned char value)",
                 "{",
                 "    unsigned char i;",
-                f"    {part.sfr('clock')} = 0;",
-                f"    {part.sfr('latch')} = 0;",
+                f"    {part.clock.sfr} = 0;",
+                f"    {part.latch.sfr} = 0;",
                 "    for (i = 0; i < 8; i++) {",
-                f"        {part.sfr('data')} = (value & 0x80) ? 1 : 0;",
+                f"        {part.data.sfr} = (value & 0x80) ? 1 : 0;",
                 "        value = (unsigned char)(value << 1);",
-                f"        {part.sfr('clock')} = 1;",
-                f"        {part.sfr('clock')} = 0;",
+                f"        {part.clock.sfr} = 1;",
+                f"        {part.clock.sfr} = 0;",
                 "    }",
-                f"    {part.sfr('latch')} = 1;      /* transfer to the outputs */",
-                f"    {part.sfr('latch')} = 0;",
+                f"    {part.latch.sfr} = 1;      /* transfer to the outputs */",
+                f"    {part.latch.sfr} = 0;",
                 "}",
                 "",
             ]
@@ -927,8 +962,8 @@ class Stc8051Target(Target):
             if port.direction == "output":
                 outputs[port.port] = outputs.get(port.port, 0) | 0xFF
         for part in program.parts.values():
-            for where in part.claimed:
-                outputs[where[0]] = outputs.get(where[0], 0) | (1 << where[1])
+            for claimed in part.claimed:
+                outputs[claimed.port] = outputs.get(claimed.port, 0) | claimed.mask
         if self.port_modes:
             for port in sorted(outputs):
                 mask = outputs[port]
@@ -1059,11 +1094,11 @@ class ArduinoTarget(Target):
     # Core C++ needs the Arduino build system; SDCC cannot touch it.
     toolchain = "arduino-cli"
 
-    # PORT and PART stay out. A PORT is eight bits of one register, which the
-    # core deliberately hides behind digitalWrite, and a PART is declared with
-    # P0.0-style pins. Reaching past the core for either would give up the
-    # portability that is the whole reason to emit core C++.
-    supports = frozenset({"pwm", "tone", "print", "table"})
+    # PORT stays out: eight bits of one register is exactly what the core
+    # hides behind digitalWrite, and reaching past it would give up the
+    # portability that is the reason to emit core C++ at all. A PART needs
+    # only three pins the core is happy to drive.
+    supports = frozenset({"pwm", "tone", "print", "table", "part"})
     compile_hint = ("DEVICE ATMEGA328P: is the same board without the Arduino "
                     "core, and that one does compile here.")
     source_extension = "ino"
@@ -1225,6 +1260,8 @@ class ArduinoTarget(Target):
                 "}",
                 "",
             ]
+        for part in program.parts.values():
+            out += self.shift_helper(part)
         return out
 
     def setup(self, program):
@@ -1243,6 +1280,10 @@ class ArduinoTarget(Target):
                 out.append(f"    pinMode({pin.ref}, OUTPUT);")
             # analog needs no pinMode (analogRead configures the mux), and
             # neither does tone (tone() drives the pin itself).
+        for part in program.parts.values():
+            for claimed in part.claimed:
+                out.append(f"    pinMode({claimed.ref}, OUTPUT);"
+                           f"   /* {part.name} */")
         for pin in program.pins.values():
             if pin.direction == "output":
                 level = "HIGH" if pin.active_low else "LOW"
@@ -1338,10 +1379,9 @@ class AvrTarget(Target):
 
     toolchain = "avr-gcc"
 
-    # PORT is here because PORTB/PORTC/PORTD are exactly what it describes.
-    # PART is not, and that is a syntax problem rather than a hardware one:
-    # `PART x = 74HC595 DATA P0.0` spells its three pins the 8051 way.
-    supports = frozenset({"pwm", "tone", "print", "table", "port"})
+    # Everything the 8051 has. PORT is PORTB/PORTC/PORTD, and a PART is three
+    # ordinary output pins bit-banged in the right order.
+    supports = frozenset({"pwm", "tone", "print", "table", "port", "part"})
 
     # Our own tick, so we choose the width -- but 16 bits would wrap every 65 s
     # and these deadlines are compared against a free-running counter, so it is
@@ -1447,7 +1487,9 @@ class AvrTarget(Target):
         # PORTx is the output latch and PINx the actual pin levels. Reading
         # PORTx back would return what was last written, which on an input
         # port is the pull-up configuration and not the world.
-        return Port(name, ord(letter), direction, active_low, where=letter,
+        # `port` is the letter itself, so it compares equal to an AvrPin's
+        # `.port` when checking whether a pin sits inside a declared port.
+        return Port(name, letter, direction, active_low, where=letter,
                     write_sfr=f"PORT{letter}", read_sfr=f"PIN{letter}")
 
     def _pwm(self, pin):
@@ -1618,6 +1660,9 @@ class AvrTarget(Target):
                 "",
             ]
 
+        for part in program.parts.values():
+            out += self.shift_helper(part)
+
         if program.uses_adc:
             out += [
                 "/* 10-bit ADC, polled, AVcc as reference. The prescaler is set",
@@ -1659,8 +1704,13 @@ class AvrTarget(Target):
                 out.append("    " + self.write_pin(pin, pin.active_low)
                            + f"   /* {pin.name} off */")
 
+        for part in program.parts.values():
+            for claimed in part.claimed:
+                out.append(f"    DDR{claimed.port} |= {self._bit(claimed)};"
+                           f"   /* {part.name} */")
+
         for whole in program.ports.values():
-            letter = chr(whole.port)
+            letter = whole.port
             if whole.direction == "output":
                 out.append(f"    DDR{letter} = 0xFF;"
                            f"               /* {whole.name} */")
@@ -2204,8 +2254,8 @@ WHEN_RE = re.compile(r"when\s+(started|flag\s+clicked|powered\s+on)\s*:", re.I)
 WHEN_PIN_RE = re.compile(r"when\s+(\w+)\s+(pressed|released)\s*:", re.I)
 PIN_RE = re.compile(r"pin\s+(\w+)\s*=\s*(\S+)\s+(output|input|analog|pwm|tone)"
                     r"(?:\s+active\s+(low|high))?", re.I)
-PART_RE = re.compile(r"part\s+(\w+)\s*=\s*74hc595\s+data\s+P([0-4])\.([0-7])\s+"
-                     r"clock\s+P([0-4])\.([0-7])\s+latch\s+P([0-4])\.([0-7])"
+PART_RE = re.compile(r"part\s+(\w+)\s*=\s*74hc595\s+data\s+(\S+)\s+"
+                     r"clock\s+(\S+)\s+latch\s+(\S+)"
                      r"(?:\s+active\s+(low|high))?", re.I)
 PORT_DECL_RE = re.compile(r"port\s+(\w+)\s*=\s*(\S+)\s+(output|input)"
                           r"(?:\s+active\s+(low|high))?", re.I)
@@ -2268,29 +2318,43 @@ def parse(source: str) -> Program:
         part = PART_RE.fullmatch(lowered)
         if part and not started:
             require(program, "part", line.number, "a PART")
-            (name, dp, db, cp, cb, lp, lb, active) = part.groups()
+            (name, data, clock, latch, active) = part.groups()
             if name in program.parts or name in program.ports or name in program.pins:
                 raise PseudocodeError(line.number, f"{name!r} declared twice")
-            claims = [(int(dp), int(db)), (int(cp), int(cb)), (int(lp), int(lb))]
-            if len(set(claims)) != 3:
+            # The three pins are ordinary OUTPUT pins, so the target resolves
+            # them exactly as it resolves any other -- which is what lets a
+            # 74HC595 hang off an Arduino or an ATmega as readily as an 8051.
+            # Resolved against an EMPTY program of the same device: all we
+            # want here is "is this a real pin on this board, and what is it
+            # called". A target's resolve_pin also runs its own clash checks,
+            # and letting those fire would answer a PART question with a PIN
+            # answer -- the reason a user needs is "a PART claims its pins",
+            # which the checks just below give.
+            scratch = Program(part=program.part)
+            claims = [program.target.resolve_pin(
+                          scratch, f"{name}_{role}", token, "output", False,
+                          line.number)
+                      for role, token in (("data", data), ("clock", clock),
+                                          ("latch", latch))]
+            if len({pin.where for pin in claims}) != 3:
                 raise PseudocodeError(
                     line.number, f"{name!r} names the same pin twice; data, clock and "
                                  f"latch must be three different pins")
-            for where in claims:
+            for claimed in claims:
                 for other in program.pins.values():
-                    if (getattr(other, "port", None), getattr(other, "bit", None)) == where:
+                    if other.where == claimed.where:
                         raise PseudocodeError(
-                            line.number, f"P{where[0]}.{where[1]} is already declared as "
+                            line.number, f"{claimed.where} is already declared as "
                                          f"{other.name!r}; a PART claims its pins")
                 for whole in program.ports.values():
-                    if whole.port == where[0]:
+                    if getattr(claimed, "port", None) == whole.port:
                         raise PseudocodeError(
-                            line.number, f"P{where[0]}.{where[1]} is inside the whole port "
+                            line.number, f"{claimed.where} is inside the whole port "
                                          f"{whole.name!r}, which would clobber it")
                 for prev in program.parts.values():
-                    if where in prev.claimed:
+                    if claimed.where in prev.claimed_where:
                         raise PseudocodeError(
-                            line.number, f"P{where[0]}.{where[1]} is already claimed by "
+                            line.number, f"{claimed.where} is already claimed by "
                                          f"{prev.name!r}")
             program.parts[name] = ShiftPart(name, "74hc595", claims[0], claims[1],
                                             claims[2], active == "low")
@@ -2553,9 +2617,9 @@ def emit_pseudocode(program: Program) -> str:
         out.append("")
         for part in program.parts.values():
             polarity = " ACTIVE LOW" if part.active_low else ""
-            d, c, l = part.data, part.clock, part.latch
-            out.append(f"  PART {part.name} = 74HC595 DATA P{d[0]}.{d[1]} "
-                       f"CLOCK P{c[0]}.{c[1]} LATCH P{l[0]}.{l[1]}{polarity}")
+            out.append(f"  PART {part.name} = 74HC595 "
+                       f"DATA {part.data.where} CLOCK {part.clock.where} "
+                       f"LATCH {part.latch.where}{polarity}")
     if program.ports:
         out.append("")
         for port in program.ports.values():
