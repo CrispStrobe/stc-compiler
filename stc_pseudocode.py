@@ -61,6 +61,23 @@ class Num(Expr):
 
 
 @dataclass
+class PortRef(Expr):
+    port: str
+
+
+@dataclass
+class Index(Expr):
+    """table[expr] -- a read from a constant lookup table in code space.
+
+    A seven-segment font, an LED-matrix frame and a note table are all this
+    shape, and none of them is expressible without it. The table is const and
+    lives in flash, which is the abundant resource here; RAM is not.
+    """
+    table: str
+    where: Expr
+
+
+@dataclass
 class Var(Expr):
     name: str
 
@@ -116,6 +133,12 @@ class SetPin(Stmt):
     # How it was written, so decompiling gives back the same sentence:
     # "turn on/off" reads better for LEDs, "set high/low" for logic levels.
     style: str = "level"        # "level" | "onoff"
+
+
+@dataclass
+class SetPort(Stmt):
+    port: str
+    value: Expr
 
 
 @dataclass
@@ -234,6 +257,24 @@ class Pin:
     where: str
     direction: str              # "output" | "input" | "analog" | "pwm" | "tone"
     active_low: bool = False
+
+
+@dataclass
+class Port:
+    """A whole 8-bit port, written at once.
+
+    Not sugar for eight pins. A seven-segment digit or an LED-matrix column has
+    to land as ONE store, or the display shows the intermediate states -- which
+    is visible as ghosting rather than as a bug report.
+    """
+    name: str
+    port: int
+    direction: str              # "output" | "input"
+    active_low: bool = False
+
+    @property
+    def sfr(self) -> str:
+        return f"P{self.port}"
 
 
 @dataclass
@@ -382,6 +423,14 @@ class Stc8051Target(Target):
                 raise PseudocodeError(
                     line, f"P{port}.{bit} is already declared as {other.name!r} "
                           f"({other.direction.upper()}); one pin cannot be two things")
+        # And the other way round: a PORT writes all eight bits at once, so a
+        # PIN inside it would be clobbered by every port write.
+        for whole in program.ports.values():
+            if whole.port == port:
+                raise PseudocodeError(
+                    line, f"P{port} is already declared as the whole port {whole.name!r}; "
+                          f"a PORT write covers all eight bits and would clobber "
+                          f"P{port}.{bit}")
 
         if direction == "tone":
             # Any GPIO will do -- software owns the toggle -- but there is only
@@ -526,6 +575,30 @@ class Stc8051Target(Target):
                 "}",
                 "",
             ]
+        if program.tables:
+            out += [
+                "/* Lookup tables live in code space: flash is the abundant resource",
+                " * here and RAM is not. `const __code` keeps them out of the 256 bytes",
+                " * that matter. */",
+            ]
+            for name, values in program.tables.items():
+                body = ", ".join(f"0x{v:02X}" for v in values)
+                out += [f"static const __code unsigned char bw_tab_{name}[] "
+                        f"= {{ {body} }};"]
+            out += [
+                "",
+                "/* A computed index is clamped rather than trusted. Reading past a",
+                " * table means reading a random byte of flash and, on a display,",
+                " * showing it -- which looks like data rather than like a fault. A",
+                " * constant index is checked at compile time and costs nothing. */",
+                "static unsigned char bw_clamp(int i, unsigned char last)",
+                "{",
+                "    if (i < 0) return 0;",
+                "    if (i > (int)last) return last;",
+                "    return (unsigned char)i;",
+                "}",
+                "",
+            ]
         if program.uses_uart:
             out += [
                 "/* Serial console on UART1, 8N1 at " + str(BW_BAUD) + " baud.",
@@ -656,6 +729,9 @@ class Stc8051Target(Target):
             # drives the level, but the pin still has to be able to drive.
             if pin.direction in ("output", "pwm"):
                 outputs[pin.port] = outputs.get(pin.port, 0) | pin.mask
+        for port in program.ports.values():
+            if port.direction == "output":
+                outputs[port.port] = outputs.get(port.port, 0) | 0xFF
         if self.port_modes:
             for port in sorted(outputs):
                 mask = outputs[port]
@@ -761,6 +837,8 @@ class Program:
     pins: dict = field(default_factory=dict)
     variables: list = field(default_factory=list)
     procedures: dict = field(default_factory=dict)
+    tables: dict = field(default_factory=dict)   # name -> list[int], in flash
+    ports: dict = field(default_factory=dict)    # name -> Port, whole-byte I/O
     # One entry per `WHEN started:` block. `body` mirrors whens[0] so older
     # call sites keep working; with several blocks the C back end emits a
     # cooperative scheduler instead of straight-line code.
@@ -828,8 +906,8 @@ def read_lines(source: str) -> list[Line]:
 
 
 TOKEN_RE = re.compile(r"""\s*(?:
-      (?P<number>\d+\.\d+|\d+)
-    | (?P<op><=|>=|!=|<>|==|[-+*/%()<>=])
+      (?P<number>0[xX][0-9A-Fa-f]+|0[bB][01]+|\d+\.\d+|\d+)
+    | (?P<op><=|>=|!=|<>|==|[-+*/%()<>=\[\]])
     | (?P<word>[A-Za-z_][A-Za-z0-9_]*)
     )""", re.X)
 
@@ -888,6 +966,11 @@ class ExprParser:
             return Unary("-", self.atom())
         if token.lower() == "not":
             return Unary("not", self.atom())
+        if re.fullmatch(r"0[xX][0-9A-Fa-f]+", token):
+            return Num(float(int(token, 16)))
+        if re.fullmatch(r"0[bB][01]+", token):
+            # A seven-segment font is written in binary or it is written wrong.
+            return Num(float(int(token[2:], 2)))
         if re.fullmatch(r"\d+\.\d+|\d+", token):
             return Num(float(token))
         lowered = token.lower()
@@ -897,6 +980,16 @@ class ExprParser:
             return Num(1)
         if lowered in ("false", "off", "low"):
             return Num(0)
+        if lowered in self.program.ports:
+            return PortRef(lowered)
+        if lowered in self.program.tables:
+            if self.take() != "[":
+                raise PseudocodeError(
+                    self.line, f"{token!r} is a TABLE; read it as {token}[<index>]")
+            where = self.parse()
+            if self.take() != "]":
+                raise PseudocodeError(self.line, f"missing ']' after {token}[")
+            return Index(lowered, where)
         if NAME_RE.match(token):
             if token not in self.program.locals_ and token not in self.program.variables:
                 self.program.variables.append(token)
@@ -1021,6 +1114,14 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
     if level:
         return SetPin(output_pin(level.group(1)), high=(level.group(2) == "high"))
 
+    into = re.match(r"set\s+(\w+)\s+to\s+(.+)$", text.strip(), re.I)
+    if into and into.group(1).lower() in program.ports:
+        port = program.ports[into.group(1).lower()]
+        if port.direction != "output":
+            raise PseudocodeError(
+                line, f"{port.name!r} is an INPUT port and cannot be written")
+        return SetPort(port.name, expression(into.group(2), program, line))
+
     say = re.match(r'print\s+"([^"]*)"\s*$', text.strip(), re.I)
     if say:
         return Print(text=say.group(1))
@@ -1132,6 +1233,9 @@ DEFINE_RE = re.compile(r"define\s+(?:fast\s+)?([A-Za-z_]\w*)\s*(.*?):\s*$", re.I
 WHEN_RE = re.compile(r"when\s+(started|flag\s+clicked|powered\s+on)\s*:", re.I)
 PIN_RE = re.compile(r"pin\s+(\w+)\s*=\s*(\S+)\s+(output|input|analog|pwm|tone)"
                     r"(?:\s+active\s+(low|high))?", re.I)
+PORT_DECL_RE = re.compile(r"port\s+(\w+)\s*=\s*P([0-4])\s+(output|input)"
+                          r"(?:\s+active\s+(low|high))?", re.I)
+TABLE_RE = re.compile(r"table\s+(\w+)\s*=\s*(.+)$", re.I)
 CLOCK_RE = re.compile(r"clock\s+([\d_]+)\s*(hz|mhz)?", re.I)
 
 
@@ -1173,6 +1277,53 @@ def parse(source: str) -> Program:
         if clock and not started:
             value = int(clock.group(1).replace("_", ""))
             program.clock = value * 1_000_000 if clock.group(2) == "mhz" else value
+            index += 1
+            continue
+
+        port = PORT_DECL_RE.fullmatch(lowered)
+        if port and not started:
+            name, number, direction, active = port.groups()
+            number = int(number)
+            if name in program.ports or name in program.pins:
+                raise PseudocodeError(line.number, f"{name!r} declared twice")
+            # A PORT and a PIN on the same port would fight: writing the byte
+            # clobbers the bit, and neither declaration would look wrong.
+            for other in program.pins.values():
+                if getattr(other, "port", None) == number:
+                    raise PseudocodeError(
+                        line.number,
+                        f"P{number} is already used one bit at a time, by {other.name!r} "
+                        f"({other.where}); a PORT writes all eight at once and would "
+                        f"clobber it")
+            for other in program.ports.values():
+                if other.port == number:
+                    raise PseudocodeError(
+                        line.number, f"P{number} is already declared as {other.name!r}")
+            program.ports[name] = Port(name, number, direction, active == "low")
+            index += 1
+            continue
+
+        table = TABLE_RE.fullmatch(text.strip())
+        if table and not started:
+            name = table.group(1)
+            if name.lower() in program.tables:
+                raise PseudocodeError(line.number, f"table {name!r} declared twice")
+            values = []
+            for item in table.group(2).split(","):
+                item = item.strip()
+                try:
+                    values.append(int(item, 0) if not item.startswith(("0b", "0B"))
+                                  else int(item[2:], 2))
+                except ValueError:
+                    raise PseudocodeError(
+                        line.number, f"{item!r} is not a constant; a TABLE holds "
+                                     f"numbers only, and lives in flash")
+            if not values:
+                raise PseudocodeError(line.number, f"table {name!r} is empty")
+            if any(v < 0 or v > 255 for v in values):
+                raise PseudocodeError(
+                    line.number, f"table {name!r} holds bytes: 0 to 255")
+            program.tables[name.lower()] = values
             index += 1
             continue
 
@@ -1256,6 +1407,10 @@ def expr_pseudo(node: Expr, parent_level: int = -1) -> str:
     """Render an expression, parenthesising only where precedence demands it."""
     if isinstance(node, Num):
         return node.text()
+    if isinstance(node, PortRef):
+        return node.port
+    if isinstance(node, Index):
+        return f"{node.table}[{expr_pseudo(node.where)}]"
     if isinstance(node, (Var, PinRef)):
         return node.name
     if isinstance(node, Unary):
@@ -1275,7 +1430,9 @@ def stmts_pseudo(body: list, depth: int, active_low: dict) -> list[str]:
     pad = "  " * depth
     out = []
     for node in body:
-        if isinstance(node, Print):
+        if isinstance(node, SetPort):
+            out.append(f"{pad}set {node.port} to {expr_pseudo(node.value)}")
+        elif isinstance(node, Print):
             out.append(f'{pad}print "{node.text}"' if node.value is None
                        else f"{pad}print {expr_pseudo(node.value)}")
         elif isinstance(node, SetTone):
@@ -1337,6 +1494,16 @@ def emit_pseudocode(program: Program) -> str:
     """
     active_low = {pin.name: pin.active_low for pin in program.pins.values()}
     out = [f"DEVICE {program.part.upper()}:", f"  CLOCK {program.clock}"]
+    if program.tables:
+        out.append("")
+        for name, values in program.tables.items():
+            out.append(f"  TABLE {name} = " + ", ".join(f"0x{v:02X}" for v in values))
+    if program.ports:
+        out.append("")
+        for port in program.ports.values():
+            polarity = " ACTIVE LOW" if port.active_low else ""
+            out.append(f"  PORT {port.name} = P{port.port} "
+                       f"{port.direction.upper()}{polarity}")
     if program.pins:
         out.append("")
         for pin in program.pins.values():
@@ -1363,12 +1530,31 @@ class Emit:
     target: Target
     pins: dict
     procs: dict
+    program: "Program" = None    # ports and tables are program-level
     counter: list = field(default_factory=lambda: [0])
 
 
 def expr_c(node: Expr, ctx: Emit, parent_level: int = -1) -> str:
     if isinstance(node, Num):
         return str(int(node.value))
+    if isinstance(node, PortRef):
+        port = ctx.program.ports[node.port]
+        raw = port.sfr
+        return f"(unsigned char)~{raw}" if port.active_low else raw
+    if isinstance(node, Index):
+        table = ctx.program.tables[node.table]
+        where = expr_c(node.where, ctx)
+        # A constant index is checked here and costs nothing at run time. A
+        # computed one is clamped, because the alternative is reading a random
+        # byte of flash and showing it on a display -- which looks like data.
+        if isinstance(node.where, Num):
+            i = int(node.where.value)
+            if not 0 <= i < len(table):
+                raise PseudocodeError(
+                    0, f"{node.table}[{i}] is outside the table "
+                       f"(0 to {len(table) - 1})")
+            return f"bw_tab_{node.table}[{i}]"
+        return f"bw_tab_{node.table}[bw_clamp({where}, {len(table) - 1})]"
     if isinstance(node, Var):
         return node.name
     if isinstance(node, PinRef):
@@ -1412,6 +1598,13 @@ def stmts_c(body: list, depth: int, ctx: Emit) -> list[str]:
             rendered = Print(text=node.text,
                              value=None if node.value is None else expr_c(node.value, ctx))
             out.append(pad + ctx.target.write_print(rendered))
+        elif isinstance(node, SetPort):
+            port = ctx.program.ports[node.port]
+            value = expr_c(node.value, ctx)
+            if port.active_low:
+                out.append(f"{pad}{port.sfr} = (unsigned char)~({value});")
+            else:
+                out.append(f"{pad}{port.sfr} = (unsigned char)({value});")
         elif isinstance(node, Toggle):
             out.append(pad + ctx.target.toggle_pin(ctx.pins[node.pin]))
         elif isinstance(node, Wait):
@@ -1500,6 +1693,13 @@ def stmts_task(body: list, depth: int, ctx: Emit,
             rendered = Print(text=node.text,
                              value=None if node.value is None else expr_c(node.value, ctx))
             out.append(pad + ctx.target.write_print(rendered))
+        elif isinstance(node, SetPort):
+            port = ctx.program.ports[node.port]
+            value = expr_c(node.value, ctx)
+            if port.active_low:
+                out.append(f"{pad}{port.sfr} = (unsigned char)~({value});")
+            else:
+                out.append(f"{pad}{port.sfr} = (unsigned char)({value});")
         elif isinstance(node, Toggle):
             out.append(pad + ctx.target.toggle_pin(ctx.pins[node.pin]))
         elif isinstance(node, Wait):
@@ -1574,7 +1774,7 @@ def emit_c(program: Program) -> str:
     supplies is every line that names a register, a header or a timebase."""
     target = program.target
     ctx = Emit(target, {pin.name: pin for pin in program.pins.values()},
-               program.procedures)
+               program.procedures, program)
     tasks = len(program.whens) > 1
 
     out = [
