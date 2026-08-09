@@ -154,6 +154,26 @@ for name, payload, expect in cases:
     error = result.get("error", "")
     check(name, result.get("success") is False and expect in error, error[:60])
 
+print("\nthe source cannot read files outside the build")
+# A compiler quotes the offending line back in its diagnostics, and this
+# service returns that output -- so an unrestricted #include turns a compile
+# endpoint into a file-read primitive. Confirmed against a deployment with
+# /etc/os-release before the check existed.
+for probe, why in [('#include "/etc/os-release"\nvoid main(void){}', "an absolute path"),
+                   ('#include "/proc/self/environ"\nvoid main(void){}', "the environment"),
+                   ('#include "../../etc/passwd"\nvoid main(void){}', "a parent traversal")]:
+    result, _ = post({"code": probe})
+    check(f"refuses {why}",
+          result.get("success") is False
+          and "outside the build directory" in (result.get("error") or ""),
+          (result.get("error") or "")[:56])
+for allowed, why in [('#include <stc12.h>\nvoid main(void){ P1 = 0; for(;;); }', "a system header"),
+                     ('#include "nope.h"\nvoid main(void){}', "a relative header (fails to compile, but is not refused)")]:
+    result, _ = post({"code": allowed})
+    check(f"still allows {why}",
+          "outside the build directory" not in (result.get("error") or ""),
+          (result.get("error") or "")[:56])
+
 print("\nno internal paths leak")
 result, _ = post({"code": "void main(void) { not C }"})
 check("workspace path stripped from errors", "/tmp/build-" not in result.get("error", ""),

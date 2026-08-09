@@ -46,6 +46,33 @@ STAGE_SHARE = os.path.join(STAGE, "share")
 # excludes '/' and '\\' so a path can never be smuggled in as an input file.
 VALUE_RE = re.compile(r"[A-Za-z0-9_.,=+:-]+")
 
+# `#include` naming a file outside the workspace. Blocking a path in `options`
+# was never enough on its own: the SOURCE can name one, and a C compiler will
+# read it and then quote the offending line back in its diagnostics. Since the
+# compiler's output is returned to the caller, `#include "/proc/self/environ"`
+# turns a compile service into a file-read primitive. Confirmed against the
+# deployment with /etc/os-release before this was written.
+#
+# Angle-bracket includes are untouched: those resolve inside the vendored
+# toolchain, which is the point of having one.
+INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]*)"',
+                        re.MULTILINE)
+
+
+def reject_escaping_includes(source: str):
+    """None if the source only includes files beside it, else an error dict."""
+    for path in INCLUDE_RE.findall(source):
+        cleaned = path.strip().replace("\\", "/")
+        if (cleaned.startswith("/") or cleaned.startswith("~")
+                or ".." in cleaned.split("/")
+                or re.match(r"^[A-Za-z]:", cleaned)):
+            return {"success": False, "stage": "source",
+                    "error": f'#include "{path}" names a file outside the '
+                             f"build directory. Only headers beside the source "
+                             f"and the toolchain's own <angle-bracket> headers "
+                             f"can be included."}
+    return None
+
 # Anything beyond this is a runaway, not a program.
 COMPILE_TIMEOUT = 25
 MAX_SOURCE_BYTES = 1_000_000
@@ -371,6 +398,10 @@ def build(req: CompileReq) -> dict:
     if len(req.code.encode("utf-8")) > MAX_SOURCE_BYTES:
         return {"success": False, "error": "source too large"}
 
+    refusal = reject_escaping_includes(req.code)
+    if refusal:
+        return refusal
+
     stem = "main"
     generated_c = None
     keil_changes: dict = {}
@@ -656,6 +687,13 @@ async def translate_project_endpoint(req: ProjectReq):
         clean = path.replace("\\", "/")
         if clean.startswith("/") or ".." in clean.split("/") or not clean:
             return {"success": False, "error": f"bad path: {path!r}"}
+    # The file NAMES were already checked; their CONTENTS can name a path too,
+    # and this endpoint compiles them.
+    for path, text in req.files.items():
+        refusal = reject_escaping_includes(text)
+        if refusal:
+            refusal["error"] = f"{path}: {refusal['error']}"
+            return refusal
 
     stage_toolchain()
     result = keil2sdcc.translate_project(req.files)
