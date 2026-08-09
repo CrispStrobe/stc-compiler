@@ -78,22 +78,43 @@ say "Assembling the avr5-only bundle ..."
 # bin/avr-gcc looks for ../lib/gcc/avr/<version>/. Flattening this the way
 # fetch-sdcc.sh flattens SDCC's would break that lookup.
 #
-#   avr/bin/                    avr-gcc and the binutils it fork/execs
+#   avr/bin/                    avr-gcc, and the prefixed tools WE call
 #   avr/lib/gcc/avr/<ver>/      cc1, collect2, device-specs, avr5 multilib
-#   avr/lib/avr/                avr-libc: headers and the avr5 libraries
+#   avr/avr/bin/                as, ld — UNPREFIXED, because that is the name
+#                               the driver looks for
+#   avr/avr/include/            avr-libc headers
+#   avr/avr/lib/                avr-libc libraries, by multilib
+#
+# The avr/avr/... half is the part that is easy to get wrong, and getting it
+# wrong fails in a way that looks like success: the driver starts, cc1 runs,
+# and then the SYSTEM x86 assembler is handed -mmcu=avr5 and rejects it. GCC
+# resolves its tools through $prefix/$target/bin, where $prefix is derived
+# from argv[0] -- so bin/avr-gcc means the assembler must be at
+# avr/avr/bin/as, under its plain name. Debian ships /usr/bin/avr-as and
+# patches gcc to match; we cannot rely on that patch once the tree moves.
 #
 rm -rf "$ROOT/avr"
-mkdir -p "$ROOT/avr/bin" "$ROOT/avr/lib"
+mkdir -p "$ROOT/avr/bin" "$ROOT/avr/lib" "$ROOT/avr/avr/bin"
 
 # The driver plus the binutils it fork/execs. avr-gcc runs `avr-as` and
 # `avr-ld` by name, and objcopy/objdump/size are what turn the .elf into a
 # .hex and report its size.
-for b in avr-gcc avr-as avr-ld avr-objcopy avr-objdump avr-size avr-ar avr-ranlib; do
+for b in avr-gcc avr-as avr-ld avr-objcopy avr-objdump avr-size avr-ar avr-ranlib avr-nm avr-strip; do
   if [ -f "$WORK/x/usr/bin/$b" ]; then
     cp "$WORK/x/usr/bin/$b" "$ROOT/avr/bin/$b"
     chmod +x "$ROOT/avr/bin/$b"
   else
     echo "  WARNING: $b not found in the packages" >&2
+  fi
+done
+
+# The same binutils again under their unprefixed names, in the tooldir. This
+# is what the driver and collect2 actually look for; without it, `as` and `ld`
+# resolve from PATH and you assemble AVR code with the host assembler.
+for b in as ld ar ranlib nm objcopy objdump strip; do
+  if [ -f "$WORK/x/usr/bin/avr-$b" ]; then
+    cp "$WORK/x/usr/bin/avr-$b" "$ROOT/avr/avr/bin/$b"
+    chmod +x "$ROOT/avr/avr/bin/$b"
   fi
 done
 
@@ -128,17 +149,22 @@ for m in $MULTILIBS; do
   test -d "$SRC/$m" && cp -R "$SRC/$m" "$DST/$m"
 done
 
-# avr-libc. The headers are ~19 MB because there is one per part; they are
-# kept whole, since avr/io.h dispatches to them by device macro and a trimmed
-# set turns an unsupported part into a confusing #include error.
-mkdir -p "$ROOT/avr/lib/avr/lib"
-cp -R "$WORK/x/usr/lib/avr/include" "$ROOT/avr/lib/avr/include"
+# avr-libc, into the tooldir where GCC expects a cross target's headers and
+# libraries ($prefix/$target/{include,lib}). Debian keeps them at
+# /usr/lib/avr instead; putting them back in the standard place is what lets
+# the bundle work without -isystem and -B crutches.
+#
+# The headers are ~19 MB because there is one per part. Kept whole: avr/io.h
+# dispatches to them by device macro, and a trimmed set turns an unsupported
+# part into a confusing #include error rather than a clear one.
+mkdir -p "$ROOT/avr/avr/lib"
+cp -R "$WORK/x/usr/lib/avr/include" "$ROOT/avr/avr/include"
 for m in $MULTILIBS; do
   test -d "$WORK/x/usr/lib/avr/lib/$m" \
-    && cp -R "$WORK/x/usr/lib/avr/lib/$m" "$ROOT/avr/lib/avr/lib/$m"
+    && cp -R "$WORK/x/usr/lib/avr/lib/$m" "$ROOT/avr/avr/lib/$m"
 done
 find "$WORK/x/usr/lib/avr/lib" -maxdepth 1 -type f \
-     -exec cp {} "$ROOT/avr/lib/avr/lib/" \;
+     -exec cp {} "$ROOT/avr/avr/lib/" \;
 
 # GPL section 1: the licences travel with the binaries. avr-gcc is GPL-3.0
 # (with the GCC Runtime Library Exception, which is what leaves compiled
@@ -169,8 +195,9 @@ du -sh "$ROOT/avr" | sed 's/^/    /'
 echo
 echo "avr-gcc present: $(test -x "$ROOT/avr/bin/avr-gcc" && echo yes || echo NO)"
 echo "cc1 present:     $(test -x "$DST/cc1" && echo yes || echo NO)"
-echo "io.h present:    $(test -f "$ROOT/avr/lib/avr/include/avr/io.h" && echo yes || echo NO)"
-echo "avr5 crt:        $(ls "$ROOT/avr/lib/avr/lib/avr5"/crtatmega328p.o >/dev/null 2>&1 \
+echo "tooldir as:      $(test -x "$ROOT/avr/avr/bin/as" && echo yes || echo NO)"
+echo "io.h present:    $(test -f "$ROOT/avr/avr/include/avr/io.h" && echo yes || echo NO)"
+echo "avr5 crt:        $(ls "$ROOT/avr/avr/lib/avr5"/crtatmega328p.o >/dev/null 2>&1 \
                           && echo yes || echo NO)"
 echo
 echo "GLIBC requirement (must be <= 2.34 to start on Vercel):"

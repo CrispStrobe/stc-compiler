@@ -21,11 +21,11 @@ jobs:
         with:
           python-version: "3.11"
       - name: Golden files (what the emitter emits, byte for byte)
-        run: ./scripts/test-golden.py
+        run: python3 ./scripts/test-golden.py
       - name: Round-trip transparency
-        run: ./scripts/test-roundtrip.py
+        run: python3 ./scripts/test-roundtrip.py
       - name: Debug symbol table
-        run: ./scripts/test-symtab.py
+        run: python3 ./scripts/test-symtab.py
 
   # The real verification: build the vendored AVR toolchain from Debian and
   # prove it compiles, links and emits an image using ONLY those binaries.
@@ -44,8 +44,6 @@ jobs:
         run: |
           set -euo pipefail
           AVR="$PWD/avr"
-          VERSION="$(cat "$AVR/GCC_VERSION")"
-          FLAGS="-B$AVR/lib/gcc/avr/$VERSION/ -B$AVR/lib/avr/lib/ -isystem$AVR/lib/avr/include"
           fail=0
           for f in scripts/golden/avr.c scripts/golden/avr-scripts.c; do
             echo "== $f"
@@ -53,7 +51,7 @@ jobs:
             # suppressed at the call site is generated code with a defect.
             if "$AVR/bin/avr-gcc" -mmcu=atmega328p -Os -std=c99 \
                  -Wall -Wextra -Werror -Wno-implicit-fallthrough \
-                 $FLAGS -o /tmp/g.elf "$f"; then
+                 -o /tmp/g.elf "$f"; then
               "$AVR/bin/avr-size" --mcu=atmega328p --format=avr /tmp/g.elf \
                 | grep -E "Program|Data" | sed 's/^/    /'
             else

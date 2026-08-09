@@ -134,23 +134,22 @@ def _make_executable(directory: str):
                      | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def stage_avr() -> tuple[str, list[str]] | None:
-    """(directory holding avr-gcc, extra flags), or None if there is no AVR
-    toolchain reachable at all.
+def stage_avr() -> str | None:
+    """Directory holding avr-gcc, or None if no AVR toolchain is reachable.
 
     Two ways this resolves, and both matter. In production the bundle is
     vendored under avr/ and staged into /tmp exactly as SDCC's is, because
     Vercel's deployment directory is read-only and drops the executable bit.
     In local development there is usually a system avr-gcc on PATH (Homebrew's
     avr-gcc, Debian's gcc-avr), and falling back to it means the AVR path can
-    be exercised and tested without first building a Linux bundle.
+    be exercised without first building a Linux bundle.
 
-    The vendored bundle keeps Debian's own directory layout, so the driver
-    finds cc1 and collect2 by itself (bin/avr-gcc looks for
-    ../lib/gcc/avr/<version>/). What it cannot infer is where avr-libc went,
-    because Debian puts it at lib/avr rather than the <prefix>/avr GCC expects
-    -- hence the explicit -B and -isystem. A system toolchain needs none of
-    this and gets no flags.
+    Neither case needs -B or -isystem. fetch-avr-gcc.sh lays the bundle out as
+    a real cross-toolchain prefix ($prefix/$target/{bin,include,lib}), so the
+    driver resolves cc1, `as`, `ld` and avr-libc by itself. That is deliberate:
+    scripts/verify-avr.sh compiles with no flags either, so what CI proves is
+    what this function actually runs. Papering over a bad layout with flags
+    here would mean the verifier no longer verifies anything.
     """
     if os.path.isdir(SRC_AVR):
         if not os.path.exists(os.path.join(AVR_STAGE_BIN, "avr-gcc")):
@@ -162,26 +161,17 @@ def stage_avr() -> tuple[str, list[str]] | None:
                     shutil.copytree(source, destination)
                 elif os.path.isfile(source) and not os.path.exists(destination):
                     shutil.copy2(source, destination)
-            if os.path.isdir(AVR_STAGE_BIN):
-                _make_executable(AVR_STAGE_BIN)
-            # cc1 and collect2 are fork/exec'd and need the bit too.
-            for root, _dirs, _files in os.walk(os.path.join(AVR_STAGE, "lib", "gcc")):
-                _make_executable(root)
+            # cc1, collect2, as and ld are all fork/exec'd and all lose the
+            # executable bit on the way through Vercel's deployment.
+            for sub in ("bin", os.path.join("avr", "bin"),
+                        os.path.join("lib", "gcc")):
+                for root, _dirs, _files in os.walk(os.path.join(AVR_STAGE, sub)):
+                    _make_executable(root)
         if os.path.exists(os.path.join(AVR_STAGE_BIN, "avr-gcc")):
-            version = ""
-            version_file = os.path.join(AVR_STAGE, "GCC_VERSION")
-            if os.path.exists(version_file):
-                with open(version_file, encoding="utf-8") as handle:
-                    version = handle.read().strip()
-            flags = [f"-B{os.path.join(AVR_STAGE, 'lib', 'avr', 'lib')}{os.sep}",
-                     f"-isystem{os.path.join(AVR_STAGE, 'lib', 'avr', 'include')}"]
-            if version:
-                flags.insert(0, "-B" + os.path.join(
-                    AVR_STAGE, "lib", "gcc", "avr", version) + os.sep)
-            return AVR_STAGE_BIN, flags
+            return AVR_STAGE_BIN
 
     found = shutil.which("avr-gcc")
-    return (os.path.dirname(found), []) if found else None
+    return os.path.dirname(found) if found else None
 
 
 class CompileReq(BaseModel):
@@ -214,13 +204,12 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
     filename, bytes, log, memory -- so a client that already speaks to this
     service does not learn a second one.
     """
-    staged = stage_avr()
-    if staged is None:
+    bin_dir = stage_avr()
+    if bin_dir is None:
         return {"success": False, "stage": "compile",
                 "error": "no AVR toolchain available; the avr/ bundle is not "
                          "vendored in this deployment and no avr-gcc is on PATH",
                 "c": generated_c}
-    bin_dir, toolchain_flags = staged
 
     work = os.path.join(tempfile.gettempdir(), f"build-{uuid.uuid4().hex}")
     os.makedirs(work, exist_ok=True)
@@ -236,7 +225,6 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
            # lowering, not a mistake, and SDCC does not warn about it either.
            "-Wno-implicit-fallthrough",
            "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections"]
-    cmd += toolchain_flags
     # Source that already sets its own clock wins: generated code bakes F_CPU
     # in, and defining it twice from the command line is a warning at best and
     # a conflicting redefinition at worst.
@@ -995,8 +983,7 @@ async def health():
     # The AVR side is reported separately and never fails the health check:
     # a deployment without the avr/ bundle is a perfectly good 8051 compiler,
     # and saying so plainly beats a red light nobody can act on.
-    staged_avr = stage_avr()
-    avr_bin = staged_avr[0] if staged_avr else None
+    avr_bin = stage_avr()
     avr_version = ""
     if avr_bin:
         try:

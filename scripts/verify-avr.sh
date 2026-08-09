@@ -28,8 +28,11 @@ bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; fail=1; }
 
 test -x "$GCC" || { bad "no $GCC — run ./scripts/fetch-avr-gcc.sh first"; exit 1; }
 
-VERSION="$(cat "$AVR/GCC_VERSION" 2>/dev/null || echo "")"
-FLAGS="-B$AVR/lib/gcc/avr/$VERSION/ -B$AVR/lib/avr/lib/ -isystem$AVR/lib/avr/include"
+# No -B, no -isystem: the bundle is laid out as a proper cross-toolchain
+# prefix, so the driver resolves cc1, as, ld and avr-libc by itself. If this
+# needs flags to work, the LAYOUT is wrong and app.py would need the same
+# crutches -- better to find that out here.
+FLAGS=""
 
 echo "verifying the vendored AVR bundle"
 echo
