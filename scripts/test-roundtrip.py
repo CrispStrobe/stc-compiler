@@ -208,6 +208,48 @@ WHEN started:
       turn off fast
 """,
 
+    # Every peripheral the Arduino core provides, in one program: PWM on a
+    # timer output, a tone, Serial and a lookup table.
+    "arduino-parity": """DEVICE ARDUINO-UNO:
+  NAME parity
+  CLOCK 16000000
+  TABLE font = 0x3F, 0x06, 0x5B, 0x4F
+  PIN dim = D9 PWM ACTIVE LOW
+  PIN buzz = D8 TONE
+  PIN pot = A0 ANALOG
+  WHEN started:
+    print "ready"
+    set i to 0
+    FOREVER:
+      set dim to font[i] percent
+      set buzz to 440 hz
+      print pot
+      wait 200 ms
+      set buzz to 0 hz
+      change i by 1
+""",
+
+    # The same, bare. D11 is Timer 2 because D9 is the tone's Timer 1, and D5
+    # and D6 are refused outright -- they are Timer 0, the millisecond tick.
+    "avr-parity": """DEVICE ATMEGA328P:
+  NAME parity
+  CLOCK 16000000
+  TABLE font = 0x3F, 0x06, 0x5B, 0x4F
+  PIN dim = D11 PWM ACTIVE LOW
+  PIN buzz = D9 TONE
+  PIN pot = A0 ANALOG
+  WHEN started:
+    print "ready"
+    set i to 0
+    FOREVER:
+      set dim to font[i] percent
+      set buzz to 440 hz
+      print pot
+      wait 200 ms
+      set buzz to 0 hz
+      change i by 1
+""",
+
     # A target off C entirely. MicroPython has no goto, so the cooperative
     # scheduler is generators rather than a Duff's device -- the case the
     # target interface was drawn to allow.

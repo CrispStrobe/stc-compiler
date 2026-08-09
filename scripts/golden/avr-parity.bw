@@ -1,0 +1,20 @@
+DEVICE ATMEGA328P:
+  NAME parity
+  CLOCK 16000000
+
+  TABLE font = 0x3F, 0x06, 0x5B, 0x4F
+
+  PIN dim = D11 PWM ACTIVE LOW
+  PIN buzz = D9 TONE
+  PIN pot = A0 ANALOG
+
+  WHEN started:
+    print "ready"
+    set i to 0
+    FOREVER:
+      set dim to font[i] percent
+      set buzz to 440 hz
+      print pot
+      wait 200 ms
+      turn off buzz
+      change i by 1

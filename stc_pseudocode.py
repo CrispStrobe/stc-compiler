@@ -34,6 +34,30 @@ PCA_PINS = {(1, 3): 0, (1, 4): 1}
 
 BW_BAUD = 9600          # the console rate; not settable from the dialect yet
 
+
+def _c_string(text: str) -> str:
+    """Escape a literal for a C string, quotes and all.
+
+    The dialect's `print "..."` regex already forbids a quote inside the text,
+    but not a backslash -- and `print "x \\"` put a lone backslash at the end of
+    the emitted literal, where it escaped the CLOSING quote and left the
+    generated C unterminated. Escaping properly is cheaper than reasoning
+    about which characters the parser happens to exclude today.
+    """
+    out = []
+    for char in text:
+        if char in ("\\", '"'):
+            out.append("\\" + char)
+        elif char == "\n":
+            out.append("\\n")
+        elif char == "\t":
+            out.append("\\t")
+        elif ord(char) < 0x20 or ord(char) > 0x7E:
+            out.append(f"\\x{ord(char):02x}")
+        else:
+            out.append(char)
+    return "".join(out)
+
 PORT_RE = re.compile(r"^P([0-4])\.([0-7])$", re.I)
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -578,7 +602,7 @@ class Stc8051Target(Target):
 
     def write_print(self, node) -> str:
         if node.value is None:
-            return f'bw_print("{node.text}");'
+            return f'bw_print("{_c_string(node.text)}");'
         return f"bw_print_num({node.value});"
 
     def write_tone(self, pin, hz: str) -> str:
@@ -956,6 +980,12 @@ class Stc8051Target(Target):
 
 ARDUINO_PIN_RE = re.compile(r"^(?:d(\d{1,2})|a(\d{1,2})|(\d{1,2}))$", re.I)
 
+# The three timers bring six compare outputs to the header. Everything else is
+# digital-only, exactly as the PCA pins are on the STC12.
+ARDUINO_PWM_PINS = {3, 5, 6, 9, 10, 11}
+# tone() is Timer 2, and Timer 2 is what drives PWM on D3 and D11.
+ARDUINO_TONE_STEALS = {3, 11}
+
 
 @dataclass
 class ArduinoPin(Pin):
@@ -989,6 +1019,12 @@ class ArduinoTarget(Target):
 
     # Core C++ needs the Arduino build system; SDCC cannot touch it.
     toolchain = "arduino-cli"
+
+    # PORT and PART stay out. A PORT is eight bits of one register, which the
+    # core deliberately hides behind digitalWrite, and a PART is declared with
+    # P0.0-style pins. Reaching past the core for either would give up the
+    # portability that is the whole reason to emit core C++.
+    supports = frozenset({"pwm", "tone", "print", "table"})
     compile_hint = ("DEVICE ATMEGA328P: is the same board without the Arduino "
                     "core, and that one does compile here.")
     source_extension = "ino"
@@ -1024,6 +1060,35 @@ class ArduinoTarget(Target):
             raise PseudocodeError(
                 line, f"the {self.display} has D0-D{self.digital_max}, "
                       f"not D{number}")
+        if direction == "pwm" and number not in ARDUINO_PWM_PINS:
+            usable = ", ".join(f"D{n}" for n in sorted(ARDUINO_PWM_PINS))
+            raise PseudocodeError(
+                line, f"PWM on the {self.display} is only on the timer compare "
+                      f"outputs: {usable}. D{number} is digital-only.")
+        if direction == "tone":
+            # tone() drives one pin at a time, and it is Timer 2 -- the same
+            # timer behind PWM on D3 and D11. Both are silent breakage if left
+            # to run: a second tone replaces the first, and the PWM pin simply
+            # stops fading.
+            for other in program.pins.values():
+                if other.direction == "tone":
+                    raise PseudocodeError(
+                        line, f"only one TONE pin ({other.name!r} already has "
+                              f"it): the Arduino core plays one tone at a time")
+                if other.direction == "pwm" and other.ref.isdigit() \
+                        and int(other.ref) in ARDUINO_TONE_STEALS:
+                    raise PseudocodeError(
+                        line, f"a TONE pin and PWM on D{other.ref} both need "
+                              f"Timer 2 -- {other.name!r} would stop fading "
+                              f"while a note sounds. Move it to D5, D6, D9 "
+                              f"or D10.")
+        if direction == "pwm" and number in ARDUINO_TONE_STEALS:
+            for other in program.pins.values():
+                if other.direction == "tone":
+                    raise PseudocodeError(
+                        line, f"PWM on D{number} and the TONE pin "
+                              f"{other.name!r} both need Timer 2. Use D5, D6, "
+                              f"D9 or D10 for PWM instead.")
         if direction == "analog":
             raise PseudocodeError(
                 line, f"ANALOG needs an analog input, and D{number} is "
@@ -1043,6 +1108,24 @@ class ArduinoTarget(Target):
 
     def read_analog(self, pin):
         return f"analogRead({pin.ref})"
+
+    def write_pwm(self, pin, value: str) -> str:
+        # analogWrite takes 0-255 as the proportion of time the PIN is high,
+        # while the AST stores the percentage of time the LOAD is on. The
+        # outer parentheses matter: `100 - x * 255 / 100` binds the wrong way.
+        duty = f"(100 - ({value}))" if pin.active_low else f"({value})"
+        return f"analogWrite({pin.ref}, ({duty} * 255) / 100);"
+
+    def write_tone(self, pin, hz: str) -> str:
+        # Through a helper because 0 Hz means silence and the frequency is an
+        # expression, so the choice is a run-time one and this hook may only
+        # return a single statement.
+        return f"bw_tone({pin.ref}, {hz});"
+
+    def write_print(self, node) -> str:
+        if node.value is None:
+            return f'Serial.println("{_c_string(node.text)}");'
+        return f"Serial.println({node.value});"
 
     # ---- time -----------------------------------------------------------
     def delay(self, ms):
@@ -1064,11 +1147,46 @@ class ArduinoTarget(Target):
         ]
 
     def runtime(self, program, tasks):
-        # Nothing to emit. The timebase, the blocking delay and the ADC are
-        # all in the core already -- which is the whole reason this target is
-        # cheap, and the reason it is a good check on the interface: a target
-        # that needs no runtime at all still has to fit through it.
-        return []
+        # Almost nothing to emit: the timebase, the blocking delay, the ADC,
+        # tone() and Serial are all in the core already. What is left is the
+        # handful of helpers the shared walkers expect by name.
+        out: list[str] = []
+        if program.tables:
+            out += [
+                "/* Lookup tables. `const` on an AVR still costs RAM -- the",
+                " * Harvard split means a plain const array is copied out of",
+                " * flash at startup -- but PROGMEM would need pgm_read_byte at",
+                " * every use, and the index expression is shared with the",
+                " * other targets. A font is tens of bytes; a big table is the",
+                " * case that would need a target hook for reads. */",
+            ]
+            for name, values in program.tables.items():
+                body = ", ".join(f"0x{v:02X}" for v in values)
+                out.append(f"static const unsigned char bw_tab_{name}[] "
+                           f"= {{ {body} }};")
+            out += [
+                "",
+                "/* A computed index is clamped rather than trusted: reading",
+                " * past a table gives a plausible-looking wrong byte. */",
+                "static unsigned char bw_clamp(int i, unsigned char last)",
+                "{",
+                "    if (i < 0) return 0;",
+                "    if (i > (int)last) return last;",
+                "    return (unsigned char)i;",
+                "}",
+                "",
+            ]
+        if program.tone_pin is not None:
+            out += [
+                "/* 0 Hz means silence, and the frequency is an expression, so",
+                " * the choice has to be made at run time. */",
+                "static void bw_tone(unsigned char pin, unsigned int hz)",
+                "{",
+                "    if (hz) tone(pin, hz); else noTone(pin);",
+                "}",
+                "",
+            ]
+        return out
 
     def setup(self, program):
         out: list[str] = []
@@ -1082,12 +1200,21 @@ class ArduinoTarget(Target):
                 # would fight it.
                 mode = "INPUT_PULLUP" if pin.active_low else "INPUT"
                 out.append(f"    pinMode({pin.ref}, {mode});")
-            # An analog pin needs no pinMode: analogRead configures the mux.
+            elif pin.direction == "pwm":
+                out.append(f"    pinMode({pin.ref}, OUTPUT);")
+            # analog needs no pinMode (analogRead configures the mux), and
+            # neither does tone (tone() drives the pin itself).
         for pin in program.pins.values():
             if pin.direction == "output":
                 level = "HIGH" if pin.active_low else "LOW"
                 out.append(f"    digitalWrite({pin.ref}, {level});"
                            f"   /* {pin.name} off */")
+            elif pin.direction == "pwm":
+                # Start at the off end, whichever end that is.
+                out.append("    " + self.write_pwm(pin, "0")
+                           + f"   /* {pin.name} off */")
+        if program.uses_uart:
+            out.append(f"    Serial.begin({BW_BAUD});")
         return out
 
     def start_scheduler(self, task_names):
@@ -1125,6 +1252,20 @@ AVR_PIN_RE = re.compile(r"^(?:([da])(\d{1,2})|p([b-d])(\d))$", re.I)
 # Timer 0 prescalers, smallest first, with their CS02:CS00 bits. The tick wants
 # an EXACT millisecond, so the emitter picks the first prescaler that divides
 # the clock evenly into 1 kHz and still fits an 8-bit compare register.
+# Which timer drives which compare output, and therefore which pins can do
+# PWM at all. D5 and D6 are OC0B/OC0A -- Timer 0 -- and Timer 0 is the
+# millisecond tick, so they are NOT offered: taking them would silently stop
+# every wait in the program.
+AVR_PWM_PINS = {
+    9:  ("OCR1A", "TCCR1A", "COM1A1", 1),
+    10: ("OCR1B", "TCCR1A", "COM1B1", 1),
+    11: ("OCR2A", "TCCR2A", "COM2A1", 2),
+    3:  ("OCR2B", "TCCR2A", "COM2B1", 2),
+}
+AVR_TICK_PINS = {5: "OC0B", 6: "OC0A"}
+# The tone is Timer 1 in CTC mode toggling OC1A, which is D9 and only D9.
+AVR_TONE_PIN = 9
+
 AVR_PRESCALERS = [(1, "_BV(CS00)"), (8, "_BV(CS01)"),
                   (64, "_BV(CS01) | _BV(CS00)"), (256, "_BV(CS02)"),
                   (1024, "_BV(CS02) | _BV(CS00)")]
@@ -1157,6 +1298,12 @@ class AvrTarget(Target):
     """
 
     toolchain = "avr-gcc"
+
+    # PORT and PART are the two the 8051 has and this does not, and both are
+    # a syntax problem rather than a hardware one: `PORT x = P0` and
+    # `PART x = 74HC595 DATA P0.0` both spell their pins the 8051 way. The
+    # ports themselves (PORTB/PORTC/PORTD) are right there.
+    supports = frozenset({"pwm", "tone", "print", "table"})
 
     # Our own tick, so we choose the width -- but 16 bits would wrap every 65 s
     # and these deadlines are compared against a free-running counter, so it is
@@ -1191,6 +1338,44 @@ class AvrTarget(Target):
             raise PseudocodeError(
                 line, f"ANALOG needs an analog input, and {label} is "
                       f"digital-only on the {self.display}; use A0-A5")
+
+        digital = int(label[1:]) if label[0] == "D" else None
+        if direction == "pwm":
+            if digital in AVR_TICK_PINS:
+                raise PseudocodeError(
+                    line, f"{label} is {AVR_TICK_PINS[digital]}, which is "
+                          f"Timer 0 -- and Timer 0 is the millisecond tick "
+                          f"every wait in the program is measured against. "
+                          f"Use D9, D10, D11 or D3.")
+            if digital not in AVR_PWM_PINS:
+                usable = ", ".join(f"D{n}" for n in sorted(AVR_PWM_PINS))
+                raise PseudocodeError(
+                    line, f"PWM on the {self.display} is only on the timer "
+                          f"compare outputs: {usable}. {label} is "
+                          f"digital-only.")
+            for other in program.pins.values():
+                if other.direction == "tone" and AVR_PWM_PINS[digital][3] == 1:
+                    raise PseudocodeError(
+                        line, f"PWM on {label} and the TONE pin "
+                              f"{other.name!r} both need Timer 1. Use D11 or "
+                              f"D3 for PWM instead -- those are Timer 2.")
+        if direction == "tone":
+            if digital != AVR_TONE_PIN:
+                raise PseudocodeError(
+                    line, f"the tone is Timer 1 toggling OC1A, so it can only "
+                          f"be D{AVR_TONE_PIN} on the {self.display}, "
+                          f"not {label}")
+            for other in program.pins.values():
+                if other.direction == "tone":
+                    raise PseudocodeError(
+                        line, f"only one TONE pin ({other.name!r} already has "
+                              f"it): there is one Timer 1")
+                if other.direction == "pwm" and other.where[0] == "D" \
+                        and AVR_PWM_PINS.get(int(other.where[1:]), (0, 0, 0, 0))[3] == 1:
+                    raise PseudocodeError(
+                        line, f"a TONE pin and PWM on {other.where} both need "
+                              f"Timer 1 -- {other.name!r} would stop fading "
+                              f"while a note sounds. Move it to D11 or D3.")
         return AvrPin(name, label, direction, active_low, port, bit, channel)
 
     def _bit(self, pin) -> str:
@@ -1213,6 +1398,25 @@ class AvrTarget(Target):
 
     def read_analog(self, pin):
         return f"adc_read({pin.channel})"
+
+    def _pwm(self, pin):
+        return AVR_PWM_PINS[int(pin.where[1:])]
+
+    def write_pwm(self, pin, value: str) -> str:
+        # The compare register holds the proportion of time the PIN is high;
+        # the AST stores the percentage of time the LOAD is on. Same number
+        # only on an active-high pin, and the outer parentheses matter.
+        register = self._pwm(pin)[0]
+        duty = f"(100 - ({value}))" if pin.active_low else f"({value})"
+        return f"{register} = ({duty} * 255) / 100;"
+
+    def write_tone(self, pin, hz: str) -> str:
+        return f"bw_tone({hz});"
+
+    def write_print(self, node) -> str:
+        if node.value is None:
+            return f'bw_print("{_c_string(node.text)}");'
+        return f"bw_print_num({node.value});"
 
     # ---- time -----------------------------------------------------------
     def delay(self, ms):
@@ -1278,6 +1482,91 @@ class AvrTarget(Target):
                 "}",
                 "",
             ]
+        if program.tables:
+            out += [
+                "/* Lookup tables. A plain `const` array on an AVR is copied",
+                " * from flash into RAM at startup -- the Harvard split means",
+                " * `[]` cannot read flash directly. PROGMEM would avoid that,",
+                " * but the index expression is shared with the other targets",
+                " * and would have to become a target hook to say pgm_read_byte.",
+                " * A font costs tens of bytes; a big table is the case that",
+                " * would justify the hook. */",
+            ]
+            for name, values in program.tables.items():
+                body = ", ".join(f"0x{v:02X}" for v in values)
+                out.append(f"static const unsigned char bw_tab_{name}[] "
+                           f"= {{ {body} }};")
+            out += [
+                "",
+                "/* A computed index is clamped rather than trusted: reading",
+                " * past a table gives a plausible-looking wrong byte. */",
+                "static unsigned char bw_clamp(int i, unsigned char last)",
+                "{",
+                "    if (i < 0) return 0;",
+                "    if (i > (int)last) return last;",
+                "    return (unsigned char)i;",
+                "}",
+                "",
+            ]
+
+        if program.tone_pin is not None:
+            out += [
+                "/* Tone: Timer 1 in CTC mode toggling OC1A, so the frequency",
+                " * is F_CPU/(2*8*(OCR1A+1)) and the whole audible band is",
+                " * reachable. Toggling in hardware costs no interrupts and",
+                " * does not drift, which a software square wave would while",
+                " * the scheduler is busy elsewhere.",
+                " *",
+                " * This takes Timer 1 outright, which is why PWM on D9 and",
+                " * D10 is refused in the same program. */",
+                "static void bw_tone(unsigned int hz)",
+                "{",
+                "    if (hz) {",
+                "        OCR1A  = (unsigned int)(F_CPU / 16UL / (unsigned long)hz - 1UL);",
+                "        TCCR1A = _BV(COM1A0);          /* toggle OC1A on match */",
+                "        TCCR1B = _BV(WGM12) | _BV(CS11);",
+                "    } else {",
+                "        TCCR1A = 0;                    /* release the pin */",
+                "        TCCR1B = 0;",
+                "        PORTB &= (unsigned char)~_BV(PB1);",
+                "    }",
+                "}",
+                "",
+            ]
+
+        if program.uses_uart:
+            out += [
+                "/* Serial console on USART0, 8N1. Blocking on UDRE0 is",
+                " * deliberate: a ring buffer costs RAM this part has little of,",
+                " * and a dropped diagnostic is worse than a slow one. */",
+                "static void bw_putc(char c)",
+                "{",
+                "    while (!(UCSR0A & _BV(UDRE0))) ;",
+                "    UDR0 = (unsigned char)c;",
+                "}",
+                "",
+                "static void bw_print(const char *s)",
+                "{",
+                "    while (*s) bw_putc(*s++);",
+                "    bw_putc('\\r');",
+                "    bw_putc('\\n');",
+                "}",
+                "",
+                "static void bw_print_num(int v)",
+                "{",
+                "    char buffer[7];",
+                "    unsigned char i = 0;",
+                "    unsigned int u;",
+                "    if (v < 0) { bw_putc('-'); u = (unsigned int)(-v); }",
+                "    else u = (unsigned int)v;",
+                "    do { buffer[i++] = (char)('0' + (u % 10)); u /= 10; } while (u);",
+                "    while (i) bw_putc(buffer[--i]);",
+                "    bw_putc('\\r');",
+                "    bw_putc('\\n');",
+                "}",
+                "",
+            ]
+
         if program.uses_adc:
             out += [
                 "/* 10-bit ADC, polled, AVcc as reference. The prescaler is set",
@@ -1306,6 +1595,11 @@ class AvrTarget(Target):
                     # the pin high while it is not pressed.
                     out.append(f"    PORT{pin.port} |= {self._bit(pin)};"
                                f"   /* {pin.name} pull-up */")
+            elif pin.direction in ("pwm", "tone"):
+                # Both drive the pin from a timer, and a compare output only
+                # reaches the pad if the pin is configured as an output.
+                out.append(f"    DDR{pin.port} |= {self._bit(pin)};"
+                           f"   /* {pin.name} ({pin.direction}) */")
             else:
                 out.append(f"    DDR{pin.port} &= (unsigned char)~{self._bit(pin)};"
                            f"   /* {pin.name} analog in */")
@@ -1313,6 +1607,37 @@ class AvrTarget(Target):
             if pin.direction == "output":
                 out.append("    " + self.write_pin(pin, pin.active_low)
                            + f"   /* {pin.name} off */")
+
+        pwm_pins = [p for p in program.pins.values() if p.direction == "pwm"]
+        if pwm_pins:
+            out.append("")
+            timers = {}
+            for pin in pwm_pins:
+                _reg, control, com, timer = self._pwm(pin)
+                timers.setdefault(timer, (control, []))[1].append(com)
+            for timer in sorted(timers):
+                control, coms = timers[timer]
+                enable = " | ".join(f"_BV({c})" for c in sorted(coms))
+                # Fast PWM, 8-bit, /64 -- about 980 Hz on Timer 2 and 490 Hz
+                # on Timer 1, which is what the Arduino core picks too and is
+                # well above anything an LED or a motor driver cares about.
+                if timer == 1:
+                    out += [f"    {control} = {enable} | _BV(WGM10);",
+                            "    TCCR1B = _BV(WGM12) | _BV(CS11) | _BV(CS10);"]
+                else:
+                    out += [f"    {control} = {enable} | _BV(WGM20) | _BV(WGM21);",
+                            "    TCCR2B = _BV(CS22);"]
+            for pin in pwm_pins:
+                out.append("    " + self.write_pwm(pin, "0")
+                           + f"   /* {pin.name} off */")
+
+        if program.uses_uart:
+            out += ["",
+                    "    /* USART0, 8N1. UBRR0 is the divisor for the baud",
+                    "     * rate, derived from F_CPU at compile time. */",
+                    f"    UBRR0 = (unsigned int)(F_CPU / 16UL / {BW_BAUD}UL - 1UL);",
+                    "    UCSR0B = _BV(TXEN0);",
+                    "    UCSR0C = _BV(UCSZ01) | _BV(UCSZ00);"]
 
         if program.uses_adc:
             out += ["",

@@ -32,6 +32,8 @@ jobs:
       # it says, and that ACTIVE LOW reaches the pin inverted.
       - name: micro:bit — run the generated MicroPython
         run: python3 ./scripts/test-microbit.py
+      - name: Parity — every target, every feature, exercised
+        run: python3 ./scripts/test-parity.py
       - name: Peripherals (PWM, tone, print)
         run: python3 ./scripts/test-peripherals.py
       - name: Tables and whole-port I/O
@@ -86,7 +88,8 @@ jobs:
           # headers, and a part whose header was trimmed away fails HERE
           # rather than in production.
           for mcu in atmega328p atmega168p; do
-            for f in scripts/golden/avr.c scripts/golden/avr-scripts.c; do
+            for f in scripts/golden/avr.c scripts/golden/avr-scripts.c \
+                     scripts/golden/avr-parity.c; do
               echo "== $mcu  $f"
               # -Werror is the point: generated code that needs a warning
               # suppressed at the call site is generated code with a defect.
