@@ -266,6 +266,7 @@ DEVICE STC12C5A60S2:
 | Form | Notes |
 |---|---|
 | `DEVICE <part>:` | optional wrapper, like `SPRITE Name:` |
+| `NAME <word>` | what the generated file is called: `blink.ino`, `blink.hex` |
 | `CLOCK <hz>` / `CLOCK <n> MHz` | overrides the `fosc` request field |
 | `PIN <name> = P1.0 OUTPUT [ACTIVE LOW]` | `ACTIVE LOW` makes `turn on` drive 0 |
 | `PIN <name> = P3.2 INPUT [ACTIVE LOW]` | readable in expressions |
@@ -422,7 +423,10 @@ curl -X POST https://stc-compiler.vercel.app/download \
 Two things about the file itself:
 
 - **The Arduino IDE wants a sketch in a folder of the same name**, so `main.ino`
-  belongs in `main/`. The IDE offers to move it there when you open it.
+  belongs in `main/`. The IDE offers to move it there when you open it. Add a
+  `NAME blink` line and you get `blink.ino` instead, which makes the folder
+  read sensibly; the name is restricted to letters, digits, `_` and `-`,
+  because it is echoed into a `Content-Disposition` header.
 - `#include <Arduino.h>` is emitted even though the IDE would add it. That is
   deliberate: the same file then also builds with `arduino-cli` or a plain C++
   toolchain, instead of only inside the IDE.

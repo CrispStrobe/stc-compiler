@@ -578,6 +578,35 @@ check("the UI offers the AVR parts",
 # Without this branch the browser shows "failed" for a micro:bit or an Arduino
 # and leaves Download disabled, so the generated source is unreachable from
 # the page the service is served on.
+# NAME decides the filename, and the strict character set matters because the
+# string is echoed into a Content-Disposition header.
+NAMED = """DEVICE ARDUINO-UNO:
+  NAME blink
+  PIN led = D13 OUTPUT
+  WHEN started:
+    turn on led
+"""
+request = urllib.request.Request(
+    f"{BASE}/download", json.dumps({"code": NAMED, "language": "pseudocode"}).encode(),
+    {"Content-Type": "application/json"})
+with urllib.request.urlopen(request, timeout=120) as response:
+    check("NAME renames the download", 'filename="blink.ino"'
+          in response.headers.get("Content-Disposition", ""),
+          response.headers.get("Content-Disposition", ""))
+
+result, _ = post({"code": NAMED.replace("ARDUINO-UNO", "ATMEGA328P")
+                             .replace("turn on led", "turn on led"),
+                  "language": "pseudocode"})
+check("NAME renames a compiled image too",
+      result.get("success") is True and result.get("filename") == "blink.hex",
+      str(result.get("filename")))
+
+result, _ = post({"code": NAMED.replace("NAME blink", "NAME ../../etc/passwd"),
+                  "language": "pseudocode"})
+check("a path traversal in NAME is refused",
+      result.get("success") is False and "do not understand" in (result.get("error") or ""),
+      (result.get("error") or "")[:60])
+
 check("the UI treats source-only as a result, not a failure",
       "source only, needs" in page and "data.c && data.toolchain" in page)
 

@@ -1,0 +1,10 @@
+DEVICE ARDUINO-UNO:
+  NAME blink
+  CLOCK 16000000
+
+  PIN led = D13 OUTPUT
+
+  WHEN started:
+    FOREVER:
+      toggle led
+      wait 500 ms

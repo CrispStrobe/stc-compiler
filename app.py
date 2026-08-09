@@ -197,7 +197,7 @@ class CompileReq(BaseModel):
 
 
 def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
-              f_cpu: int | None) -> dict:
+              f_cpu: int | None, stem: str = "main") -> dict:
     """Compile C for an ATmega with avr-gcc, and return an Intel HEX image.
 
     Deliberately the same response shape as the SDCC path -- base64 image,
@@ -274,11 +274,13 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
     try:
         objcopy = os.path.join(bin_dir, "avr-objcopy")
         if req.format == "bin":
-            out, name, args = os.path.join(work, "main.bin"), "main.bin", ["-O", "binary"]
+            out, name, args = (os.path.join(work, "main.bin"),
+                               f"{stem}.bin", ["-O", "binary"])
         else:
             # "ihx" and "hex" are one format here: avr-objcopy emits Intel HEX
             # directly, so there is no packihx step to distinguish them.
-            out, name, args = os.path.join(work, "main.hex"), "main.hex", ["-O", "ihex"]
+            out, name, args = (os.path.join(work, "main.hex"),
+                               f"{stem}.hex", ["-O", "ihex"])
         subprocess.run([objcopy, *args, "-R", ".eeprom", elf, out],
                        capture_output=True, timeout=10, env=env)
         if not os.path.exists(out):
@@ -333,6 +335,7 @@ def build(req: CompileReq) -> dict:
     if len(req.code.encode("utf-8")) > MAX_SOURCE_BYTES:
         return {"success": False, "error": "source too large"}
 
+    stem = "main"
     generated_c = None
     keil_changes: dict = {}
     keil_unresolved: list = []
@@ -347,13 +350,14 @@ def build(req: CompileReq) -> dict:
         # not the request's `target` field -- decides which toolchain the
         # generated source needs, because it is what decided the dialect.
         chip = program.target
+        stem = program.name or "main"
         req = req.model_copy(update={"code": generated_c})
         # The pseudocode's own CLOCK wins; the clock is already baked into the
         # generated C as FOSC_HZ or F_CPU, and defining it twice is a warning
         # at best.
         req = req.model_copy(update={"fosc": None})
         if chip.toolchain == "avr-gcc":
-            return build_avr(req, AVR_TARGETS[chip.key], generated_c, None)
+            return build_avr(req, AVR_TARGETS[chip.key], generated_c, None, stem)
         if chip.toolchain != "sdcc-mcs51":
             return {"success": False, "stage": "compile",
                     "error": f"{chip.display} transpiles here, but building it "
@@ -363,7 +367,7 @@ def build(req: CompileReq) -> dict:
                     "c": generated_c,
                     "toolchain": chip.toolchain,
                     "language": stc_pseudocode.source_language(program),
-                    "filename": f"main.{chip.source_extension}"}
+                    "filename": f"{stem}.{chip.source_extension}"}
     elif req.language.lower() in ("keil", "c51"):
         stage_toolchain()      # SFR addresses come from the staged SDCC headers
         result = keil2sdcc.translate(req.code)
@@ -453,15 +457,15 @@ def build(req: CompileReq) -> dict:
 
     try:
         if req.format == "ihx":
-            out, name = ihx, "main.ihx"
+            out, name = ihx, f"{stem}.ihx"
         elif req.format == "hex":
-            out, name = os.path.join(work, "main.hex"), "main.hex"
+            out, name = os.path.join(work, "main.hex"), f"{stem}.hex"
             with open(out, "w", encoding="utf-8") as handle:
                 packed = subprocess.run([os.path.join(STAGE_BIN, "packihx"), ihx],
                                         capture_output=True, text=True, timeout=10)
                 handle.write(packed.stdout)
         else:
-            out, name = os.path.join(work, "main.bin"), "main.bin"
+            out, name = os.path.join(work, "main.bin"), f"{stem}.bin"
             subprocess.run([os.path.join(STAGE_BIN, "makebin"), "-p", ihx, out],
                            capture_output=True, timeout=10)
 
@@ -748,6 +752,7 @@ async def transpile_only(req: CompileReq):
         # field keeps its name so existing callers keep working, and this says
         # what is actually in it.
         "language": stc_pseudocode.source_language(program),
+        "filename": f"{program.name or 'main'}.{program.target.source_extension}",
         "part": program.part,
         "clock": program.clock,
         # `where` is the target-neutral location token ("P1.0", "D13", "A0").

@@ -1384,6 +1384,11 @@ TARGETS = {
 class Program:
     part: str = "stc12c5a60s2"
     clock: int = 11059200
+    # What to call the generated file. Empty means "main", which is what every
+    # program was called before NAME existed. The Arduino IDE in particular
+    # wants a sketch folder named after the sketch, so `blink.ino` in `blink/`
+    # beats `main.ino` in `main/`.
+    name: str = ""
     pins: dict = field(default_factory=dict)
     variables: list = field(default_factory=list)
     procedures: dict = field(default_factory=dict)
@@ -1806,6 +1811,11 @@ PORT_DECL_RE = re.compile(r"port\s+(\w+)\s*=\s*P([0-4])\s+(output|input)"
                           r"(?:\s+active\s+(low|high))?", re.I)
 TABLE_RE = re.compile(r"table\s+(\w+)\s*=\s*(.+)$", re.I)
 CLOCK_RE = re.compile(r"clock\s+([\d_]+)\s*(hz|mhz)?", re.I)
+# Deliberately strict, and not only for tidiness: this string is handed back in
+# a Content-Disposition header and used as a filename. Letters, digits,
+# underscore and dash, starting with a letter or underscore -- no dots, no
+# separators, no quotes, nothing that can escape either context.
+PROGRAM_NAME_RE = re.compile(r"name\s+([A-Za-z_][A-Za-z0-9_-]{0,39})\s*", re.I)
 
 
 def parse(source: str) -> Program:
@@ -1841,6 +1851,12 @@ def parse(source: str) -> Program:
     while index < len(lines):
         line = lines[index]
         text, lowered = line.text, line.text.lower()
+
+        named = PROGRAM_NAME_RE.fullmatch(text.strip())
+        if named and not started:
+            program.name = named.group(1)
+            index += 1
+            continue
 
         clock = CLOCK_RE.fullmatch(lowered)
         if clock and not started:
@@ -1965,7 +1981,8 @@ def parse(source: str) -> Program:
 
         raise PseudocodeError(
             line.number, f"do not understand {text!r}"
-            + ("" if started else " (expected CLOCK, PIN, DEFINE or WHEN started:)"))
+            + ("" if started else " (expected NAME, CLOCK, PIN, DEFINE or "
+                                  "WHEN started:)"))
 
     if not started:
         raise PseudocodeError(lines[-1].number, "no 'WHEN started:' block")
@@ -2100,7 +2117,10 @@ def emit_pseudocode(program: Program) -> str:
     emitting again gives exactly the same text.
     """
     active_low = {pin.name: pin.active_low for pin in program.pins.values()}
-    out = [f"DEVICE {program.part.upper()}:", f"  CLOCK {program.clock}"]
+    out = [f"DEVICE {program.part.upper()}:"]
+    if program.name:
+        out.append(f"  NAME {program.name}")
+    out.append(f"  CLOCK {program.clock}")
     if program.tables:
         out.append("")
         for name, values in program.tables.items():

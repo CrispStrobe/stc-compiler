@@ -231,6 +231,19 @@ WHEN started:
       turn off spk
 """,
 
+    # NAME decides what the generated file is called. It round-trips like any
+    # other header line, and the strict character set is not tidiness: the
+    # string ends up in a Content-Disposition header and as a filename.
+    "named": """DEVICE ARDUINO-UNO:
+  NAME blink
+  CLOCK 16000000
+  PIN led = D13 OUTPUT
+  WHEN started:
+    FOREVER:
+      toggle led
+      wait 500 ms
+""",
+
     "microbit-once": """DEVICE MICROBIT:
   CLOCK 16000000
   PIN led = P0 OUTPUT
