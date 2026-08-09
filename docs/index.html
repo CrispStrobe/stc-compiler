@@ -265,6 +265,7 @@ async function boot() {
     py.runPython(GLUE);
     const devices = JSON.parse(py.globals.get('bw_devices')());
     $('go').disabled = false;
+    checkApiAge(devices);
     setStatus(devices.length + ' devices ready — everything below runs in this page', 'ok');
     $('out').textContent =
       'Ready.\n\nDevices:\n' +
@@ -352,7 +353,8 @@ $('hex').onclick = async () => {
     });
     const data = await response.json();
     if (!data.success) {
-      setStatus('the compiler refused: ' + (data.error || 'unknown'), 'err');
+      setStatus('the compiler refused: ' + (data.error || 'unknown')
+                + (apiWarning ? ' — note: ' + apiWarning : ''), 'err');
       $('out').textContent = data.error || 'unknown error';
     } else {
       const binary = atob(data.base64);
@@ -369,6 +371,30 @@ $('hex').onclick = async () => {
   }
   $('hex').disabled = false;
 };
+
+// ---- is the hosted compiler as new as this page? -------------------------
+//
+// Pages redeploys on every push; the API is behind a daily deployment cap, so
+// the two CAN diverge -- and when they do, a program transpiles here with a
+// device the compiler has never heard of and Compile to .hex fails for a
+// reason that looks like a bug in the program. Comparing device lists costs
+// one request and needs no version stamping on either side.
+let apiWarning = '';
+async function checkApiAge(local) {
+  try {
+    const response = await fetch(API + '/health');
+    const health = await response.json();
+    const theirs = new Set(health.devices || []);
+    const missing = local.map(d => d.key).filter(k => !theirs.has(k));
+    if (missing.length) {
+      apiWarning = `the hosted compiler is older than this page and does not `
+                 + `know ${missing.join(', ')} — Compile to .hex will refuse those`;
+      setStatus(apiWarning, 'err');
+    }
+  } catch {
+    apiWarning = '';       // offline is fine; only compiling needs the API
+  }
+}
 
 // ---- flashing ------------------------------------------------------------
 // Web Serial is Chromium-only and needs a secure context, which GitHub Pages

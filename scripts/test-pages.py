@@ -57,6 +57,8 @@ if index.exists():
     check("the flasher is wired in", "flash.js" in page and "id=flash" in page)
     check("Web Serial absence is explained rather than left as a dead button",
           "'serial' in navigator" in page)
+    check("the page notices when the hosted compiler is older than it is",
+          "checkApiAge" in page and "/health" in page)
 check("flash.js is present", (DOCS / "flash.js").exists())
 check(".nojekyll is present (Jekyll would drop dotfiles and mangle paths)",
       (DOCS / ".nojekyll").exists())
