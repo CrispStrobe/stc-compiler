@@ -589,10 +589,16 @@ NAMED = """DEVICE ARDUINO-UNO:
 request = urllib.request.Request(
     f"{BASE}/download", json.dumps({"code": NAMED, "language": "pseudocode"}).encode(),
     {"Content-Type": "application/json"})
-with urllib.request.urlopen(request, timeout=120) as response:
-    check("NAME renames the download", 'filename="blink.ino"'
-          in response.headers.get("Content-Disposition", ""),
-          response.headers.get("Content-Disposition", ""))
+try:
+    with urllib.request.urlopen(request, timeout=120) as response:
+        check("NAME renames the download", 'filename="blink.ino"'
+              in response.headers.get("Content-Disposition", ""),
+              response.headers.get("Content-Disposition", ""))
+except urllib.error.HTTPError as exc:
+    # A failing check must stay a check. Letting the HTTPError out aborts the
+    # whole suite and hides every test after it, which is how one unsupported
+    # feature on an older deployment looks like total collapse.
+    check("NAME renames the download", False, f"HTTP {exc.code}")
 
 result, _ = post({"code": NAMED.replace("ARDUINO-UNO", "ATMEGA328P")
                              .replace("turn on led", "turn on led"),
