@@ -516,6 +516,16 @@ checks every address against the linker's `.map`, an artefact this tool never
 reads: agreeing with the `.cdb` alone would only prove the parser is
 self-consistent.
 
+When the C came from a Brickwright project — `sb3-creator`'s
+`generateC(project, {debug: true})` — it also carries an `@bw yield` header
+naming the **Scratch block** behind each `case` label, and those ids are merged
+into `yields[].block`. That is what lets a front end highlight the block a
+halted program is sitting on instead of showing a state number. A map that
+disagrees with the `case` labels in the same file is refused rather than
+merged: pointing at a confidently wrong block is worse than pointing at
+nothing. Hand-written firmware has no such header, no `block` keys, and no
+error.
+
 ---
 
 ## Calling it
