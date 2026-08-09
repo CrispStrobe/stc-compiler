@@ -217,6 +217,16 @@ class Toggle(Stmt):
 class Wait(Stmt):
     amount: Expr
     unit: str                   # "seconds" | "ms"
+    # The source line, so a target whose clock cannot express this wait can point
+    # at it. Defaults to 0 for hand-built nodes; every parsed Wait carries the
+    # real line.
+    #
+    # `compare=False` because this is provenance, not meaning. The round-trip
+    # tests assert that decompiling and re-parsing yields an equal AST, and two
+    # programs that differ only in which line a wait sits on are the same
+    # program — without this, adding the field failed 20 round-trips that had
+    # nothing wrong with them.
+    line: int = field(default=0, compare=False)
 
 
 @dataclass
@@ -466,6 +476,18 @@ class Target:
     # casting that to a 16-bit int would make every deadline past 32 s wrong.
     time_type = "unsigned int"
     time_signed = "int"
+
+    # The shortest wait this target can actually produce, in milliseconds, and
+    # the name to blame in the refusal. Every target's delay primitive counts
+    # whole milliseconds today, so the floor is 1 -- but it is stated here
+    # rather than assumed in the portable layer because it is precisely a fact
+    # about the target's clock, and a board with a microsecond delay would set
+    # it lower. A wait under the floor is refused by name: rounding it up
+    # invents time the user did not ask for, and rounding it down (which is
+    # what unguarded arithmetic does) deletes the wait entirely and leaves a
+    # program that compiles, flashes, and does something else.
+    wait_floor_ms = 1.0
+    wait_floor_reason = "the millisecond delay"
 
     # ---- pins -----------------------------------------------------------
     def shift_helper(self, part) -> list[str]:
@@ -2128,7 +2150,7 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
     wait = re.fullmatch(r"wait\s+(.+?)\s*(seconds?|secs?|s|ms|milliseconds?)", lowered)
     if wait:
         unit = "ms" if wait.group(2).startswith("m") else "seconds"
-        return Wait(expression(wait.group(1), program, line), unit)
+        return Wait(expression(wait.group(1), program, line), unit, line)
 
     turn = re.fullmatch(r"turn\s+(on|off)\s+(\w+)", lowered)
     if turn:
@@ -2734,12 +2756,67 @@ def expr_c(node: Expr, ctx: Emit, parent_level: int = -1) -> str:
 
 
 def ms_of(node: Wait, ctx: Emit) -> str:
-    """A Wait in milliseconds, folded to a constant where it can be."""
-    if isinstance(node.amount, Num):
-        value = node.amount.value
-        return str(int(round(value * 1000 if node.unit == "seconds" else value)))
+    """A Wait in milliseconds, folded to a constant where it can be.
+
+    Refuses a wait the target's clock cannot express, rather than quietly
+    substituting one it can. The floor and the reason both come from the target
+    (`wait_floor_ms`), because how short a wait can be is a fact about the board,
+    not about this walker.
+
+    Below the floor, unguarded arithmetic rounds to zero and the wait vanishes:
+    the loop then runs at full speed with nothing anywhere to say it changed.
+    That is the worst kind of wrong — it compiles, it flashes, and it does
+    something other than what it says. Rounding up instead is no better; it
+    invents time the user did not ask for. So neither: name it and stop.
+
+    The boundary is the floor *inclusive*, because Python rounds halves to even,
+    so `round(0.5) == 0`. Half a millisecond is a perfectly reasonable scan dwell
+    to write, and it is the case someone actually hits.
+    """
+    constant = _const_value(node.amount)
+    if constant is not None:
+        ms = constant * 1000 if node.unit == "seconds" else constant
+        folded = int(round(ms))
+        floor = ctx.target.wait_floor_ms
+        # `wait 0` is a deliberate yield and stays legal; what has to be caught
+        # is a nonzero wait collapsing into nothing.
+        if ms > 0 and folded == 0:
+            raise PseudocodeError(
+                node.line,
+                f"wait {_trim(ms)} ms is shorter than {ctx.target.display} can "
+                f"express: {ctx.target.wait_floor_reason} has "
+                f"{_trim(floor)} ms resolution, so this would compile to no "
+                f"wait at all. Use {_trim(floor)} ms or more.")
+        if ms < 0:
+            raise PseudocodeError(
+                node.line,
+                f"wait {_trim(ms)} ms is negative. A wait count is unsigned, so "
+                f"rather than waiting no time this would wrap to a very long "
+                f"one.")
+        return str(folded)
     inner = expr_c(node.amount, ctx, UNARY_LEVEL)
     return inner if node.unit == "ms" else f"(unsigned int)(({inner}) * 1000)"
+
+
+def _trim(value: float) -> str:
+    """Format a millisecond count without a trailing `.0` on whole numbers."""
+    return f"{value:g}"
+
+
+def _const_value(node: Expr) -> float | None:
+    """The literal value of `node`, or None if it is not a constant.
+
+    `wait -1 seconds` parses as Unary('-', Num(1)), not as a negative Num, so a
+    plain isinstance check on Num misses it and the negative falls through to the
+    runtime path — where `(unsigned int)(-1 * 1000)` wraps to a 64.5-second wait.
+    Folding the unary minus here is what makes the negative check reachable at all.
+    """
+    if isinstance(node, Num):
+        return node.value
+    if isinstance(node, Unary) and node.op == "-":
+        inner = _const_value(node.operand)
+        return None if inner is None else -inner
+    return None
 
 
 def stmts_c(body: list, depth: int, ctx: Emit) -> list[str]:
