@@ -5,3 +5,16 @@ __pycache__/
 
 # Agent context: local paths and operational detail, not for the public repo.
 CLAUDE.md
+
+# The vendored AVR toolchain is COMMITTED, like SDCC's bin/ + share/ before
+# it. Vercel deploys from git and vercel.json's legacy `builds` config bundles
+# the project directory, so anything not in git is not in the function.
+#
+# 32 MB, built by ./scripts/fetch-avr-gcc.sh and verified by the avr-bundle
+# job in CI. Already trimmed: no cc1plus, no lto1, one multilib, and 2 of
+# avr-libc's 267 device headers. What is left is cc1 (12 MB) and the
+# binutils, neither of which compresses away.
+#
+# Rebuild it with the script rather than editing it by hand; CI rebuilds it
+# from scratch on every push, so a hand-patched tree would be silently
+# replaced anyway.

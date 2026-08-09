@@ -44,6 +44,6 @@ void main(void)
         } else {
             P2_7 = 1;
         }
-        while (!(!P3_4)) ;
+        while (!(!P3_4)) { }
     }
 }

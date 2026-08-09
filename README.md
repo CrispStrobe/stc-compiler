@@ -264,6 +264,12 @@ DEVICE STC12C5A60S2:
 | `PIN <name> = P1.0 OUTPUT [ACTIVE LOW]` | `ACTIVE LOW` makes `turn on` drive 0 |
 | `PIN <name> = P3.2 INPUT [ACTIVE LOW]` | readable in expressions |
 | `PIN <name> = P1.2 ANALOG` | 10-bit ADC; channel *n* is on `P1.n`, so P1 only |
+
+The location on the right of the `=` is whatever the `DEVICE` calls a pin, and
+the device checks it: `P0.0`–`P4.7` on the 8051 parts, `D0`–`D13` and `A0`–`A5`
+on an Arduino Uno. Asking for something the board cannot do is a parse error
+naming the board, not a miscompile.
+
 | `DEFINE <name> (a) (b):` | procedure; callable as `name 3, 80` or `name(3, 80)` |
 | `WHEN started:` | also accepts `WHEN flag clicked:` |
 | `FOREVER:` · `REPEAT n:` · `IF c THEN:` / `ELSE:` | indentation-scoped |
@@ -316,9 +322,15 @@ if the right operand of a binary node is not re-emitted one level tighter,
 | `stc89c52rc` | `--iram-size 256 --xram-size 256 --code-size 8192` (12T) |
 | `stc15f2k60s2` | `--iram-size 256 --xram-size 1792 --code-size 61440` (1T) |
 | `mcs51` | none — bring your own via `options` |
+| `atmega328p` | avr-gcc, `-mmcu=atmega328p`, 32 KB flash |
+| `atmega168p` | avr-gcc, `-mmcu=atmega168p`, 16 KB flash |
 
-Every target compiles `-mmcs51 --std-c99`. Adding a part is three lines in
-`TARGETS` in [`app.py`](app.py).
+The 8051 targets compile `-mmcs51 --std-c99`; adding a part is three lines in
+`TARGETS` in [`app.py`](app.py). The AVR targets route to a second toolchain
+entirely (`AVR_TARGETS`), and `/compile` picks between them from the `DEVICE`
+line for pseudocode, or the `target` field for hand-written C. `/health`
+reports both, and reports the AVR side as absent rather than failing when the
+bundle is not deployed.
 
 The pseudocode front end is part-aware too: `DEVICE STC89C52RC:` emits code
 without port-mode registers or the AUXR 1T bit, refuses `ANALOG` pins (no
@@ -327,6 +339,84 @@ count identically, so the same program is timing-correct across families.
 Several `WHEN started:` blocks compile to a cooperative scheduler (Timer-0
 millisecond tick, one state machine per script, a yield at every wait and
 every loop iteration — Scratch's own contract).
+
+### Beyond the 8051
+
+`DEVICE ARDUINO-UNO:` and `DEVICE ARDUINO-NANO:` emit Arduino core C++ —
+`pinMode`/`digitalWrite`/`analogRead`, the script in `setup()`, cooperative
+tasks dispatched from `loop()`. The scheduler contract survives the move
+unchanged, because `millis()` *is* the millisecond tick the 8051 back end had
+to build by hand; the Arduino target ships no runtime of its own at all. What
+does change is the width of it: `millis()` is 32-bit, so the deadlines and the
+wraparound compare widen with it, and that type comes from the target rather
+than from the AST walker.
+
+**Core C++ transpiles here; it does not compile here.** SDCC cannot build it
+and `arduino-cli` plus the AVR core is ~250 MB against Vercel's 250 MB
+function limit. `POST /compile` with an Arduino `DEVICE` is refused, naming
+the toolchain it would need, and returns the generated source anyway.
+
+`DEVICE ATMEGA328P:` is the same board **without** the core, and that one does
+compile here — see below.
+
+### AVR: the same boards, compiled
+
+| `DEVICE` / `target` | Emits | Compiles here |
+|---|---|---|
+| `arduino-uno`, `arduino-nano` | Arduino core C++ | no — paste into the IDE |
+| `atmega328p`, `atmega168p` | bare AVR C | **yes**, via avr-gcc |
+
+An ATmega328P *is* an Uno, and pins keep the board's labels (`D13`, `A0`; port
+names like `PB5` are accepted and canonicalised), so a program moves between
+the two devices unchanged and only the generated C differs. What changes is
+what the C does: the generator knows the pin at emit time, so
+
+```
+turn on led     ->   PORTB |= _BV(PB5);        /* one instruction */
+toggle led      ->   PINB = _BV(PB5);          /* hardware toggle, no RMW */
+```
+
+instead of the core's `digitalWrite`, which resolves the port through a
+PROGMEM table and checks for a PWM channel to disable on every call. A
+two-script scheduler with an ADC read comes out at **638 bytes**.
+
+Timer 0 runs in CTC mode at exactly 1 kHz — the emitter picks the prescaler
+and compare value that divide the declared `CLOCK` evenly, and refuses a clock
+that cannot produce an exact millisecond rather than silently drifting.
+
+Building the toolchain bundle:
+
+```bash
+./scripts/fetch-avr-gcc.sh    # ~33 MB: avr-gcc, binutils, avr-libc (avr5 only)
+./scripts/verify-avr.sh       # MUST run on Linux — see below
+```
+
+`fetch-avr-gcc.sh` lifts Debian **bullseye** binaries out of `.deb`s, the same
+trick and the same reason as `fetch-sdcc.sh`: bullseye's `cc1` needs only
+`GLIBC_2.14`, where bookworm's needs 2.36 and would not start on Vercel's
+Amazon Linux 2023 (2.34). `cc1plus` and the other 41 multilibs are dropped;
+nothing here emits C++.
+
+The bundle is Linux x86_64, so **building it on macOS does not verify it** —
+and that gap is not theoretical. Four separate failures got through a
+successful-looking build before CI caught them: the host `as` being handed
+`-mmcu=avr5`, a missing `avr/io.h`, an absent LTO linker plugin, and `ld`'s
+linker scripts. Each one produced a 45 MB bundle that looked complete.
+
+So verification runs in CI (`.github/workflows/ci.yml`), on Linux, on every
+push: `verify-avr.sh` compiles, links and objcopies using only the vendored
+binaries, and both goldens are then built for **every** part in `AVR_TARGETS`
+under `-Werror`. The job also asserts the GLIBC floor and uploads the verified
+bundle as an artifact. To run the check by hand on any Linux box:
+
+```bash
+./scripts/fetch-avr-gcc.sh && ./scripts/verify-avr.sh
+```
+
+The Arduino core is deliberately **not** vendored: it is LGPL-2.1, and static
+linking it into an image this service hands back engages the relink
+obligation. avr-libc is BSD-3-Clause, and avr-gcc's runtime carries the GCC
+Runtime Library Exception, so compiled output is unencumbered.
 
 ## Debug symbol tables
 

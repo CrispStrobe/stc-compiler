@@ -328,7 +328,11 @@ check("ADC helper emitted", "static unsigned int adc_read" in c)
 check("analog pin -> channel", "adc_read(2)" in c)
 check("P1ASF set for the channel", "P1ASF = 0x04" in c)
 check("analog pin set high-impedance", "P1M1 |=  0x04" in c)
-check("wait until -> spin", "while (!(!P3_2)) ;" in c)
+# `{ }` and not a bare `;`: an empty statement after a while clause is what
+# GCC's -Wmisleading-indentation fires on, because the next generated line is
+# indented as though the loop guarded it. SDCC never warned, so this only
+# surfaced once the AVR target compiled the same lowering.
+check("wait until -> spin", "while (!(!P3_2)) { }" in c)
 check("REPEAT UNTIL -> negated while", "while (!(!P3_2)) {" in c)
 
 result, _ = post({"code": FULL, "language": "pseudocode"})
