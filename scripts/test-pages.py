@@ -54,6 +54,10 @@ if index.exists():
           "bw_transpile" in page and "loadPyodide" in page)
     check("compiling is delegated, and says where",
           "/compile" in page and "stc-compiler.vercel.app" in page)
+    check("the flasher is wired in", "flash.js" in page and "id=flash" in page)
+    check("Web Serial absence is explained rather than left as a dead button",
+          "'serial' in navigator" in page)
+check("flash.js is present", (DOCS / "flash.js").exists())
 check(".nojekyll is present (Jekyll would drop dotfiles and mangle paths)",
       (DOCS / ".nojekyll").exists())
 

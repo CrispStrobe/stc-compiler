@@ -99,6 +99,7 @@
       <button id=dl disabled>Download</button>
       <button id=copy disabled>Copy</button>
       <button id=hex disabled title="Sent to the hosted compiler; nothing else leaves this page">Compile to .hex</button>
+      <button id=flash disabled title="Programs an attached board over USB serial">Flash</button>
     </div>
     <pre id=out>Loading Python…</pre>
     <div id=status>starting</div>
@@ -123,7 +124,8 @@
 </footer>
 
 <script src="https://cdn.jsdelivr.net/pyodide/v314.0.3/full/pyodide.js"></script>
-<script>
+<script type=module>
+import { flashAvr } from './flash.js';
 const API = "https://stc-compiler.vercel.app";
 const $ = id => document.getElementById(id);
 let py = null, result = null, image = null;
@@ -291,11 +293,13 @@ function transpile() {
     $('out').textContent = data.error;
     setStatus(data.line ? 'line ' + data.line : 'failed', 'err');
     $('dl').disabled = $('copy').disabled = $('hex').disabled = true;
+    refreshFlash();
     return;
   }
   render();
   $('dl').disabled = $('copy').disabled = false;
   $('hex').disabled = !data.compilable;
+  refreshFlash();
   const lines = data.code.split('\n').length;
   setStatus(`${data.device} → ${data.filename} · ${lines} lines of ` +
             `${data.language === 'python' ? 'MicroPython' : 'C'}` +
@@ -358,11 +362,61 @@ $('hex').onclick = async () => {
       $('out').textContent = new TextDecoder().decode(bytes);
       $('outlabel').textContent = data.filename;
       setStatus(`${data.bytes} bytes → ${data.filename} · Download now gives the image`, 'ok');
+      refreshFlash();
     }
   } catch (err) {
     setStatus('could not reach the compiler: ' + err, 'err');
   }
   $('hex').disabled = false;
+};
+
+// ---- flashing ------------------------------------------------------------
+// Web Serial is Chromium-only and needs a secure context, which GitHub Pages
+// is. Firefox and Safari get told why rather than getting a dead button.
+const CAN_SERIAL = 'serial' in navigator;
+
+function flashable() {
+  return CAN_SERIAL && image && result && result.toolchain === 'avr-gcc';
+}
+
+function refreshFlash() {
+  $('flash').disabled = !flashable();
+  if (!CAN_SERIAL) {
+    $('flash').title = 'Web Serial is not available in this browser; '
+                     + 'Chrome or Edge can do this.';
+  } else if (result && result.toolchain === 'sdcc-mcs51') {
+    $('flash').title = 'The STC bootloader answers only after a COLD power-on, '
+                     + 'so it needs its own flow; use stcgal for now.';
+  } else if (!image) {
+    $('flash').title = 'Compile to .hex first — there is nothing to write yet.';
+  } else {
+    $('flash').title = 'Programs an attached board over USB serial';
+  }
+}
+
+$('flash').onclick = async () => {
+  if (!flashable()) return;
+  let port;
+  try {
+    port = await navigator.serial.requestPort();
+  } catch {
+    setStatus('no port chosen', 'err');
+    return;
+  }
+  $('flash').disabled = true;
+  const lines = [];
+  const log = (text) => { lines.push(text); $('out').textContent = lines.join('\n'); };
+  try {
+    setStatus('flashing…');
+    const hexText = new TextDecoder().decode(image.bytes);
+    const done = await flashAvr(port, hexText, { log });
+    setStatus(`flashed ${done.bytes} bytes and verified`, 'ok');
+  } catch (err) {
+    log('');
+    log('failed: ' + err.message);
+    setStatus('flashing failed: ' + err.message, 'err');
+  }
+  refreshFlash();
 };
 
 for (const name of Object.keys(EXAMPLES)) {

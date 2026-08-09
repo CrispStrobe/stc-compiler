@@ -161,6 +161,33 @@ the hosted API for the parts that genuinely need SDCC or avr-gcc, and says so.
 CI starts a browser and transpiles every example in it, because "the page
 loads" and "CPython starts in it and emits MicroPython" are different claims.
 
+#### Getting it onto a board
+
+| board | how | in the page? |
+|---|---|---|
+| ATmega328P / Uno / Nano | Web Serial → STK500v1 (the Arduino bootloader) | **yes** — *Flash* |
+| STC12 / STC15 | STC ISP over serial | not yet — `stcgal` |
+| micro:bit | copy the `.py`, or DAPLink | see below |
+
+*Flash* pulses DTR to reset the board into its bootloader, then programs and
+verifies it page by page. Web Serial is Chromium-only and needs a secure
+context, which Pages provides; other browsers are told why rather than given a
+dead button.
+
+The STC parts are a different interaction, not just different bytes: their ISP
+bootloader answers **only after a cold power-on** — a reset pulse will not do —
+so it needs a prompt-and-wait flow of its own. `stcgal` remains the way in.
+
+Flashing is the one step whose output cannot be checked by compiling it, so
+`scripts/test-flash.mjs` puts a simulated STK500v1 bootloader on the far end of
+the wire and asks whether its flash matches the image byte for byte. That is
+what catches word-vs-byte addressing, an off-by-one page boundary, or a
+checksum read as data — mistakes that all look identical from outside, as a
+board that does nothing.
+
+**Not verified against real hardware.** The protocol is exercised end to end
+against a simulator; no ATmega has been programmed by it.
+
 ### `GET /`
 
 A small browser UI with the blink example preloaded — no build step, no CDN.

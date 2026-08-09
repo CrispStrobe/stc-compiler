@@ -18,3 +18,4 @@ CLAUDE.md
 # Rebuild it with the script rather than editing it by hand; CI rebuilds it
 # from scratch on every push, so a hand-patched tree would be silently
 # replaced anyway.
+build-avr/
