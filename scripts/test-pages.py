@@ -93,6 +93,13 @@ if index.exists():
 
     check("compiling is delegated, and says where",
           "/compile" in page and "stc-compiler.vercel.app" in page)
+    # …and says WHICH compiler, because it is not the one the repo uses. The
+    # hosted service pins SDCC 4.0.0 (its host is glibc 2.34; 4.5.0 needs 2.36)
+    # while stc12c5a60s2-lab builds with 4.5.0. Measured on 01-blink, same C and
+    # same flags: 996 bytes from 4.5.0, 888 from 4.0.0. A user comparing the
+    # page's .hex against their own build deserves to know why they differ.
+    check("the image says which SDCC built it",
+          "apiSdcc" in page and "built by SDCC" in page)
     # Only the COMPILE is delegated. Transpiling happens here, once, and the
     # image must be built from the C the page is showing — otherwise the server
     # transpiles a second time with its own copy of the front end, and the two

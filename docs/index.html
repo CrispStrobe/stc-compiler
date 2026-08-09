@@ -415,7 +415,9 @@ $('hex').onclick = async () => {
       image = {bytes, filename: data.filename};
       $('out').textContent = new TextDecoder().decode(bytes);
       $('outlabel').textContent = data.filename;
-      setStatus(`${data.bytes} bytes → ${data.filename} · Download now gives the image`, 'ok');
+      setStatus(`${data.bytes} bytes → ${data.filename}`
+                + (apiSdcc ? ` · built by SDCC ${apiSdcc}` : '')
+                + ` · Download now gives the image`, 'ok');
       refreshFlash();
     }
   } catch (err) {
@@ -432,10 +434,22 @@ $('hex').onclick = async () => {
 // reason that looks like a bug in the program. Comparing device lists costs
 // one request and needs no version stamping on either side.
 let apiWarning = '';
+// Which SDCC built the image, shown next to it.
+//
+// Not cosmetic. The hosted service pins SDCC 4.0.0, deliberately: it runs on a
+// glibc 2.34 host and 4.5.0 needs GLIBC_2.36 and will not start there (see
+// scripts/fetch-sdcc.sh). The stc12c5a60s2-lab repo builds with 4.5.0. Same C,
+// same flags, one program — 01-blink is 996 bytes from 4.5.0 and 888 from
+// 4.0.0. So the .hex this page hands you is not the .hex `make` gives you, and
+// until now nothing said so. Naming the compiler is the honest minimum; the
+// real fix is SDCC as WebAssembly, which has no glibc to be pinned by.
+let apiSdcc = '';
 async function checkApiAge(local) {
   try {
     const response = await fetch(API + '/health');
     const health = await response.json();
+    const version = /\b(\d+\.\d+\.\d+)\b/.exec(health.sdcc || '');
+    apiSdcc = version ? version[1] : '';
     const theirs = new Set(health.devices || []);
     const missing = local.map(d => d.key).filter(k => !theirs.has(k));
     if (missing.length) {
