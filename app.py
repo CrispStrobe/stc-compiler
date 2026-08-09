@@ -234,6 +234,12 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
            # is a `case` the previous statement falls into. That is the
            # lowering, not a mistake, and SDCC does not warn about it either.
            "-Wno-implicit-fallthrough",
+           # gcc-avr 5.4 reports "promoted ~unsigned is always non-zero" for
+           # an active-low whole-port read, `(unsigned char)~PINC > 0`. The
+           # cast is what makes it a byte and the code is correct; the check
+           # fires on every spelling of the complement, so it is the check
+           # that goes rather than the expression.
+           "-Wno-sign-compare",
            "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections"]
     # Source that already sets its own clock wins: generated code bakes F_CPU
     # in, and defining it twice from the command line is a warning at best and

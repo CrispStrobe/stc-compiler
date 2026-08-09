@@ -298,13 +298,31 @@ class Port:
     is visible as ghosting rather than as a bug report.
     """
     name: str
-    port: int
+    port: int                   # opaque target-side identity, for clash checks
     direction: str              # "output" | "input"
     active_low: bool = False
+    # The location token as the target canonicalised it -- "P2" on an 8051,
+    # "D" on an AVR. Same job as Pin.where: it is what the pseudocode back end
+    # writes, so the round trip does not depend on how `port` is numbered.
+    where: str = ""
+    # Where the byte is written and where it is read. Separate because they
+    # are separate registers on an AVR: writing PORTB drives the pins, reading
+    # PORTB gives you back the latch, and only PINB gives the actual levels.
+    # On an 8051 both are the one SFR, which is why these default to it.
+    write_sfr: str = ""
+    read_sfr: str = ""
+
+    @property
+    def label(self) -> str:
+        return self.where or f"P{self.port}"
 
     @property
     def sfr(self) -> str:
-        return f"P{self.port}"
+        return self.write_sfr or f"P{self.port}"
+
+    @property
+    def read(self) -> str:
+        return self.read_sfr or self.sfr
 
 
 @dataclass
@@ -435,6 +453,15 @@ class Target:
     time_signed = "int"
 
     # ---- pins -----------------------------------------------------------
+    def resolve_port(self, program, name, where, direction, active_low,
+                     line: int) -> "Port":
+        """Turn a whole-port declaration's location token into a Port.
+
+        Only reached by targets whose `supports` includes "port"; the others
+        are refused by name before this is called.
+        """
+        raise NotImplementedError
+
     def resolve_pin(self, program, name, where, direction, active_low,
                     line: int) -> Pin:
         """Turn the declaration's opaque location token into a Pin, or explain
@@ -530,6 +557,18 @@ class Stc8051Target(Target):
         self.baud_from_brt = port_modes
 
     # ---- pins -----------------------------------------------------------
+    def resolve_port(self, program, name, where, direction, active_low, line):
+        match = re.fullmatch(r"p([0-4])", where, re.I)
+        if not match:
+            raise PseudocodeError(
+                line, f"{where.upper()} is not a port on the {self.display}; "
+                      "use P0 to P4")
+        number = int(match.group(1))
+        # One SFR both ways on an 8051: reading P2 gives the pins, writing it
+        # drives them.
+        return Port(name, number, direction, active_low, where=f"P{number}",
+                    write_sfr=f"P{number}", read_sfr=f"P{number}")
+
     def resolve_pin(self, program, name, where, direction, active_low, line):
         match = PORT_RE.match(where)
         if not match:
@@ -1299,11 +1338,10 @@ class AvrTarget(Target):
 
     toolchain = "avr-gcc"
 
-    # PORT and PART are the two the 8051 has and this does not, and both are
-    # a syntax problem rather than a hardware one: `PORT x = P0` and
-    # `PART x = 74HC595 DATA P0.0` both spell their pins the 8051 way. The
-    # ports themselves (PORTB/PORTC/PORTD) are right there.
-    supports = frozenset({"pwm", "tone", "print", "table"})
+    # PORT is here because PORTB/PORTC/PORTD are exactly what it describes.
+    # PART is not, and that is a syntax problem rather than a hardware one:
+    # `PART x = 74HC595 DATA P0.0` spells its three pins the 8051 way.
+    supports = frozenset({"pwm", "tone", "print", "table", "port"})
 
     # Our own tick, so we choose the width -- but 16 bits would wrap every 65 s
     # and these deadlines are compared against a free-running counter, so it is
@@ -1398,6 +1436,19 @@ class AvrTarget(Target):
 
     def read_analog(self, pin):
         return f"adc_read({pin.channel})"
+
+    def resolve_port(self, program, name, where, direction, active_low, line):
+        match = re.fullmatch(r"(?:port)?([b-d])", where, re.I)
+        if not match:
+            raise PseudocodeError(
+                line, f"{where.upper()} is not a port on the {self.display}; "
+                      "use B, C or D (PORTB, PORTC, PORTD)")
+        letter = match.group(1).upper()
+        # PORTx is the output latch and PINx the actual pin levels. Reading
+        # PORTx back would return what was last written, which on an input
+        # port is the pull-up configuration and not the world.
+        return Port(name, ord(letter), direction, active_low, where=letter,
+                    write_sfr=f"PORT{letter}", read_sfr=f"PIN{letter}")
 
     def _pwm(self, pin):
         return AVR_PWM_PINS[int(pin.where[1:])]
@@ -1607,6 +1658,17 @@ class AvrTarget(Target):
             if pin.direction == "output":
                 out.append("    " + self.write_pin(pin, pin.active_low)
                            + f"   /* {pin.name} off */")
+
+        for whole in program.ports.values():
+            letter = chr(whole.port)
+            if whole.direction == "output":
+                out.append(f"    DDR{letter} = 0xFF;"
+                           f"               /* {whole.name} */")
+            else:
+                out.append(f"    DDR{letter} = 0x00;")
+                if whole.active_low:
+                    out.append(f"    PORT{letter} = 0xFF;"
+                               f"              /* {whole.name} pull-ups */")
 
         pwm_pins = [p for p in program.pins.values() if p.direction == "pwm"]
         if pwm_pins:
@@ -1961,8 +2023,10 @@ def require(program: Program, feature: str, line: int, what: str) -> None:
     """Refuse a feature the target cannot emit, naming both."""
     if feature not in program.target.supports:
         raise PseudocodeError(
-            line, f"{what} is not available on the {program.target.display}: "
-                  f"this generator only emits it for the 8051 families so far")
+            line, f"{what} is not available on the {program.target.display}. "
+                  f"Devices that have it: "
+                  + ", ".join(sorted({t.display for t in TARGETS.values()
+                                      if feature in t.supports})))
 
 
 def simple_statement(text: str, program: Program, line: int) -> Stmt:
@@ -2143,7 +2207,7 @@ PIN_RE = re.compile(r"pin\s+(\w+)\s*=\s*(\S+)\s+(output|input|analog|pwm|tone)"
 PART_RE = re.compile(r"part\s+(\w+)\s*=\s*74hc595\s+data\s+P([0-4])\.([0-7])\s+"
                      r"clock\s+P([0-4])\.([0-7])\s+latch\s+P([0-4])\.([0-7])"
                      r"(?:\s+active\s+(low|high))?", re.I)
-PORT_DECL_RE = re.compile(r"port\s+(\w+)\s*=\s*P([0-4])\s+(output|input)"
+PORT_DECL_RE = re.compile(r"port\s+(\w+)\s*=\s*(\S+)\s+(output|input)"
                           r"(?:\s+active\s+(low|high))?", re.I)
 TABLE_RE = re.compile(r"table\s+(\w+)\s*=\s*(.+)$", re.I)
 CLOCK_RE = re.compile(r"clock\s+([\d_]+)\s*(hz|mhz)?", re.I)
@@ -2236,24 +2300,26 @@ def parse(source: str) -> Program:
         port = PORT_DECL_RE.fullmatch(lowered)
         if port and not started:
             require(program, "port", line.number, "a whole-port PORT")
-            name, number, direction, active = port.groups()
-            number = int(number)
+            name, where, direction, active = port.groups()
             if name in program.ports or name in program.pins:
                 raise PseudocodeError(line.number, f"{name!r} declared twice")
+            whole = program.target.resolve_port(
+                program, name, where, direction, active == "low", line.number)
             # A PORT and a PIN on the same port would fight: writing the byte
             # clobbers the bit, and neither declaration would look wrong.
             for other in program.pins.values():
-                if getattr(other, "port", None) == number:
+                if getattr(other, "port", None) == whole.port:
                     raise PseudocodeError(
                         line.number,
-                        f"P{number} is already used one bit at a time, by {other.name!r} "
-                        f"({other.where}); a PORT writes all eight at once and would "
-                        f"clobber it")
+                        f"{where.upper()} is already used one bit at a time, by "
+                        f"{other.name!r} ({other.where}); a PORT writes all eight at "
+                        f"once and would clobber it")
             for other in program.ports.values():
-                if other.port == number:
+                if other.port == whole.port:
                     raise PseudocodeError(
-                        line.number, f"P{number} is already declared as {other.name!r}")
-            program.ports[name] = Port(name, number, direction, active == "low")
+                        line.number,
+                        f"{where.upper()} is already declared as {other.name!r}")
+            program.ports[name] = whole
             index += 1
             continue
 
@@ -2494,7 +2560,7 @@ def emit_pseudocode(program: Program) -> str:
         out.append("")
         for port in program.ports.values():
             polarity = " ACTIVE LOW" if port.active_low else ""
-            out.append(f"  PORT {port.name} = P{port.port} "
+            out.append(f"  PORT {port.name} = {port.label} "
                        f"{port.direction.upper()}{polarity}")
     if program.pins:
         out.append("")
@@ -2533,7 +2599,14 @@ def expr_c(node: Expr, ctx: Emit, parent_level: int = -1) -> str:
         return str(int(node.value))
     if isinstance(node, PortRef):
         port = ctx.program.ports[node.port]
-        raw = port.sfr
+        raw = port.read
+        # gcc-avr 5.4 warns "promoted ~unsigned is always non-zero" on
+        # `(unsigned char)~PINC > 0` -- and on `0xFF - PINC` and every other
+        # spelling, including ones containing no `~` at all. It is looking
+        # through the cast at a complement-shaped subexpression, and the cast
+        # is exactly what makes the value a byte again. The generated code is
+        # right; the warning is not, so build_avr turns that one check off
+        # rather than contorting this expression to dodge it.
         return f"(unsigned char)~{raw}" if port.active_low else raw
     if isinstance(node, Index):
         table = ctx.program.tables[node.table]

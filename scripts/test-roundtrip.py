@@ -250,6 +250,23 @@ WHEN started:
       change i by 1
 """,
 
+    # Whole-port I/O on an AVR: PORTx to drive, PINx to read (reading PORTx
+    # back would give the latch, not the world), and DDRx for direction.
+    "avr-port": """DEVICE ATMEGA328P:
+  NAME segments
+  CLOCK 16000000
+  TABLE font = 0x3F, 0x06, 0x5B, 0x4F, 0x66
+  PORT segs = D OUTPUT
+  PORT keys = C INPUT ACTIVE LOW
+  WHEN started:
+    set i to 0
+    FOREVER:
+      set segs to font[i]
+      IF keys > 0 THEN:
+        change i by 1
+      wait 200 ms
+""",
+
     # A target off C entirely. MicroPython has no goto, so the cooperative
     # scheduler is generators rather than a Duff's device -- the case the
     # target interface was drawn to allow.

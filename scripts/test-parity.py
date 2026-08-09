@@ -47,7 +47,7 @@ DEVICES = {
     "ARDUINO-UNO":  dict(out="D13",  pwm="D9",   tone="D8",   ana="A0",
                          port=None,  clock="16000000"),
     "ATMEGA328P":   dict(out="D13",  pwm="D11",  tone="D9",   ana="A0",
-                         port=None,  clock="16000000"),
+                         port="D",   clock="16000000"),
     "MICROBIT":     dict(out="P0",   pwm="P1",   tone="P2",   ana="P4",
                          port=None,  clock="16000000"),
 }

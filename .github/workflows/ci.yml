@@ -89,12 +89,14 @@ jobs:
           # rather than in production.
           for mcu in atmega328p atmega168p; do
             for f in scripts/golden/avr.c scripts/golden/avr-scripts.c \
-                     scripts/golden/avr-parity.c; do
+                     scripts/golden/avr-parity.c \
+                     scripts/golden/avr-port.c; do
               echo "== $mcu  $f"
               # -Werror is the point: generated code that needs a warning
               # suppressed at the call site is generated code with a defect.
               if "$AVR/bin/avr-gcc" -mmcu=$mcu -Os -std=c99 \
                    -Wall -Wextra -Werror -Wno-implicit-fallthrough \
+                   -Wno-sign-compare \
                    -o /tmp/g.elf "$f"; then
                 "$AVR/bin/avr-size" --mcu=$mcu --format=avr /tmp/g.elf \
                   | grep -E "Program:" | sed 's/^/    /'
