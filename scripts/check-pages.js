@@ -77,6 +77,68 @@ const { chromium } = require('playwright');
   ok('canonical pseudocode round-trips in-page',
      (await page.textContent('#out')).includes('NAME blink'));
 
+  // --- flash.js, in the runtime it actually ships to --------------------
+  //
+  // scripts/test-flash.mjs exercises these protocols in Node. They run in a
+  // browser. Those are different runtimes and the module has only ever been
+  // IMPORTED here, never executed -- so the pure protocol functions are run
+  // in the page and compared against Node's answers for the same inputs.
+  // Same module, two engines, one expected result.
+  const { pathToFileURL } = require('url');
+  const path = require('path');
+  const flash = await import(
+    pathToFileURL(path.join(__dirname, '..', 'docs', 'flash.js')).href);
+
+  // Computed, not typed. Two drafts of this file carried a hand-written
+  // checksum that was wrong -- good for the parser, wasteful for me.
+  const record = (addr, data) => {
+    const body = [data.length, (addr >> 8) & 0xff, addr & 0xff, 0, ...data];
+    const sum = (0x100 - (body.reduce((a, b) => a + b, 0) & 0xff)) & 0xff;
+    return ':' + [...body, sum]
+      .map(b => b.toString(16).padStart(2, '0').toUpperCase()).join('');
+  };
+  const HEX = [record(0x0000, [0x0C, 0x94, 0x34, 0x00, 0x0C, 0x94, 0x3E, 0x00,
+                               0x0C, 0x94, 0x3E, 0x00, 0x0C, 0x94, 0x3E, 0x00]),
+               record(0x0020, [0x12, 0x34, 0x56, 0x78]),
+               ':00000001FF'].join('\n');
+  const TRICKY = "a'b\\c\nd\x00\x7f";
+
+  const node = {
+    image: Array.from(flash.parseIntelHex(HEX).image).join(','),
+    packet: Buffer.from(flash.stcPacket([0x50, 0x00, 0x00, 0x36, 0x01, 0xd1, 0x7e]))
+                  .toString('hex'),
+    baud: JSON.stringify(flash.stcBaud(11059200, 115200)),
+    bytes: flash.pythonBytes(new TextEncoder().encode(TRICKY)),
+  };
+
+  const inBrowser = await page.evaluate(async ({ hex, tricky, base }) => {
+    const m = await import(base + '/flash.js');
+    const hexb = (a) => Array.from(a).map(b => b.toString(16).padStart(2, '0')).join('');
+    return {
+      image: Array.from(m.parseIntelHex(hex).image).join(','),
+      packet: hexb(m.stcPacket([0x50, 0x00, 0x00, 0x36, 0x01, 0xd1, 0x7e])),
+      baud: JSON.stringify(m.stcBaud(11059200, 115200)),
+      bytes: m.pythonBytes(new TextEncoder().encode(tricky)),
+    };
+  }, { hex: HEX, tricky: TRICKY, base });
+
+  for (const key of Object.keys(node)) {
+    ok(`flash.js agrees between Node and the browser: ${key}`,
+       node[key] === inBrowser[key],
+       node[key] === inBrowser[key] ? ''
+         : `node ${JSON.stringify(node[key]).slice(0, 40)} vs browser `
+           + `${JSON.stringify(inBrowser[key]).slice(0, 40)}`);
+  }
+
+  // A malformed image must throw in the browser too, not silently return junk.
+  const threw = await page.evaluate(async ({ base, bad }) => {
+    const m = await import(base + '/flash.js');
+    try { m.parseIntelHex(bad); return null; }
+    catch (e) { return e.message; }
+  }, { base, bad: HEX.split('\n')[0].slice(0, -2) + 'FF' });
+  ok('a bad checksum still throws in the browser', /checksum/.test(threw || ''),
+     String(threw));
+
   ok('no uncaught page errors', errors.length === 0, errors.slice(0, 2).join(' | '));
 
   await browser.close();
