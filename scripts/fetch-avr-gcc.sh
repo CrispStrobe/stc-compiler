@@ -139,13 +139,25 @@ DST="$ROOT/avr/lib/gcc/avr/$VERSION"
 mkdir -p "$DST"
 
 # cc1 is the C compiler proper; collect2 is what the driver calls to link.
-# cc1plus (13 MB) and lto1 are deliberately left behind: nothing here emits
-# C++, and -flto is not offered.
+# cc1plus (13 MB) is deliberately left behind: nothing here emits C++.
 for f in cc1 collect2 libgcc.a; do
   test -f "$SRC/$f" || { echo "missing $f in gcc-avr" >&2; exit 1; }
   cp "$SRC/$f" "$DST/$f"
 done
 chmod +x "$DST/cc1" "$DST/collect2"
+
+# The LTO linker plugin, which is needed even though we never pass -flto.
+# This gcc was configured with plugin support, so it hands ld a --plugin
+# argument on every link and dies with
+#
+#   fatal error: -fuse-linker-plugin, but liblto_plugin.so not found
+#
+# if it is absent. 860 KB for the plugin and lto-wrapper. lto1 (11 MB) is
+# still left out: that one is only reached by an actual -flto compile, which
+# this service does not offer.
+cp -a "$SRC"/liblto_plugin.so* "$DST/" 2>/dev/null || true
+test -f "$SRC/lto-wrapper" && cp "$SRC/lto-wrapper" "$DST/lto-wrapper" \
+  && chmod +x "$DST/lto-wrapper"
 
 # device-specs is what makes -mmcu=atmega328p mean anything: one spec file per
 # part, naming its core, its startfile and its device library. Small, and
