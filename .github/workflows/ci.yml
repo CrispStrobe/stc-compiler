@@ -148,7 +148,9 @@ jobs:
         run: python3 ./scripts/test-pages.py
       # Flashing is the one step whose output cannot be checked by compiling
       # it, so the far end of the wire is simulated instead.
-      - name: Flash an image into a simulated bootloader
+      # Includes the STC differential check: the packets this emits are
+      # compared against a transcript real stcgal produced.
+      - name: Flash into simulated bootloaders, and match stcgal byte for byte
         run: node scripts/test-flash.mjs
       - name: Install a browser
         run: |

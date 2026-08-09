@@ -235,22 +235,6 @@ export async function flashAvr(port, hexText, {
   }
 }
 
-/**
- * The STC path, which is NOT this one and is why it is a stub rather than a
- * guess. The STC12/STC15 ISP bootloader answers only after a COLD power-on --
- * a reset pulse is not enough, which is documented in the lab's README and is
- * the single fact most STC tutorials get wrong. So the interaction is: open
- * the port, begin sending the handshake, ask the user to remove and reapply
- * power, and catch the greeting when it arrives. That is a different UI, not
- * just different bytes, and it is the reason this is not folded into
- * flashAvr.
- */
-export async function flashStc() {
-  throw new Error(
-    'STC ISP flashing is not implemented in the browser yet: the bootloader ' +
-    'answers only after a cold power-on, so it needs its own prompt-and-wait ' +
-    'flow. Use `stcgal -P stc12 -p /dev/cu.usbserial-XXXX main.hex` for now.');
-}
 
 // ---------------------------------------------------------------- micro:bit
 //
@@ -372,6 +356,202 @@ export async function flashMicrobit(port, source, {
     return { bytes: bytes.length };
   } finally {
     await io.close();
+    try { await port.close(); } catch {}
+  }
+}
+
+// -------------------------------------------------------------------- STC
+//
+// The STC12/STC15 ISP. Its bootloader answers ONLY after a cold power-on --
+// a reset pulse will not do it, which is the single fact most STC tutorials
+// get wrong -- so the flow is: open the port, start sending 0x7F, and wait
+// for the user to pull and reapply power. That is a different interaction
+// from the AVR's, not just different bytes, which is why it lives here rather
+// than in flashAvr.
+//
+// The wire format was not deduced. scripts/fixtures/stc12-session.json is a
+// transcript captured from real stcgal driving a simulated STC12C5A60S2, and
+// scripts/test-flash.mjs asserts this code reproduces it packet for packet.
+// An implementation that merely agrees with my reading of stcgal would pass a
+// test I also wrote from that reading; one that reproduces stcgal's own bytes
+// is speaking the protocol.
+
+const STC_START = [0x46, 0xb9], STC_HOST = 0x6a, STC_MCU = 0x68, STC_END = 0x16;
+
+// The erase command carries the PART's flash size, not the image's, so the
+// model has to be recognised from the magic the bootloader announces. Only
+// the parts this project targets are listed; an unknown one falls back to the
+// image size, which erases enough to program it and no more.
+export const STC_MODELS = {
+  0xd17e: { name: 'STC12C5A60S2', code: 61440 },
+  0xd168: { name: 'STC12C5A16S2', code: 16384 },
+  0xf408: { name: 'STC15F2K60S2', code: 61440 },
+  0xf002: { name: 'STC89C52RC', code: 8192 },
+};
+
+export function stcPacket(data) {
+  const body = [STC_HOST, ((data.length + 6) >> 8) & 0xff, (data.length + 6) & 0xff,
+                ...data];
+  const sum = body.reduce((a, b) => a + b, 0) & 0xffff;
+  return Uint8Array.from([...STC_START, ...body, (sum >> 8) & 0xff, sum & 0xff,
+                          STC_END]);
+}
+
+/** Read one MCU packet and return its payload, checksum verified. */
+export async function readStcPacket(io) {
+  let head = (await io.read(1))[0];
+  // Some bootloader versions omit the frame start on the status packet;
+  // stcgal accepts that always, so we do too.
+  if (head !== STC_MCU) {
+    if (head !== STC_START[0]) throw new Error('bad frame start');
+    if ((await io.read(1))[0] !== STC_START[1]) throw new Error('bad frame start');
+    if ((await io.read(1))[0] !== STC_MCU) throw new Error('bad packet direction');
+  }
+  const lengthBytes = await io.read(2);
+  const length = (lengthBytes[0] << 8) | lengthBytes[1];
+  const rest = await io.read(length - 3);
+  if (rest[rest.length - 1] !== STC_END) throw new Error('bad frame end');
+  const data = rest.subarray(0, rest.length - 3);
+  const given = (rest[rest.length - 3] << 8) | rest[rest.length - 2];
+  const want = ([STC_MCU, lengthBytes[0], lengthBytes[1], ...data]
+                 .reduce((a, b) => a + b, 0)) & 0xffff;
+  if (given !== want) throw new Error('packet checksum mismatch');
+  return data;
+}
+
+/** IAP wait states, straight from the datasheet table stcgal encodes. */
+function iapDelay(hz) {
+  if (hz < 1e6) return 0x87;
+  if (hz < 2e6) return 0x86;
+  if (hz < 3e6) return 0x85;
+  if (hz < 6e6) return 0x84;
+  if (hz < 12e6) return 0x83;
+  if (hz < 20e6) return 0x82;
+  if (hz < 24e6) return 0x81;
+  return 0x80;
+}
+
+export function stcBaud(clockHz, transferBaud) {
+  const brt = 256 - Math.round(clockHz / (transferBaud * 16));
+  if (brt <= 1 || brt > 255) {
+    throw new Error(`${transferBaud} baud cannot be set from a ${clockHz} Hz clock`);
+  }
+  return { brt, csum: (2 * (256 - brt)) & 0xff, iap: iapDelay(clockHz), delay: 0x80 };
+}
+
+/** Decode the status packet the bootloader greets us with. */
+export function stcStatus(payload, handshakeBaud) {
+  if (payload.length < 23) throw new Error('status packet too short');
+  let counter = 0;
+  for (let i = 0; i < 8; i++) counter += (payload[1 + 2 * i] << 8) | payload[2 + 2 * i];
+  counter /= 8;
+  return {
+    clockHz: (handshakeBaud * counter * 12) / 7,
+    magic: (payload[20] << 8) | payload[21],
+    bslVersion: payload[17],
+  };
+}
+
+/**
+ * Program an STC12 over its ISP. `onPowerCycle` is called once, so the caller
+ * can tell the user to do the one thing only they can do.
+ *
+ * Options are deliberately NOT programmed. stcgal rewrites them on every run;
+ * this does not, because an option byte is how you disable the ISP pin and
+ * lock yourself out of the part, and nothing in the pseudocode dialect asks
+ * for one to change.
+ */
+export async function flashStc(port, hexText, {
+  handshakeBaud = 2400, transferBaud = 115200, log = () => {},
+  onPowerCycle = () => {}, sink = null, timeoutMs = 30000,
+} = {}) {
+  const parsed = parseIntelHex(hexText);
+  // stcgal pads to a 512-byte boundary before erasing or writing, and the
+  // block count in the erase command is derived from the padded length. An
+  // unpadded image asks the part to erase fewer blocks than it then writes.
+  const padded = new Uint8Array(Math.ceil(parsed.image.length / 512) * 512).fill(0xff);
+  padded.set(parsed.image);
+  const image = padded;
+  const sent = [];
+  const record = (packet) => { sent.push(packet); return packet; };
+
+  await port.open({ baudRate: handshakeBaud });
+  let io = serialTransport(port, { timeout: 4000 });
+  const say = async (data) => { const p = record(stcPacket(data)); await io.write(p); };
+
+  try {
+    log('waiting for the bootloader — pull the power and reapply it');
+    onPowerCycle();
+    const deadline = Date.now() + timeoutMs;
+    let status = null;
+    while (!status) {
+      if (Date.now() > deadline) {
+        throw new Error('no bootloader greeting: the STC ISP answers only ' +
+                        'after a COLD power-on, and a reset button is not enough');
+      }
+      await io.write(Uint8Array.from([0x7f]));
+      try { status = await readStcPacket(io); } catch { /* keep pulsing */ }
+    }
+    const info = stcStatus(status, handshakeBaud);
+    log(`bootloader: magic ${info.magic.toString(16)}, ` +
+        `${(info.clockHz / 1e6).toFixed(3)} MHz, BSL ${(info.bslVersion >> 4)}.` +
+        `${info.bslVersion & 0xf}`);
+
+    const magicHi = (info.magic >> 8) & 0xff, magicLo = info.magic & 0xff;
+    const { brt, csum, iap, delay } = stcBaud(info.clockHz, transferBaud);
+
+    log('negotiating baud…');
+    await say([0x50, 0x00, 0x00, 0x36, 0x01, magicHi, magicLo]);
+    if ((await readStcPacket(io))[0] !== 0x8f) throw new Error('handshake refused');
+    await say([0x8f, 0xc0, brt, 0x3f, csum, delay, iap]);
+    if ((await readStcPacket(io))[0] !== 0x8f) throw new Error('baud test refused');
+    await say([0x8e, 0xc0, brt, 0x3f, csum, delay]);
+    if ((await readStcPacket(io))[0] !== 0x84) throw new Error('baud switch refused');
+
+    // Web Serial cannot change the rate of an open port, so this is a close
+    // and reopen. It is also the most fragile step here and the one a
+    // simulator cannot vouch for.
+    if (transferBaud !== handshakeBaud && !sink) {
+      await io.close();
+      await port.close();
+      await port.open({ baudRate: transferBaud });
+      io = serialTransport(port, { timeout: 4000 });
+    }
+
+    const model = STC_MODELS[info.magic];
+    const codeSize = model ? model.code : image.length;
+    if (model) log(`part: ${model.name}, ${codeSize} bytes of flash`);
+    else log(`unknown magic ${info.magic.toString(16)}; erasing only what is written`);
+    const blocks = Math.ceil(image.length / 512) * 2;
+    const total = Math.ceil(codeSize / 512) * 2;
+    log(`erasing ${blocks} blocks…`);
+    const erase = [0x84, 0xff, 0x00, blocks, 0x00, 0x00, total,
+                   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    for (let i = 0x80; i > 0x0d; i--) erase.push(i);
+    await say(erase);
+    if ((await readStcPacket(io))[0] !== 0x00) throw new Error('erase refused');
+
+    const BLOCK = 128;
+    for (let at = 0; at < image.length; at += BLOCK) {
+      const chunk = image.subarray(at, at + BLOCK);
+      const body = [0, 0, 0, (at >> 8) & 0xff, at & 0xff, (BLOCK >> 8) & 0xff,
+                    BLOCK & 0xff, ...chunk];
+      while (body.length < BLOCK + 7) body.push(0);
+      await say(body);
+      if ((await readStcPacket(io))[0] !== 0x00) {
+        throw new Error(`write refused at 0x${at.toString(16)}`);
+      }
+      log(`  wrote ${chunk.length} bytes at 0x${at.toString(16).padStart(4, '0')}`);
+    }
+
+    await say([0x69, 0x00, 0x00, 0x36, 0x01, magicHi, magicLo]);
+    if ((await readStcPacket(io))[0] !== 0x8d) throw new Error('finish refused');
+
+    await say([0x82]);                       // reset and run
+    log(`done: ${parsed.image.length} bytes (padded to ${image.length})`);
+    return { bytes: parsed.image.length, padded: image.length, sent };
+  } finally {
+    try { await io.close(); } catch {}
     try { await port.close(); } catch {}
   }
 }

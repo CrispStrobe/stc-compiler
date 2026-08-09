@@ -55,6 +55,10 @@ if index.exists():
     check("compiling is delegated, and says where",
           "/compile" in page and "stc-compiler.vercel.app" in page)
     check("the flasher is wired in", "flash.js" in page and "id=flash" in page)
+    check("all three flash paths reach the button",
+          all(t in page for t in ("flashAvr", "flashMicrobit", "flashStc")))
+    check("the STC cold power-on is told to the user, not assumed",
+          "COLD power-on" in page)
     check("Web Serial absence is explained rather than left as a dead button",
           "'serial' in navigator" in page)
     check("the page notices when the hosted compiler is older than it is",

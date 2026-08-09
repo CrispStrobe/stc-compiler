@@ -13,8 +13,8 @@
 //
 //   node scripts/test-flash.mjs
 //
-import { parseIntelHex, Stk500, flashAvr, flashMicrobit, pythonBytes, STK }
-  from '../docs/flash.js';
+import { parseIntelHex, Stk500, flashAvr, flashMicrobit, flashStc, stcPacket,
+         stcBaud, stcStatus, pythonBytes, STK } from '../docs/flash.js';
 
 let passed = 0, failed = 0;
 const ok = (name, cond, detail = '') => {
@@ -179,7 +179,9 @@ import { readFileSync, existsSync } from 'node:fs';
 // A real avr-gcc image when one has been built locally; otherwise a
 // synthetic one big enough to cross several page boundaries, because a
 // 36-byte image would never exercise the addressing that actually goes wrong.
-const REAL = 'build-avr/parity.hex';
+// Committed, not built: the stcgal transcript was captured against THIS
+// image, so the differential check is only meaningful with the same bytes.
+const REAL = 'scripts/fixtures/parity.hex';
 function syntheticHex(length) {
   const lines = [];
   for (let at = 0; at < length; at += 16) {
@@ -361,6 +363,95 @@ catch (e) { replError = e; }
 ok('a dropped chunk is caught by the size read-back',
    replError && /but the board has/.test(replError.message),
    replError ? replError.message.slice(0, 56) : 'no error raised!');
+
+// --- STC: differential against a transcript real stcgal produced ---------
+console.log('');
+const SESSION = JSON.parse(readFileSync('scripts/fixtures/stc12-session.json', 'utf8'));
+
+/** Answers exactly as the simulated STC12 did while stcgal drove it. */
+function stcDevice(clockHz, magic, handshakeBaud) {
+  const out = [];
+  const push = (data) => { for (const b of stcPacket(data)) out.push(b); };
+  // The greeting: 8 frequency words, BSL version, then the model magic.
+  const counter = Math.round(clockHz * 7 / (handshakeBaud * 12));
+  const status = [0x50];
+  for (let i = 0; i < 8; i++) status.push((counter >> 8) & 0xff, counter & 0xff);
+  status.push(0x72, 0x03, 0x00, (magic >> 8) & 0xff, magic & 0xff);
+  for (let i = 0; i < 16; i++) status.push(0);
+
+  let greeted = false;
+  return {
+    out,
+    feed(bytes) {
+      if (!greeted) {
+        if (bytes.some(b => b === 0x7f)) {
+          greeted = true;
+          // The MCU packet direction byte is 0x68, not 0x6a.
+          const packet = stcPacket(status);
+          packet[2] = 0x68;
+          const body = [0x68, packet[3], packet[4], ...status];
+          const sum = body.reduce((a, b) => a + b, 0) & 0xffff;
+          out.push(0x46, 0xb9, ...body, (sum >> 8) & 0xff, sum & 0xff, 0x16);
+        }
+        return;
+      }
+      // Host packet: reply per Stc12BaseProtocol's table.
+      const data = [...bytes].slice(5, -3);
+      const reply = { 0x50: 0x8f, 0x8f: 0x8f, 0x8e: 0x84, 0x84: 0x00,
+                      0x00: 0x00, 0x69: 0x8d, 0x82: null }[data[0]];
+      if (reply === null || reply === undefined) return;
+      const body = data[0] === 0x84
+        ? [reply, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17] : [reply, 0x00];
+      const packet = stcPacket(body);
+      const inner = [0x68, packet[3], packet[4], ...body];
+      const sum = inner.reduce((a, b) => a + b, 0) & 0xffff;
+      out.push(0x46, 0xb9, ...inner, (sum >> 8) & 0xff, sum & 0xff, 0x16);
+    },
+  };
+}
+
+function stcPort(device) {
+  return {
+    async open() {}, async close() {},
+    get writable() { return { getWriter: () => ({
+      async write(b) { device.feed(b); }, releaseLock() {} }) }; },
+    get readable() { return { getReader: () => ({
+      async read() {
+        for (let i = 0; i < 300 && !device.out.length; i++) {
+          await new Promise(r => setTimeout(r, 2));
+        }
+        if (!device.out.length) return { done: true };
+        return { value: Uint8Array.from(device.out.splice(0, device.out.length)),
+                 done: false };
+      },
+      async cancel() {}, releaseLock() {} }) }; },
+  };
+}
+
+ok('the baud maths matches stcgal (11.0592 MHz -> 115200)',
+   JSON.stringify(stcBaud(11059200, 115200)) ===
+     JSON.stringify({ brt: 250, csum: 12, iap: 0x83, delay: 0x80 }),
+   JSON.stringify(stcBaud(11059200, 115200)));
+
+const stcHex = readFileSync('scripts/fixtures/parity.hex', 'utf8');
+const device = stcDevice(SESSION.clock_hz, parseInt(SESSION.mcu_magic, 16),
+                         SESSION.handshake_baud);
+const stcResult = await flashStc(stcPort(device), stcHex, { log: () => {}, sink: true });
+const mine = stcResult.sent.map(p => Buffer.from(p).toString('hex'));
+// stcgal also rewrites the option bytes (0x8d); this deliberately does not,
+// because an option byte is how you disable the ISP pin and lock yourself out.
+const theirs = SESSION.host_packets.filter(h => h.slice(10, 12) !== '8d');
+
+ok('sends the same number of packets as stcgal', mine.length === theirs.length,
+   `${mine.length} vs ${theirs.length}`);
+let differs = -1;
+for (let i = 0; i < Math.min(mine.length, theirs.length); i++) {
+  if (mine[i] !== theirs[i]) { differs = i; break; }
+}
+ok('every packet is byte-identical to the reference implementation\'s',
+   differs === -1,
+   differs === -1 ? `${mine.length} packets`
+     : `packet ${differs}:\n        stcgal ${theirs[differs]}\n        ours   ${mine[differs]}`);
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

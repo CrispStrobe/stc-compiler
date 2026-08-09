@@ -125,7 +125,7 @@
 
 <script src="https://cdn.jsdelivr.net/pyodide/v314.0.3/full/pyodide.js"></script>
 <script type=module>
-import { flashAvr, flashMicrobit } from './flash.js';
+import { flashAvr, flashMicrobit, flashStc } from './flash.js';
 const API = "https://stc-compiler.vercel.app";
 const $ = id => document.getElementById(id);
 let py = null, result = null, image = null;
@@ -406,6 +406,7 @@ function flashable() {
   // An AVR needs the compiled image; a micro:bit does not need a compiler at
   // all -- MicroPython's REPL takes the source straight.
   if (result.toolchain === 'avr-gcc') return !!image;
+  if (result.toolchain === 'sdcc-mcs51') return !!image;
   if (result.toolchain === 'uflash') return true;
   return false;
 }
@@ -415,9 +416,10 @@ function refreshFlash() {
   if (!CAN_SERIAL) {
     $('flash').title = 'Web Serial is not available in this browser; '
                      + 'Chrome or Edge can do this.';
-  } else if (result && result.toolchain === 'sdcc-mcs51') {
-    $('flash').title = 'The STC bootloader answers only after a COLD power-on, '
-                     + 'so it needs its own flow; use stcgal for now.';
+  } else if (result && result.toolchain === 'sdcc-mcs51' && !image) {
+    $('flash').title = 'Compile to .hex first, then pull the power and reapply '
+                     + 'it when asked — the STC bootloader answers only after a '
+                     + 'COLD power-on.';
   } else if (result && result.toolchain === 'uflash') {
     $('flash').title = 'Writes main.py over the REPL. The board needs '
                      + 'MicroPython on it already — flash that once from '
@@ -447,6 +449,14 @@ $('flash').onclick = async () => {
     if (result.toolchain === 'uflash') {
       done = await flashMicrobit(port, result.code, { log });
       setStatus(`wrote main.py, ${done.bytes} bytes, and restarted`, 'ok');
+    } else if (result.toolchain === 'sdcc-mcs51') {
+      done = await flashStc(port, new TextDecoder().decode(image.bytes), {
+        log,
+        onPowerCycle: () => setStatus(
+          'PULL THE POWER AND REAPPLY IT — a reset button will not do; the STC '
+          + 'ISP bootloader only runs after a cold power-on'),
+      });
+      setStatus(`flashed ${done.bytes} bytes`, 'ok');
     } else {
       done = await flashAvr(port, new TextDecoder().decode(image.bytes), { log });
       setStatus(`flashed ${done.bytes} bytes and verified`, 'ok');

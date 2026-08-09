@@ -167,7 +167,7 @@ loads" and "CPython starts in it and emits MicroPython" are different claims.
 |---|---|---|
 | ATmega328P / Uno / Nano | Web Serial → STK500v1 (the Arduino bootloader) | **yes** — *Flash* |
 | micro:bit | Web Serial → MicroPython's raw REPL, writing `main.py` | **yes** — *Flash* |
-| STC12 / STC15 | STC ISP over serial | not yet — `stcgal` |
+| STC12 / STC15 | STC ISP over serial, after a cold power-on | **yes** — *Flash* |
 
 A micro:bit has no serial bootloader, but once MicroPython is on it the raw
 REPL is a perfectly good file channel — which is what `microfs` and the
@@ -183,9 +183,23 @@ verifies it page by page. Web Serial is Chromium-only and needs a secure
 context, which Pages provides; other browsers are told why rather than given a
 dead button.
 
-The STC parts are a different interaction, not just different bytes: their ISP
-bootloader answers **only after a cold power-on** — a reset pulse will not do —
-so it needs a prompt-and-wait flow of its own. `stcgal` remains the way in.
+The STC parts are a different *interaction*, not just different bytes: their
+ISP bootloader answers **only after a cold power-on** — a reset pulse will not
+do — so the page starts pulsing `0x7F` and asks you to pull the power and
+reapply it. That is the one thing only you can do.
+
+Its wire format was not deduced. `scripts/fixtures/stc12-session.json` is a
+transcript captured from **real stcgal** driving a simulated STC12C5A60S2 over
+a pseudo-terminal, and the test asserts this code reproduces it **packet for
+packet**. That matters: a test written from my own reading of stcgal would
+have agreed with an implementation written from the same reading. It caught
+two things reading had not — stcgal pads the image to a 512-byte boundary
+before erasing, and the erase command carries the *part's* flash size (from a
+magic-number table) rather than the image's.
+
+Option bytes are deliberately **not** programmed, though stcgal rewrites them
+on every run: an option byte is how you disable the ISP pin and lock yourself
+out of the part, and nothing in the dialect asks for one to change.
 
 Flashing is the one step whose output cannot be checked by compiling it, so
 `scripts/test-flash.mjs` puts simulated devices on the far end of the wire: an
