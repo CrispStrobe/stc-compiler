@@ -1,0 +1,11 @@
+gcc-avr      gcc-avr_5.4.0+Atmel3.6.2-1+b1_amd64.deb
+binutils-avr binutils-avr_2.26.20160125+Atmel3.6.2-2+b1_amd64.deb
+avr-libc     avr-libc_2.0.0+Atmel3.6.2-1.1_all.deb
+
+from Debian bullseye, https://deb.debian.org/debian/pool/main
+corresponding source: apt-get source gcc-avr binutils-avr avr-libc
+
+gcc-avr and binutils-avr are GPL-3.0-or-later. The GCC Runtime Library
+Exception covers libgcc, so images compiled with this bundle are unencumbered.
+avr-libc is BSD-3-Clause. The Arduino core (LGPL-2.1) is NOT vendored and is
+not linked into anything this service returns.

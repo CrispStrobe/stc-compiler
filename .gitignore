@@ -6,20 +6,15 @@ __pycache__/
 # Agent context: local paths and operational detail, not for the public repo.
 CLAUDE.md
 
-# The vendored AVR toolchain, 33 MB, built by ./scripts/fetch-avr-gcc.sh and
-# verified green by the avr-bundle job in CI.
+# The vendored AVR toolchain is COMMITTED, like SDCC's bin/ + share/ before
+# it. Vercel deploys from git and vercel.json's legacy `builds` config bundles
+# the project directory, so anything not in git is not in the function.
 #
-# Ignored rather than committed ON PURPOSE, and this is a decision to revisit
-# rather than a permanent state: Vercel deploys from git and vercel.json's
-# legacy `builds` config bundles the project directory, so /compile for AVR
-# parts will NOT work in production until this is committed. SDCC's 8 MB
-# bin/ + share/ are committed for exactly that reason.
+# 32 MB, built by ./scripts/fetch-avr-gcc.sh and verified by the avr-bundle
+# job in CI. Already trimmed: no cc1plus, no lto1, one multilib, and 2 of
+# avr-libc's 267 device headers. What is left is cc1 (12 MB) and the
+# binutils, neither of which compresses away.
 #
-# 33 MB is 4x that and it lands in git history permanently, which is why it is
-# a choice rather than a side effect. Already trimmed: no cc1plus, no lto1,
-# one multilib, and 2 of avr-libc's 267 device headers. The remainder is cc1
-# (12 MB) and the binutils, and neither compresses away.
-#
-# CI uploads the verified bundle as an artifact, so it can be inspected or
-# fetched without committing anything.
-avr/
+# Rebuild it with the script rather than editing it by hand; CI rebuilds it
+# from scratch on every push, so a hand-patched tree would be silently
+# replaced anyway.
