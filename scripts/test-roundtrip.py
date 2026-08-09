@@ -244,6 +244,21 @@ WHEN started:
       wait 500 ms
 """,
 
+    # An event hat on a micro:bit button. The generated task polls for the
+    # edge, which is the shape the C targets get too -- but as a generator.
+    "microbit-hat": """DEVICE MICROBIT:
+  CLOCK 16000000
+  PIN btn = BUTTON_A INPUT
+  PIN led = P0 OUTPUT
+  WHEN started:
+    FOREVER:
+      wait 500 ms
+  WHEN btn pressed:
+    set hits to 0
+    change hits by 1
+    turn on led
+""",
+
     "microbit-once": """DEVICE MICROBIT:
   CLOCK 16000000
   PIN led = P0 OUTPUT

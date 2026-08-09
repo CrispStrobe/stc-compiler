@@ -147,7 +147,7 @@ class MicrobitTarget(sp.Target):
     # ---- the emitter ----------------------------------------------------
     def emit(self, program) -> str:
         pins = {pin.name: pin for pin in program.pins.values()}
-        tasks = len(program.whens) > 1
+        tasks = len(program.whens) > 1 or any(program.when_hats)
         # Names that live at module scope and are assigned inside functions,
         # so every function that touches them needs a `global`.
         globals_ = list(program.variables)
@@ -207,12 +207,46 @@ class MicrobitTarget(sp.Target):
         for number, block in enumerate(program.whens):
             name = f"bw_task{number}" if tasks else "bw_script"
             task_names.append(name)
+            hat = program.when_hats[number] if program.when_hats else None
+
+            if hat is not None:
+                # An event hat polls its pin and fires on the edge. read_pin
+                # already folds ACTIVE LOW in, so `_now` is the LOGICAL level:
+                # a button wired to ground reads 1 when it is held down.
+                pin_name, edge = hat
+                pin = pins[pin_name]
+                fired = ("_now and not _prev" if edge == "pressed"
+                         else "_prev and not _now")
+                out += [f"# WHEN {pin_name} {edge}:", f"def {name}():"]
+                # `global` belongs at function level, before anything nests.
+                out += self._global_decl(block, program, globals_ + toggled,
+                                         "    ")
+                out += ["    _prev = 0",
+                        "    while True:",
+                        f"        _now = 1 if {self.read_pin(pin)} else 0",
+                        f"        _fired = {fired}",
+                        "        _prev = _now",
+                        "        if _fired:"]
+                body = self._stmts(block, 3, pins, program, tasks,
+                                   globals_ + toggled)
+                out += body or ["            pass"]
+                # Poll once per scheduler pass. Also what makes this function a
+                # generator when the body happens to contain no wait.
+                out += ["        yield", ""]
+                continue
+
             out += [f"# WHEN started:"
                     + (f" (script {number + 1})" if tasks else ""),
                     f"def {name}():"]
             body = self._stmts(block, 1, pins, program, tasks,
                                globals_ + toggled)
             out += body or ["    pass"]
+            if tasks and not any("yield" in line for line in body):
+                # A script with no wait and no loop yields nowhere, so `def`
+                # would produce a plain function -- and the scheduler would
+                # call next() on the None it returned. One bare yield makes it
+                # the generator the scheduler expects.
+                out += ["    yield   # runs once; this is what makes it a generator"]
             out.append("")
 
         if used_display:
@@ -257,12 +291,7 @@ class MicrobitTarget(sp.Target):
         out: list[str] = []
 
         if depth == 1 and globals_:
-            assigned = {node.name for node in _walk_body(body)
-                        if isinstance(node, (sp.SetVar, sp.ChangeVar))}
-            needed = [g for g in dict.fromkeys(globals_)
-                      if g in assigned and g in program.variables]
-            if needed:
-                out.append(f"{pad}global " + ", ".join(needed))
+            out += self._global_decl(body, program, globals_, pad)
 
         for node in body:
             if isinstance(node, sp.SetPin):
@@ -348,6 +377,19 @@ class MicrobitTarget(sp.Target):
             else:
                 raise TypeError(node)
         return out
+
+    def _global_decl(self, body, program, globals_, pad) -> list[str]:
+        """`global` for every module-level variable this block assigns.
+
+        Without it MicroPython makes the assignment a local and the variable
+        silently stops being shared -- no error, just a script that never sees
+        what another one wrote.
+        """
+        assigned = {node.name for node in _walk_body(body)
+                    if isinstance(node, (sp.SetVar, sp.ChangeVar))}
+        needed = [g for g in dict.fromkeys(globals_)
+                  if g in assigned and g in program.variables]
+        return [f"{pad}global " + ", ".join(needed)] if needed else []
 
     def _ms(self, node, pins) -> str:
         if isinstance(node.amount, sp.Num):

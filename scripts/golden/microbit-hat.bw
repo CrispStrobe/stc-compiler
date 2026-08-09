@@ -1,0 +1,14 @@
+DEVICE MICROBIT:
+  CLOCK 16000000
+
+  PIN btn = BUTTON_A INPUT
+  PIN led = P0 OUTPUT
+
+  WHEN started:
+    FOREVER:
+      wait 500 ms
+
+  WHEN btn pressed:
+    set hits to 0
+    change hits by 1
+    turn on led

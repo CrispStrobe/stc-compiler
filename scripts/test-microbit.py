@@ -271,6 +271,54 @@ check("0 Hz silences rather than playing 0", silences == [("silence", 0)],
 check("a table is indexed, not inlined", "font[i]" in code)
 check("tables are tuples, not lists", "font = (0x00, 0x40, 0x64,)" in code)
 
+# --- event hats fire on the EDGE, not while held ---------------------------
+print()
+HAT = """DEVICE MICROBIT:
+  PIN btn = BUTTON_A INPUT
+  PIN led = P0 OUTPUT
+  WHEN started:
+    FOREVER:
+      wait 50 ms
+  WHEN btn pressed:
+    set hits to 0
+    change hits by 1
+    turn on led
+"""
+code = sp.emit(sp.parse(HAT))
+try:
+    compile(code, "<generated>", "exec")
+    check("event hat: parses as Python", True)
+except SyntaxError as exc:
+    check("event hat: parses as Python", False, str(exc))
+
+check("event hat: polls its pin", "_prev" in code and "button_a.is_pressed()" in code)
+check("event hat: `global` sits at function level, not inside the if",
+      "\n    global hits" in code)
+
+# The stub button goes not-pressed -> pressed exactly once, so a correct edge
+# detector fires exactly once no matter how many times it is polled.
+log, _ = run(code)
+fires = [w for w in log if w[0] == "write" and w[1] == 0 and w[2] == 1]
+check("event hat: fires once on the edge, not while held", len(fires) == 1,
+      f"{len(fires)} firings")
+
+# A script with no wait and no loop yields nowhere; without a bare yield the
+# `def` is a plain function and the scheduler calls next() on its None.
+NO_WAIT = """DEVICE MICROBIT:
+  PIN led = P0 OUTPUT
+  WHEN started:
+    FOREVER:
+      wait 50 ms
+  WHEN started:
+    turn on led
+"""
+code = sp.emit(sp.parse(NO_WAIT))
+check("a script that never waits is still a generator",
+      "yield   # runs once" in code)
+log, _ = run(code)          # would raise TypeError if it were not
+check("...and the scheduler runs it without dying",
+      any(w[0] == "write" and w[1] == 0 and w[2] == 1 for w in log))
+
 # --- errors the target must refuse -----------------------------------------
 print()
 for decl, why in [
