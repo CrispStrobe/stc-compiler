@@ -22,6 +22,7 @@ import uuid
 import keil2sdcc
 import stc_disasm
 import stc_pseudocode
+import stc_symtab
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -194,6 +195,23 @@ class CompileReq(BaseModel):
     # Also return an 8051 disassembly of the image. Off by default: it is
     # several KB of text nobody asked for.
     disassemble: bool = False
+    # Also return the debug symbol table (stc_symtab): the addresses of bw_ms,
+    # <task>_state and <task>_until, and the code address of every yield point.
+    # A browser cannot run sdcc or Python, so this endpoint is the ONLY way a
+    # front end can obtain one — and without it a debugger can halt a program
+    # but not say where it stopped.
+    #
+    # This adds --debug to the compile, and --debug CHANGES THE IMAGE: measured
+    # on a two-task fixture, 8 of 39 hex records differ and the image grows by
+    # two bytes, because SDCC stops tail-merging returns so that line records
+    # map cleanly (a `JNB/RET` pair becomes `JB/SJMP`). The program behaves the
+    # same — it is the same C — but it is not the same bytes.
+    #
+    # So a symbol table is only ever valid for the image it was built WITH.
+    # Never pair one with a separately compiled release image: every code
+    # address in it would be off, and a breakpoint would land somewhere
+    # arbitrary. Ask for both together, or neither.
+    symbols: bool = False
 
 
 def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
@@ -328,6 +346,18 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _fosc_from_source(code: str) -> int | None:
+    """The clock, read back out of the source.
+
+    The pseudocode path deliberately clears `fosc` on the request because the
+    CLOCK line already baked it into the generated C, and defining it twice is
+    a warning at best. The symbol table still wants the number, and the C is
+    where it now lives.
+    """
+    m = re.search(r"^\s*#define\s+FOSC_HZ\s+(\d+)", code, re.M)
+    return int(m.group(1)) if m else None
+
+
 def build(req: CompileReq) -> dict:
     """Compile and return the JSON-shaped result. Shared by both endpoints."""
     if len(req.code.encode("utf-8")) > MAX_SOURCE_BYTES:
@@ -411,6 +441,9 @@ def build(req: CompileReq) -> dict:
         cmd.append("--std-c99")
     cmd += keil2sdcc.shim_args()
     cmd += target["flags"]
+    if req.symbols:
+        # The .cdb only carries addresses when the LINK step ran with --debug.
+        cmd.append("--debug")
     if req.fosc:
         cmd.append(f"-DFOSC_HZ={int(req.fosc)}UL")
     for name, value in req.defines.items():
@@ -484,6 +517,30 @@ def build(req: CompileReq) -> dict:
             with open(mem_path, encoding="utf-8", errors="replace") as handle:
                 mem = handle.read()
 
+        # The debug symbol table, when asked for. A failure here must NOT fail
+        # the compile: the commonest reason is a single-WHEN program, which has
+        # no scheduler and therefore no Level 1 position to describe. The image
+        # is still perfectly good, so hand it back with the reason attached
+        # rather than turning a working build into an error.
+        symbols = None
+        symbols_error = None
+        if req.symbols:
+            cdb_path = os.path.join(work, "main.cdb")
+            try:
+                with open(cdb_path, encoding="utf-8", errors="replace") as handle:
+                    cdb_text = handle.read()
+                symbols = stc_symtab.build_symbol_table(
+                    cdb_text, req.code,
+                    fosc=req.fosc or _fosc_from_source(req.code) or 11059200,
+                    device=req.target.lower(),
+                )
+            except FileNotFoundError:
+                symbols_error = ("sdcc wrote no main.cdb, so there are no addresses "
+                                 "to report. That is a toolchain problem, not a "
+                                 "problem with this source.")
+            except stc_symtab.SymbolTableError as exc:
+                symbols_error = str(exc)
+
         return {
             "success": True,
             "c": generated_c,          # None unless the source was translated
@@ -491,6 +548,8 @@ def build(req: CompileReq) -> dict:
             "unresolved": keil_unresolved or None,
             "warnings": keil_warnings or None,
             "disassembly": listing,     # None unless disassemble was requested
+            "symbols": symbols,         # None unless symbols was requested
+            "symbols_error": symbols_error,
             "base64": base64.b64encode(blob).decode("ascii"),
             "filename": name,
             "bytes": len(blob),

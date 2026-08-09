@@ -23,10 +23,18 @@ Output is the 004 format:
           {"name": "bw_task0", "func_addr": 226,
            "state": {"space": "iram", "addr": 12, "size": 2},
            "until": {"space": "iram", "addr": 14, "size": 2},
-           "yields": [{"state": 0, "label": "entry", "addr": 261}, ...]}
+           "yields": [{"state": 0, "label": "entry", "addr": 261,
+                       "block": "j:p^E*hF,qR%nT.b|"}, ...]}
         ]
       }
     }
+
+`block` is the Scratch block id this yield belongs to, and it is what lets a
+front end glow the block a halted program is sitting on rather than print a
+number (`sb3-creator/reference/debugger-ui.md` §2). It appears only when the C
+carries sb3-creator's `@bw yield` header — a debug build of a Brickwright
+project. Hand-written firmware has no blocks to point at, so its symbol table
+simply has no `block` keys, which is not an error.
 
 The on-chip monitor reads a subset of the same file: it has no code
 breakpoints, so it ignores `yields[].addr` and matches `(task, state)` in its
@@ -47,6 +55,7 @@ import argparse
 import json
 import re
 import sys
+from urllib.parse import unquote
 
 # --------------------------------------------------------------- address spaces
 #
@@ -75,6 +84,12 @@ CDB_SPACE = {
 
 TASK_RE = re.compile(r"^\s*static\s+void\s+(bw_task\d+)\s*\(\s*void\s*\)\s*$")
 CASE_RE = re.compile(r"^\s*case\s+(\d+)\s*:")
+
+# `@bw yield <task> <state> <percent-encoded block id> <kind>` in sb3-creator's
+# marker header. The id is percent-encoded because Scratch's block-id alphabet
+# contains both `*` and `/`, which would otherwise close the C comment the
+# header lives in.
+YIELD_RE = re.compile(r"@bw\s+yield\s+(\w+)\s+(\d+)\s+(\S+)\s+(\S+)\s*$")
 
 
 class SymbolTableError(Exception):
@@ -185,6 +200,27 @@ def scan_tasks(source: str) -> dict[str, list[tuple[int, int, str]]]:
     return tasks
 
 
+def scan_yield_map(source: str) -> dict[str, dict[int, str]]:
+    """The `(task, state) -> Scratch block id` map out of the `@bw` header.
+
+    Only sb3-creator's `generateC(project, {debug: true})` writes this. Without
+    it a Level 1 position is a number a front end cannot point at; with it the
+    block editor can glow the block a halted program is sitting on.
+
+    Returns {} for C that carries no header, which is the normal case for
+    hand-written firmware and not an error.
+    """
+    header = re.search(r"@bw-begin(.*?)@bw-end", source, re.S)
+    if not header:
+        return {}
+    out: dict[str, dict[int, str]] = {}
+    for line in header.group(1).splitlines():
+        m = YIELD_RE.search(line)
+        if m:
+            out.setdefault(m.group(1), {})[int(m.group(2))] = unquote(m.group(3))
+    return out
+
+
 def _label_for(lines: list[str], lineno: int, task: str, state: int) -> str:
     """A human-readable name for a yield point. Advisory only.
 
@@ -215,6 +251,7 @@ def build_symbol_table(cdb_text: str, c_source: str, *, fosc: int,
                        device: str, source_name: str | None = None) -> dict:
     cdb = Cdb(cdb_text)
     tasks = scan_tasks(c_source)
+    yield_map = scan_yield_map(c_source)
 
     if not tasks:
         raise SymbolTableError(
@@ -245,6 +282,24 @@ def build_symbol_table(cdb_text: str, c_source: str, *, fosc: int,
                 )
             source_name = candidates[0]
 
+    # If the C carries a yield map, it must describe exactly the `case` labels
+    # that are actually in the file. A map that disagrees is worse than no map:
+    # it would point a front end at a confidently wrong block, and nothing
+    # downstream could detect it. Refuse rather than emit one.
+    if yield_map:
+        from_header = {(t, s) for t, states in yield_map.items() for s in states}
+        from_source = {(t, s) for t, cases in tasks.items() for s, _, _ in cases}
+        if from_header != from_source:
+            only_header = sorted(from_header - from_source)
+            only_source = sorted(from_source - from_header)
+            raise SymbolTableError(
+                "the @bw yield map disagrees with the case labels in the same "
+                "file. It was written by a different build than this C, so "
+                "every block id in it is suspect.\n"
+                f"  in the header but not the source: {only_header}\n"
+                f"  in the source but not the header: {only_source}"
+            )
+
     out_tasks = []
     for name in sorted(tasks, key=lambda n: int(n[len("bw_task"):])):
         yields = []
@@ -253,6 +308,9 @@ def build_symbol_table(cdb_text: str, c_source: str, *, fosc: int,
             addr = cdb.lines.get((source_name, lineno))
             if addr is not None:
                 entry["addr"] = addr
+            block = yield_map.get(name, {}).get(state)
+            if block is not None:
+                entry["block"] = block
             yields.append(entry)
 
         missing = [y["state"] for y in yields if "addr" not in y]

@@ -175,3 +175,84 @@ jobs:
               print("\n".join("  FAIL " + f for f in fails)); sys.exit(1)
           print("\nservice path ok")
           PY
+
+      # The 8051 half of the same endpoint, and the only way a browser can ever
+      # obtain a debug symbol table: it cannot run sdcc, and it cannot run
+      # Python. Without this the debugger can halt a program but not say where.
+      - name: POST /compile returns a debug symbol table
+        run: |
+          python - <<'PY'
+          import asyncio, sys
+          import app
+
+          def run(**kw):
+              return asyncio.run(app.compile_source(app.CompileReq(**kw)))
+
+          TWO = """DEVICE STC12C5A60S2:
+            CLOCK 11059200
+            PIN led1 = P1.0 OUTPUT ACTIVE LOW
+            PIN led2 = P1.1 OUTPUT ACTIVE LOW
+            WHEN started:
+              FOREVER:
+                toggle led1
+                wait 150 ms
+            WHEN started:
+              REPEAT 3:
+                toggle led2
+                wait 300 ms
+          """
+          ONE = """DEVICE STC12C5A60S2:
+            CLOCK 11059200
+            PIN led = P1.0 OUTPUT ACTIVE LOW
+            WHEN started:
+              FOREVER:
+                toggle led
+                wait 500 ms
+          """
+
+          fails = []
+
+          r = run(code=TWO, language="pseudocode", symbols=True)
+          if not r.get("success"):
+              fails.append(f"two-task compile failed: {r.get('error')}")
+          else:
+              s = r.get("symbols")
+              if not s:
+                  fails.append(f"no symbol table: {r.get('symbols_error')}")
+              else:
+                  tasks = s["scheduler"]["tasks"]
+                  ys = [y for t in tasks for y in t["yields"]]
+                  if len(tasks) != 2:
+                      fails.append(f"expected 2 tasks, got {len(tasks)}")
+                  # An address is the whole point: without --debug reaching the
+                  # LINK step the .cdb has symbols and no addresses at all.
+                  if any("addr" not in y for y in ys):
+                      fails.append("a yield has no code address")
+                  if s["scheduler"]["bw_ms"]["space"] != "iram":
+                      fails.append("bw_ms is not in iram")
+                  print(f"  ok  {len(tasks)} tasks, {len(ys)} yields, "
+                        f"bw_ms @ 0x{s['scheduler']['bw_ms']['addr']:02x}, {r['bytes']} B")
+
+          # A single WHEN has no scheduler, so there is no Level 1 position to
+          # describe. That must not fail the BUILD — the image is fine.
+          r = run(code=ONE, language="pseudocode", symbols=True)
+          if not r.get("success"):
+              fails.append(f"single-task compile should still succeed: {r.get('error')}")
+          elif r.get("symbols") is not None:
+              fails.append("a single-WHEN program cannot have a symbol table")
+          elif "single-WHEN" not in (r.get("symbols_error") or ""):
+              fails.append(f"unhelpful reason: {r.get('symbols_error')}")
+          else:
+              print("  ok  single-WHEN builds, and says why it has no table")
+
+          # Not asking for symbols must change nothing.
+          r = run(code=TWO, language="pseudocode")
+          if r.get("symbols") is not None or r.get("symbols_error") is not None:
+              fails.append("symbols leaked into a request that did not ask")
+          else:
+              print("  ok  a plain compile is untouched")
+
+          if fails:
+              print("\n".join("  FAIL " + f for f in fails)); sys.exit(1)
+          print("\nsymbol table ok")
+          PY

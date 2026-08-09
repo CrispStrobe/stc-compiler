@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -176,6 +177,62 @@ def main() -> int:
            "a WAIT is labelled as one")
         ok(any(y["label"] == "repeat_top" for y in sched["tasks"][1]["yields"]),
            "a REPEAT head is labelled as one")
+
+        print("the @bw yield map: block ids, and the refusal when it has drifted")
+        # sb3-creator's generateC(project, {debug: true}) writes this header; the
+        # emitter in THIS repo does not, because pseudocode has no blocks. So the
+        # fixture is built from the C's own case labels — what is under test here
+        # is the merge and the drift refusal, not the other repo's emitter.
+        ok(all("block" not in y for t in sched["tasks"] for y in t["yields"]),
+           "headerless C still produces a table, just without block ids")
+
+        # An id containing `*/` is the case the percent-encoding exists for: it
+        # would otherwise close the comment the header lives in.
+        def synth_header(cases):
+            lines = ["/* @bw-begin", " * @bw device stc12c5a60s2"]
+            for task, state in cases:
+                raw = f"a*/b-{task}-{state}" if state == 0 else f"blk({task}/{state})"
+                enc = quote(raw, safe="").replace("*", "%2A")
+                lines.append(f" * @bw yield {task} {state} {enc} yielded")
+            lines.append(" * @bw-end */")
+            return "\n".join(lines) + "\n"
+
+        # Appended rather than prepended: the header's position is irrelevant to the
+        # scanner, and appending leaves every line number — and so every .cdb line
+        # record — exactly where it was. The "addresses are unchanged" check below
+        # is then testing the merge rather than a line shift.
+        real_cases = [(t["name"], y["state"]) for t in sched["tasks"] for y in t["yields"]]
+        with_header = c_text + synth_header(real_cases)
+        merged = stc_symtab.build_symbol_table(
+            cdb_text, with_header, fosc=11059200, device="stc12c5a60s2"
+        )
+        got = [(t["name"], y["state"], y.get("block"))
+               for t in merged["scheduler"]["tasks"] for y in t["yields"]]
+        want = [(task, state,
+                 f"a*/b-{task}-{state}" if state == 0 else f"blk({task}/{state})")
+                for task, state in real_cases]
+        ok(sorted(got) == sorted(want), "every yield carries its block id, decoded exactly")
+        ok(any("*/" in (b or "") for _, _, b in got),
+           "including one that would have closed the C comment")
+        # The addresses must not have moved: adding a header is metadata only.
+        ok([y["addr"] for t in merged["scheduler"]["tasks"] for y in t["yields"]]
+           == [y["addr"] for t in sched["tasks"] for y in t["yields"]],
+           "and the code addresses are unchanged")
+
+        print("  a map that disagrees with the case labels is refused")
+        for label, cases in (
+            ("a state the source does not have", real_cases + [("bw_task0", 99)]),
+            ("a state the header is missing", real_cases[:-1]),
+            ("a task that is not in the source", real_cases + [("bw_task9", 0)]),
+        ):
+            try:
+                stc_symtab.build_symbol_table(
+                    cdb_text, c_text + synth_header(cases),
+                    fosc=11059200, device="stc12c5a60s2",
+                )
+                ok(False, f"should have raised: {label}")
+            except stc_symtab.SymbolTableError as exc:
+                ok("disagrees with the case labels" in str(exc), f"refused: {label}")
 
         print("the single-task case refuses rather than emitting an empty table")
         c2, cdb2, _ = build(SINGLE_TASK, workdir / "single" if False else workdir)
