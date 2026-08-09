@@ -131,6 +131,34 @@ jobs:
           path: avr/
           retention-days: 14
 
+  # The static site. It claims to run the project's own transpiler in the
+  # browser rather than a JavaScript copy of it, and the only way to know
+  # that is to start a browser and watch it happen.
+  pages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: docs/ still mirrors the transpiler
+        run: python3 ./scripts/test-pages.py
+      - name: Install a browser
+        run: |
+          npm install --no-save playwright@1.60.0
+          npx playwright install --with-deps chromium
+      - name: Transpile every example in the browser
+        run: |
+          (cd docs && python3 -m http.server 8765 &) 
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:8765/index.html >/dev/null && break
+            sleep 0.5
+          done
+          node scripts/check-pages.js http://localhost:8765
+
   # The end-to-end path: pseudocode in, Intel HEX out, through the real
   # endpoint rather than through the emitter alone.
   service:

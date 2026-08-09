@@ -1,0 +1,380 @@
+<!doctype html>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>BrickWright pseudocode → C, MicroPython, sketches</title>
+<link rel=icon href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>⚙</text></svg>">
+<style>
+  :root {
+    --bg: #fbfbfa; --fg: #1c1c1a; --dim: #6b6b66; --line: #ddddd8;
+    --panel: #fff; --accent: #1f6feb; --ok: #14804a; --err: #b3261e;
+    --code: #f4f4f1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16171a; --fg: #e7e7e4; --dim: #9a9a94; --line: #2e3035;
+      --panel: #1d1e22; --accent: #6ea8ff; --ok: #4ec98a; --err: #ff7b72;
+      --code: #121316;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    padding: 1.1rem 1.25rem .9rem; border-bottom: 1px solid var(--line);
+  }
+  h1 { font-size: 1.05rem; margin: 0 0 .25rem; font-weight: 620; }
+  header p { margin: 0; color: var(--dim); font-size: .86rem; max-width: 62ch; }
+  main { display: grid; gap: 1rem; padding: 1rem 1.25rem 2rem; }
+  @media (min-width: 900px) { main { grid-template-columns: 1fr 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    display: flex; flex-direction: column; min-width: 0;
+  }
+  .bar {
+    display: flex; gap: .5rem; align-items: center; flex-wrap: wrap;
+    padding: .55rem .7rem; border-bottom: 1px solid var(--line);
+  }
+  .bar strong { font-size: .78rem; text-transform: uppercase;
+                letter-spacing: .06em; color: var(--dim); font-weight: 600; }
+  .grow { flex: 1; }
+  select, button, textarea, pre {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  }
+  select, button {
+    font-size: .82rem; padding: .3rem .55rem; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--fg);
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.08); color: #fff; }
+  textarea, pre {
+    margin: 0; border: 0; padding: .7rem; background: var(--code);
+    color: var(--fg); font-size: 12.5px; line-height: 1.55; min-height: 22rem;
+    resize: vertical; width: 100%; overflow: auto; white-space: pre;
+    border-radius: 0 0 8px 8px;
+  }
+  textarea { outline: 0; }
+  #status { font-size: .8rem; color: var(--dim); padding: .45rem .7rem;
+            border-top: 1px solid var(--line); }
+  #status.ok { color: var(--ok); } #status.err { color: var(--err); }
+  footer { padding: 0 1.25rem 2rem; color: var(--dim); font-size: .8rem;
+           max-width: 78ch; }
+  footer code { background: var(--code); padding: .05rem .3rem; border-radius: 4px; }
+  a { color: var(--accent); }
+</style>
+
+<header>
+  <h1>BrickWright pseudocode → C, MicroPython and Arduino sketches</h1>
+  <p>
+    Runs entirely in this page. The transpiler is the project's own
+    <code>stc_pseudocode.py</code>, executed by CPython compiled to
+    WebAssembly — not a second implementation in JavaScript, so there is
+    nothing here that can drift from what the API and the test suites use.
+  </p>
+</header>
+
+<main>
+  <section class=panel>
+    <div class=bar>
+      <strong>pseudocode</strong>
+      <select id=example title="Load an example"></select>
+      <span class=grow></span>
+      <button id=go class=primary disabled>Transpile</button>
+    </div>
+    <textarea id=source spellcheck=false></textarea>
+  </section>
+
+  <section class=panel>
+    <div class=bar>
+      <strong id=outlabel>output</strong>
+      <select id=view>
+        <option value=code>generated source</option>
+        <option value=canon>canonical pseudocode</option>
+      </select>
+      <span class=grow></span>
+      <button id=dl disabled>Download</button>
+      <button id=copy disabled>Copy</button>
+      <button id=hex disabled title="Sent to the hosted compiler; nothing else leaves this page">Compile to .hex</button>
+    </div>
+    <pre id=out>Loading Python…</pre>
+    <div id=status>starting</div>
+  </section>
+</main>
+
+<footer>
+  <p>
+    <strong>Transpiling is local; compiling is not.</strong> Turning C into a
+    flashable image needs SDCC or avr-gcc, which are native binaries this page
+    cannot run, so <em>Compile to .hex</em> posts the generated source to the
+    hosted API at <code>stc-compiler.vercel.app</code> and everything else
+    stays here. A micro:bit needs no compiler at all — MicroPython is
+    interpreted on the device — and an Arduino sketch is built by the Arduino
+    IDE, so for those the download <em>is</em> the deliverable.
+  </p>
+  <p>
+    An <code>.ino</code> belongs in a folder of the same name; add a
+    <code>NAME blink</code> line and you get <code>blink.ino</code>.
+    Source: <a href="https://github.com/CrispStrobe/stc-compiler">CrispStrobe/stc-compiler</a>.
+  </p>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v314.0.3/full/pyodide.js"></script>
+<script>
+const API = "https://stc-compiler.vercel.app";
+const $ = id => document.getElementById(id);
+let py = null, result = null, image = null;
+
+const EXAMPLES = {
+  "blink — STC12": `DEVICE STC12C5A60S2:
+  NAME blink
+  CLOCK 11059200
+  PIN led = P1.0 OUTPUT ACTIVE LOW
+
+  WHEN started:
+    FOREVER:
+      toggle led
+      wait 500 ms
+`,
+  "two scripts — Arduino": `DEVICE ARDUINO-UNO:
+  NAME heartbeat
+  PIN slow = D13 OUTPUT
+  PIN fast = D12 OUTPUT ACTIVE LOW
+
+  WHEN started:
+    FOREVER:
+      toggle slow
+      wait 500 ms
+
+  WHEN started:
+    FOREVER:
+      toggle fast
+      wait 300 ms
+`,
+  "buttons and a tone — micro:bit": `DEVICE MICROBIT:
+  NAME chirp
+  PIN led = P0 OUTPUT
+  PIN buzz = P2 TONE
+  PIN btn = BUTTON_A INPUT
+
+  WHEN started:
+    FOREVER:
+      toggle led
+      wait 400 ms
+
+  WHEN btn pressed:
+    set buzz to 880 hz
+    wait 120 ms
+    set buzz to 0 hz
+`,
+  "PWM, tone and serial — ATmega328P": `DEVICE ATMEGA328P:
+  NAME parity
+  CLOCK 16000000
+  TABLE font = 0x3F, 0x06, 0x5B, 0x4F
+  PIN dim = D11 PWM ACTIVE LOW
+  PIN buzz = D9 TONE
+  PIN pot = A0 ANALOG
+
+  WHEN started:
+    print "ready"
+    set i to 0
+    FOREVER:
+      set dim to font[i] percent
+      set buzz to 440 hz
+      print pot
+      wait 200 ms
+      set buzz to 0 hz
+      change i by 1
+`,
+  "a 74HC595 — ATmega328P": `DEVICE ATMEGA328P:
+  NAME expander
+  CLOCK 16000000
+  TABLE font = 0x3F, 0x06, 0x5B
+  PART sr = 74HC595 DATA D4 CLOCK D7 LATCH D8
+
+  WHEN started:
+    set i to 0
+    FOREVER:
+      set sr to font[i]
+      wait 200 ms
+      change i by 1
+`,
+};
+
+function setStatus(text, kind) {
+  $('status').textContent = text;
+  $('status').className = kind || '';
+}
+
+// The transpiler side, in Python, so the browser never reimplements it.
+const GLUE = `
+import json, sys
+sys.path.insert(0, '/app')
+import stc_pseudocode as sp
+
+def bw_devices():
+    seen, out = set(), []
+    for key in sorted(sp.TARGETS):
+        target = sp.TARGETS[key]
+        if id(target) in seen:
+            continue
+        seen.add(id(target))
+        out.append({"key": key, "display": target.display,
+                    "toolchain": target.toolchain})
+    return json.dumps(out)
+
+def bw_transpile(source):
+    try:
+        program = sp.parse(source)
+        target = program.target
+        return json.dumps({
+            "ok": True,
+            "code": sp.emit(program),
+            "canon": sp.emit_pseudocode(program),
+            "language": sp.source_language(program),
+            "device": target.display,
+            "toolchain": target.toolchain,
+            "compilable": target.toolchain in ("sdcc-mcs51", "avr-gcc"),
+            "hint": target.compile_hint,
+            "filename": (program.name or "main") + "." + target.source_extension,
+            "stem": program.name or "main",
+        })
+    except sp.PseudocodeError as exc:
+        return json.dumps({"ok": False, "error": str(exc), "line": exc.line})
+    except Exception as exc:
+        return json.dumps({"ok": False,
+                           "error": type(exc).__name__ + ": " + str(exc)})
+`;
+
+async function boot() {
+  try {
+    setStatus('loading CPython (WebAssembly)…');
+    py = await loadPyodide();
+    setStatus('loading the transpiler…');
+    py.FS.mkdirTree('/app');
+    for (const name of ['stc_pseudocode.py', 'bw_microbit.py']) {
+      const response = await fetch(name + '?v=1');
+      if (!response.ok) throw new Error(name + ': HTTP ' + response.status);
+      py.FS.writeFile('/app/' + name, await response.text());
+    }
+    py.runPython(GLUE);
+    const devices = JSON.parse(py.globals.get('bw_devices')());
+    $('go').disabled = false;
+    setStatus(devices.length + ' devices ready — everything below runs in this page', 'ok');
+    $('out').textContent =
+      'Ready.\n\nDevices:\n' +
+      devices.map(d => '  ' + d.display.padEnd(24) + d.toolchain).join('\n') +
+      '\n\nPress Transpile.';
+    transpile();
+  } catch (err) {
+    setStatus('could not start: ' + err, 'err');
+    $('out').textContent =
+      String(err) + '\n\nThis page needs to reach the jsDelivr CDN for Pyodide.';
+  }
+}
+
+function transpile() {
+  if (!py) return;
+  image = null;
+  let data;
+  try {
+    data = JSON.parse(py.globals.get('bw_transpile')($('source').value));
+  } catch (err) {
+    setStatus('transpiler crashed: ' + err, 'err');
+    return;
+  }
+  result = data;
+  if (!data.ok) {
+    $('out').textContent = data.error;
+    setStatus(data.line ? 'line ' + data.line : 'failed', 'err');
+    $('dl').disabled = $('copy').disabled = $('hex').disabled = true;
+    return;
+  }
+  render();
+  $('dl').disabled = $('copy').disabled = false;
+  $('hex').disabled = !data.compilable;
+  const lines = data.code.split('\n').length;
+  setStatus(`${data.device} → ${data.filename} · ${lines} lines of ` +
+            `${data.language === 'python' ? 'MicroPython' : 'C'}` +
+            (data.compilable ? '' : ' · nothing to compile: ' + data.hint), 'ok');
+}
+
+function render() {
+  if (!result || !result.ok) return;
+  const view = $('view').value;
+  $('out').textContent = view === 'canon' ? result.canon : result.code;
+  $('outlabel').textContent = view === 'canon' ? 'canonical' : result.filename;
+}
+
+function save(bytes, filename, type) {
+  const url = URL.createObjectURL(new Blob([bytes], {type: type || 'text/plain'}));
+  const anchor = document.createElement('a');
+  anchor.href = url; anchor.download = filename;
+  document.body.appendChild(anchor); anchor.click(); anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+$('go').onclick = transpile;
+$('view').onchange = render;
+$('source').addEventListener('keydown', event => {
+  if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') transpile();
+});
+
+$('dl').onclick = () => {
+  if (!result || !result.ok) return;
+  if (image) return save(image.bytes, image.filename, 'application/octet-stream');
+  save(result.code, result.filename);
+};
+
+$('copy').onclick = async () => {
+  if (!result || !result.ok) return;
+  await navigator.clipboard.writeText($('out').textContent);
+  const was = $('copy').textContent;
+  $('copy').textContent = 'Copied';
+  setTimeout(() => { $('copy').textContent = was; }, 1200);
+};
+
+$('hex').onclick = async () => {
+  if (!result || !result.ok) return;
+  setStatus('compiling on ' + API + ' …');
+  $('hex').disabled = true;
+  try {
+    const response = await fetch(API + '/compile', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({code: $('source').value, language: 'pseudocode'}),
+    });
+    const data = await response.json();
+    if (!data.success) {
+      setStatus('the compiler refused: ' + (data.error || 'unknown'), 'err');
+      $('out').textContent = data.error || 'unknown error';
+    } else {
+      const binary = atob(data.base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      image = {bytes, filename: data.filename};
+      $('out').textContent = new TextDecoder().decode(bytes);
+      $('outlabel').textContent = data.filename;
+      setStatus(`${data.bytes} bytes → ${data.filename} · Download now gives the image`, 'ok');
+    }
+  } catch (err) {
+    setStatus('could not reach the compiler: ' + err, 'err');
+  }
+  $('hex').disabled = false;
+};
+
+for (const name of Object.keys(EXAMPLES)) {
+  const option = document.createElement('option');
+  option.value = option.textContent = name;
+  $('example').appendChild(option);
+}
+$('example').onchange = () => {
+  $('source').value = EXAMPLES[$('example').value];
+  transpile();
+};
+$('source').value = EXAMPLES[Object.keys(EXAMPLES)[0]];
+
+boot();
+</script>

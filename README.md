@@ -141,6 +141,26 @@ text.
 Reports the SDCC version and the known targets. Also the cheapest way to see
 whether a cold start staged the toolchain correctly.
 
+### GitHub Pages — the transpiler with no server at all
+
+<https://crispstrobe.github.io/stc-compiler/>
+
+Everything except turning C into an image runs in the page. It loads CPython
+compiled to WebAssembly and imports **this repository's own
+`stc_pseudocode.py`** — not a JavaScript reimplementation, so there is no
+second implementation that can drift from what the API and the test suites
+use. `docs/` keeps its own copy of the two modules because Pages serves that
+directory and nothing above it; `scripts/test-pages.py` fails the moment the
+copy and the original disagree.
+
+That covers more than it sounds like: a micro:bit needs no compiler (MicroPython
+is interpreted on the device) and an Arduino sketch is built by the IDE, so for
+those two targets the page is the whole toolchain. **Compile to .hex** posts to
+the hosted API for the parts that genuinely need SDCC or avr-gcc, and says so.
+
+CI starts a browser and transpiles every example in it, because "the page
+loads" and "CPython starts in it and emits MicroPython" are different claims.
+
 ### `GET /`
 
 A small browser UI with the blink example preloaded — no build step, no CDN.

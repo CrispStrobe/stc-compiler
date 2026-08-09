@@ -1,0 +1,3091 @@
+"""
+stc_pseudocode — BrickWright-style pseudocode ⇄ C for the STC12 / 8051.
+
+Parsing is target-neutral and so is the control-flow lowering; everything that
+knows about a chip lives behind `Target` (registers, headers, the timebase,
+what a pin location token even means). See that class for where the seam runs
+and why it runs there.
+
+The dialect follows the conventions already used by sb3-creator's pseudocode
+(`SPRITE Name:` / `WHEN flag clicked:` / `REPEAT n:` / `IF x > y THEN:` /
+`set v to n`): UPPERCASE for structure and control flow, lowercase for
+statements, indentation for nesting, and `=` comparing rather than assigning.
+
+Parsing builds an **AST**, and both back ends walk it:
+
+    text ──parse──▶ Program (AST) ──emit_c─────────▶ C ──▶ SDCC ──▶ .hex
+                          │
+                          └────────emit_pseudocode─▶ text
+
+That is the same shape as sb3-creator, where blocks are the IR and
+`decompile(project)` walks it back to pseudocode — and it is what makes the
+round-trip testable, because `parse` and `emit_pseudocode` have to be inverses.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+
+# Which PCA module each pin carries, on the STC12C5A60S2 with AUXR1.PCA_P4
+# clear. Setting that bit moves them to P4.2/P4.3, and other STC12 variants
+# differ again -- so this is a per-target fact, not an 8051 one.
+PCA_PINS = {(1, 3): 0, (1, 4): 1}
+
+BW_BAUD = 9600          # the console rate; not settable from the dialect yet
+
+
+def _c_string(text: str) -> str:
+    """Escape a literal for a C string, quotes and all.
+
+    The dialect's `print "..."` regex already forbids a quote inside the text,
+    but not a backslash -- and `print "x \\"` put a lone backslash at the end of
+    the emitted literal, where it escaped the CLOSING quote and left the
+    generated C unterminated. Escaping properly is cheaper than reasoning
+    about which characters the parser happens to exclude today.
+    """
+    out = []
+    for char in text:
+        if char in ("\\", '"'):
+            out.append("\\" + char)
+        elif char == "\n":
+            out.append("\\n")
+        elif char == "\t":
+            out.append("\\t")
+        elif ord(char) < 0x20 or ord(char) > 0x7E:
+            out.append(f"\\x{ord(char):02x}")
+        else:
+            out.append(char)
+    return "".join(out)
+
+PORT_RE = re.compile(r"^P([0-4])\.([0-7])$", re.I)
+NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+class PseudocodeError(Exception):
+    """Carries a line number so the caller can point at the offending line."""
+
+    def __init__(self, line: int, message: str):
+        self.line = line
+        super().__init__(f"line {line}: {message}")
+
+
+# ============================================================== expression AST
+
+class Expr:
+    pass
+
+
+@dataclass
+class Num(Expr):
+    value: float
+
+    def text(self) -> str:
+        return str(int(self.value)) if float(self.value).is_integer() else str(self.value)
+
+
+@dataclass
+class PortRef(Expr):
+    port: str
+
+
+@dataclass
+class Index(Expr):
+    """table[expr] -- a read from a constant lookup table in code space.
+
+    A seven-segment font, an LED-matrix frame and a note table are all this
+    shape, and none of them is expressible without it. The table is const and
+    lives in flash, which is the abundant resource here; RAM is not.
+    """
+    table: str
+    where: Expr
+
+
+@dataclass
+class Var(Expr):
+    name: str
+
+
+@dataclass
+class PinRef(Expr):
+    name: str
+
+
+@dataclass
+class Unary(Expr):
+    op: str            # "not" | "-"
+    operand: Expr
+
+
+@dataclass
+class Binary(Expr):
+    op: str            # pseudocode spelling: or and = != < > <= >= + - * / %
+    left: Expr
+    right: Expr
+
+
+# Lowest binding first. The index doubles as precedence, so the emitters can
+# work out where parentheses are genuinely needed instead of adding them
+# everywhere -- which matters because the pseudocode back end's output has to
+# parse back to the identical tree.
+PRECEDENCE = [
+    ("or",),
+    ("and",),
+    ("=", "!=", "<", ">", "<=", ">="),
+    ("+", "-"),
+    ("*", "/", "%"),
+]
+LEVEL = {op: index for index, ops in enumerate(PRECEDENCE) for op in ops}
+UNARY_LEVEL = len(PRECEDENCE)
+
+TO_C = {"or": "||", "and": "&&", "=": "==", "!=": "!=",
+        "<": "<", ">": ">", "<=": "<=", ">=": ">=",
+        "+": "+", "-": "-", "*": "*", "/": "/", "%": "%"}
+SYNONYM = {"==": "=", "<>": "!="}
+
+
+# =============================================================== statement AST
+
+class Stmt:
+    pass
+
+
+@dataclass
+class SetPin(Stmt):
+    pin: str
+    high: bool
+    # How it was written, so decompiling gives back the same sentence:
+    # "turn on/off" reads better for LEDs, "set high/low" for logic levels.
+    style: str = "level"        # "level" | "onoff"
+
+
+@dataclass
+class SetPart(Stmt):
+    part: str
+    value: Expr
+
+
+@dataclass
+class SetPort(Stmt):
+    port: str
+    value: Expr
+
+
+@dataclass
+class Print(Stmt):
+    """Write a line to the serial console.
+
+    Either a literal or a number, never both and never concatenated: string
+    building on a part with 256 bytes of RAM is a bigger feature than it looks,
+    and two `print`s cost nothing.
+    """
+    text: str = ""              # a literal, when value is None
+    value: Expr = None          # a number, when text is ""
+
+
+@dataclass
+class SetTone(Stmt):
+    """Play a frequency on a tone pin, or silence it with 0.
+
+    Not PWM: a tone needs a settable PERIOD, and every PWM path on this chip
+    has a fixed carrier -- see STC12-PERIPHERAL-MODEL.md 5b for why the
+    obvious PCA route gives 3.9 Hz. This is Timer 1 toggling the pin.
+    """
+    pin: str
+    hz: Expr
+
+
+@dataclass
+class SetPwm(Stmt):
+    """Set a PWM pin's duty, as a percentage of time the load is ON.
+
+    The AST stores what was written -- brightness -- not the compare value.
+    Polarity and the hardware's inverted comparator are the target's problem,
+    so decompiling gives back the same sentence on an active-low pin as on an
+    active-high one.
+    """
+    pin: str
+    value: Expr
+
+
+@dataclass
+class Toggle(Stmt):
+    pin: str
+
+
+@dataclass
+class Wait(Stmt):
+    amount: Expr
+    unit: str                   # "seconds" | "ms"
+
+
+@dataclass
+class WaitUntil(Stmt):
+    cond: Expr
+
+
+@dataclass
+class SetVar(Stmt):
+    name: str
+    value: Expr
+
+
+@dataclass
+class ChangeVar(Stmt):
+    name: str
+    delta: Expr
+
+
+@dataclass
+class Forever(Stmt):
+    body: list
+
+
+@dataclass
+class Repeat(Stmt):
+    count: Expr
+    body: list
+
+
+@dataclass
+class Loop(Stmt):
+    cond: Expr
+    body: list
+    until: bool = False         # REPEAT UNTIL c  vs  WHILE c
+
+
+@dataclass
+class If(Stmt):
+    cond: Expr
+    body: list
+    orelse: list = field(default_factory=list)
+
+
+@dataclass
+class Call(Stmt):
+    name: str
+    args: list
+
+
+@dataclass
+class Stop(Stmt):
+    pass
+
+
+# ===================================================================== program
+
+@dataclass
+class Pin:
+    """A declared pin, in terms every target shares.
+
+    `where` is the token exactly as the target canonicalised it -- "P1.0" on an
+    8051, "D13" or "A0" on an Arduino. The AST stores that string and nothing
+    about ports, bits or registers: those are the target's business, and a
+    target that has no registers at all still has to fit here.
+    """
+    name: str
+    where: str
+    direction: str              # "output" | "input" | "analog" | "pwm" | "tone"
+    active_low: bool = False
+
+
+@dataclass
+class Port:
+    """A whole 8-bit port, written at once.
+
+    Not sugar for eight pins. A seven-segment digit or an LED-matrix column has
+    to land as ONE store, or the display shows the intermediate states -- which
+    is visible as ghosting rather than as a bug report.
+    """
+    name: str
+    port: int                   # opaque target-side identity, for clash checks
+    direction: str              # "output" | "input"
+    active_low: bool = False
+    # The location token as the target canonicalised it -- "P2" on an 8051,
+    # "D" on an AVR. Same job as Pin.where: it is what the pseudocode back end
+    # writes, so the round trip does not depend on how `port` is numbered.
+    where: str = ""
+    # Where the byte is written and where it is read. Separate because they
+    # are separate registers on an AVR: writing PORTB drives the pins, reading
+    # PORTB gives you back the latch, and only PINB gives the actual levels.
+    # On an 8051 both are the one SFR, which is why these default to it.
+    write_sfr: str = ""
+    read_sfr: str = ""
+
+    @property
+    def label(self) -> str:
+        return self.where or f"P{self.port}"
+
+    @property
+    def sfr(self) -> str:
+        return self.write_sfr or f"P{self.port}"
+
+    @property
+    def read(self) -> str:
+        return self.read_sfr or self.sfr
+
+
+@dataclass
+class ShiftPart:
+    """A 74HC595: eight outputs for three pins.
+
+    Modelled as a PORT that costs three pins instead of eight, so it takes the
+    same `set ... to ...` and the same polarity. A user who has run out of pins
+    should not have to learn a second vocabulary to say the same thing.
+
+    Admitted to the parts library because its correctness depends on the ORDER
+    of edges and not their duration -- the part is specified into the tens of
+    megahertz and has no minimum clock period an 8051 could violate. See
+    docs/PARTS-MODEL.md.
+    """
+    name: str
+    kind: str                   # "74hc595"
+    data: Pin                   # three OUTPUT pins, resolved by the target
+    clock: Pin
+    latch: Pin
+    active_low: bool = False
+
+    @property
+    def claimed(self) -> list:
+        return [self.data, self.clock, self.latch]
+
+    @property
+    def claimed_where(self) -> list:
+        """The three locations as the target spells them, for clash checks."""
+        return [pin.where for pin in self.claimed]
+
+
+@dataclass
+class Pin8051(Pin):
+    """The 8051 view: a port and a bit, which is what the registers are named for."""
+    port: int = 0
+    bit: int = 0
+
+    @property
+    def sfr(self) -> str:
+        return f"P{self.port}_{self.bit}"
+
+    @property
+    def mask(self) -> int:
+        return 1 << self.bit
+
+    @property
+    def adc_channel(self) -> int:
+        # ADC channel n is on P1.n. True of this family, not of 8051s in
+        # general, and certainly not a rule any other target should inherit.
+        return self.bit
+
+    @property
+    def pca_module(self) -> int:
+        # CCP0/PWM0 is P1.3 and CCP1/PWM1 is P1.4 on the STC12C5A60S2.
+        # Other STC12 variants put them elsewhere (the STC12C5201AD uses
+        # P3.7/P3.5), so this belongs to the target, not to "8051".
+        return PCA_PINS[(self.port, self.bit)]
+
+
+@dataclass
+class Procedure:
+    name: str
+    params: list
+    body: list = field(default_factory=list)
+
+    @property
+    def c_name(self) -> str:
+        return "bw_" + re.sub(r"\W", "_", self.name)
+
+
+# ============================================================ target interface
+
+class Target:
+    """Everything below the AST: what a pin is, how you drive it, what a
+    millisecond costs, and what has to happen before main()'s first statement.
+
+    The control-flow lowering (`stmts_c`, `stmts_task`) is portable and must
+    stay that way, so it never formats a register name -- it asks the target
+    for a statement or an expression and pastes that in. The seam is drawn
+    here rather than one layer down because targets differ at *statement*
+    level too, not only in primitives: a target with no `goto` cannot use the
+    Duff's-device lowering at all and has to schedule some other way.
+    """
+
+    key = ""                    # canonical device token, as written in DEVICE
+    display = ""                # how to name it in an error message
+
+    # Which of the later peripheral features this target can emit. Two target
+    # families were built in parallel on this interface -- one adding
+    # architectures (Arduino, AVR), one adding peripherals (PWM, tone, serial,
+    # whole-port I/O, tables, parts) -- and they met here. A target that does
+    # not list a feature refuses it BY NAME at the declaration or statement
+    # that asked for it, rather than failing with an AttributeError three
+    # layers down inside the emitter, which is what would otherwise happen the
+    # first time somebody wrote `set led to 50 percent` for an Arduino.
+    supports: frozenset = frozenset()
+
+    # Whether the serial baud rate comes from somewhere OTHER than the timer a
+    # TONE pin needs. It is an 8051 contention: on the STC89 the baud rate is
+    # Timer 1 and so is the tone, in different modes, so a program cannot both
+    # print and sound a note. The STC12 has a dedicated baud-rate timer and is
+    # fine. Any target whose console and tone do not share one timer -- which
+    # is every non-8051 one -- leaves this True and the check passes.
+    baud_from_brt = True
+
+    # Which compiler turns this target's output into an image. Transpiling is
+    # free; compiling is not, and the hosted service vendors SDCC only. Saying
+    # so here lets the caller refuse clearly instead of handing Arduino C++ to
+    # `sdcc -mmcs51` and reporting whatever it makes of that.
+    toolchain = "sdcc-mcs51"
+
+    # What to tell someone whose device transpiles here but cannot be built
+    # here. Target-specific, because "use the other device" is good advice for
+    # an Arduino and nonsense for a micro:bit.
+    compile_hint = ""
+
+    # Extension for the generated source when it is handed back as a file.
+    # Not always "c": Arduino core source wants .ino so the IDE opens it as a
+    # sketch, and a micro:bit target emits Python.
+    source_extension = "c"
+
+    # The C type a millisecond count lives in, and its signed counterpart for
+    # the scheduler's wraparound-safe deadline compare. 16 bits is right for a
+    # Timer-0 counter we increment ourselves; a target whose clock is the
+    # core's `millis()` gets a 32-bit one whether it wants it or not, and
+    # casting that to a 16-bit int would make every deadline past 32 s wrong.
+    time_type = "unsigned int"
+    time_signed = "int"
+
+    # ---- pins -----------------------------------------------------------
+    def shift_helper(self, part) -> list[str]:
+        """The 74HC595 bit-banger, in terms of this target's pin writes.
+
+        Nothing about shifting a byte out on three pins is chip-specific --
+        the part is specified into the tens of megahertz and has no minimum
+        clock period any of these cores could violate, so only the ORDER of
+        the edges matters. That is why one implementation serves every target
+        that can write a pin at all.
+        """
+        return [
+            f"/* {part.kind.upper()}: eight outputs for three pins. Data is",
+            " * sampled on the rising edge of the shift clock, and the latch",
+            " * transfers on its own rising edge.",
+            " *",
+            " * MSB first, so the byte reads left to right on the outputs. */",
+            f"static void bw_part_{part.name}(unsigned char value)",
+            "{",
+            "    unsigned char i;",
+            "    " + self.write_pin(part.clock, False),
+            "    " + self.write_pin(part.latch, False),
+            "    for (i = 0; i < 8; i++) {",
+            "        if (value & 0x80) { " + self.write_pin(part.data, True) + " }",
+            "        else { " + self.write_pin(part.data, False) + " }",
+            "        value = (unsigned char)(value << 1);",
+            "        " + self.write_pin(part.clock, True),
+            "        " + self.write_pin(part.clock, False),
+            "    }",
+            "    " + self.write_pin(part.latch, True)
+            + "      /* transfer to the outputs */",
+            "    " + self.write_pin(part.latch, False),
+            "}",
+            "",
+        ]
+
+    def resolve_port(self, program, name, where, direction, active_low,
+                     line: int) -> "Port":
+        """Turn a whole-port declaration's location token into a Port.
+
+        Only reached by targets whose `supports` includes "port"; the others
+        are refused by name before this is called.
+        """
+        raise NotImplementedError
+
+    def resolve_pin(self, program, name, where, direction, active_low,
+                    line: int) -> Pin:
+        """Turn the declaration's opaque location token into a Pin, or explain
+        why this target cannot offer what was asked for."""
+        raise NotImplementedError
+
+    def write_pin(self, pin: Pin, high: bool) -> str:
+        raise NotImplementedError
+
+    def toggle_pin(self, pin: Pin) -> str:
+        raise NotImplementedError
+
+    def read_pin(self, pin: Pin) -> str:
+        raise NotImplementedError
+
+    def read_analog(self, pin: Pin) -> str:
+        raise NotImplementedError
+
+    # ---- time -----------------------------------------------------------
+    def delay(self, ms: str) -> str:
+        """A blocking wait, as a statement. Only the straight-line back end
+        uses it; tasks yield instead."""
+        raise NotImplementedError
+
+    def now(self) -> str:
+        """Milliseconds since boot, as an expression."""
+        raise NotImplementedError
+
+    # ---- the shell around the generated statements -----------------------
+    def prologue(self, program) -> list[str]:
+        raise NotImplementedError
+
+    def runtime(self, program, tasks: bool) -> list[str]:
+        """The tick/now/delay machinery and any peripheral helpers. A target
+        whose language already provides a timebase returns nothing."""
+        raise NotImplementedError
+
+    def setup(self, program) -> list[str]:
+        """The first statements of main(): pin directions, peripherals, timer."""
+        raise NotImplementedError
+
+    def start_scheduler(self, task_names: list[str]) -> list[str]:
+        """Start the timebase and run the cooperative tasks forever."""
+        raise NotImplementedError
+
+    # A target whose language cannot express the shared lowering overrides
+    # this and emits the whole program itself. MicroPython is the case: no
+    # goto, so the Duff's-device state machines are unavailable and the
+    # cooperative tasks become generators instead. Targets that leave it None
+    # get the C back end below.
+    emit = None
+
+    def main(self, program, setup_lines: list[str], body_lines: list[str],
+             task_names: list[str]) -> list[str]:
+        """The whole shell around the generated statements.
+
+        Not merely main()'s braces: a target is free to have no main() at all.
+        The Arduino core owns main() and calls setup() and loop() from it, so
+        this is two functions there and one here -- a difference the AST
+        walker must not have to know about. `task_names` is empty for a
+        single-script program, and `body_lines` is empty for a multi-script
+        one; exactly one of the two is ever non-empty.
+        """
+        raise NotImplementedError
+
+
+class Stc8051Target(Target):
+    supports = frozenset({"pwm", "tone", "print", "port", "table", "part"})
+
+    """The 8051 families, which differ from each other only in three flags.
+
+    An STC12C5A60S2 drops into an STC89C52 socket pin-for-pin, but the 1T core
+    runs software delay loops 6-12x too fast. Our generated code never
+    busy-waits -- every delay and every scheduler tick is Timer 0 at FOSC/12,
+    which both families count identically -- so the same pseudocode is
+    timing-correct on either chip.
+    """
+
+    def __init__(self, key: str, display: str, header: str,
+                 port_modes: bool, aux_1t_bit: bool, adc: bool, pwm: bool = False):
+        self.key = key
+        self.display = display
+        self.header = header        # the SDCC header with this family's registers
+        self.port_modes = port_modes  # PxM0/PxM1 exist (STC12); STC89 is quasi-bidi
+        self.aux_1t_bit = aux_1t_bit  # AUXR.7 selects T0 1T mode and must be cleared
+        self.adc = adc                # 10-bit ADC on P1 (STC12 only)
+        self.pwm = pwm                # PCA capture/compare modules with PWM mode
+        # Where UART1's baud rate comes from. The STC12 has a dedicated
+        # baud-rate timer; the STC89 has to spend Timer 1 on it, which is the
+        # same Timer 1 a TONE pin wants -- so on that family the two features
+        # are mutually exclusive, and saying so is better than a silent
+        # fight over TMOD.
+        self.baud_from_brt = port_modes
+
+    # ---- pins -----------------------------------------------------------
+    def resolve_port(self, program, name, where, direction, active_low, line):
+        match = re.fullmatch(r"p([0-4])", where, re.I)
+        if not match:
+            raise PseudocodeError(
+                line, f"{where.upper()} is not a port on the {self.display}; "
+                      "use P0 to P4")
+        number = int(match.group(1))
+        # One SFR both ways on an 8051: reading P2 gives the pins, writing it
+        # drives them.
+        return Port(name, number, direction, active_low, where=f"P{number}",
+                    write_sfr=f"P{number}", read_sfr=f"P{number}")
+
+    def resolve_pin(self, program, name, where, direction, active_low, line):
+        match = PORT_RE.match(where)
+        if not match:
+            raise PseudocodeError(
+                line, f"{where.upper()} is not a pin on the {self.display}; "
+                      "use P0.0 to P4.7")
+        port, bit = int(match.group(1)), int(match.group(2))
+
+        # Two names for one physical pin is always a mistake, and nothing
+        # downstream would notice: program.pins is keyed by name, so both
+        # declarations survive and quietly fight over the same register.
+        for other in program.pins.values():
+            if getattr(other, "port", None) == port and getattr(other, "bit", None) == bit:
+                raise PseudocodeError(
+                    line, f"P{port}.{bit} is already declared as {other.name!r} "
+                          f"({other.direction.upper()}); one pin cannot be two things")
+        # And the other way round: a PORT writes all eight bits at once, so a
+        # PIN inside it would be clobbered by every port write.
+        for prev in program.parts.values():
+            if f"P{port}.{bit}" in prev.claimed_where:
+                raise PseudocodeError(
+                    line, f"P{port}.{bit} is claimed by the part {prev.name!r}")
+        for whole in program.ports.values():
+            if whole.port == port:
+                raise PseudocodeError(
+                    line, f"P{port} is already declared as the whole port {whole.name!r}; "
+                          f"a PORT write covers all eight bits and would clobber "
+                          f"P{port}.{bit}")
+
+        if direction == "tone":
+            # Any GPIO will do -- software owns the toggle -- but there is only
+            # one Timer 1, so there is only one tone.
+            for other in program.pins.values():
+                if other.direction == "tone":
+                    raise PseudocodeError(
+                        line, f"only one TONE pin is possible ({other.name!r} already "
+                              f"has it): the tone is Timer 1, and there is one of those")
+        if direction == "pwm":
+            if not self.pwm:
+                raise PseudocodeError(
+                    line, f"PWM needs the PCA, and the {program.part} has none")
+            if (port, bit) not in PCA_PINS:
+                pins = ", ".join(f"P{p}.{b} (module {m})"
+                                 for (p, b), m in sorted(PCA_PINS.items()))
+                raise PseudocodeError(
+                    line, f"PWM is only available on the PCA pins: {pins}. "
+                          f"{where.upper()} has no PCA module. Note those pins are "
+                          f"also ADC channels, so a pin cannot do both.")
+        if direction == "analog":
+            if port != 1:
+                raise PseudocodeError(
+                    line, "ANALOG is only available on P1.0-P1.7 "
+                          f"(ADC0-ADC7), not {where.upper()}")
+            if not self.adc:
+                raise PseudocodeError(
+                    line, f"ANALOG pins need an ADC, and the {program.part} has none")
+        return Pin8051(name, f"P{port}.{bit}", direction, active_low, port, bit)
+
+    def write_pin(self, pin, high):
+        return f"{pin.sfr} = {1 if high else 0};"
+
+    def toggle_pin(self, pin):
+        return f"{pin.sfr} = !{pin.sfr};"
+
+    def read_pin(self, pin):
+        return f"!{pin.sfr}" if pin.active_low else pin.sfr
+
+    def read_analog(self, pin):
+        return f"adc_read({pin.adc_channel})"
+
+    def write_print(self, node) -> str:
+        if node.value is None:
+            return f'bw_print("{_c_string(node.text)}");'
+        return f"bw_print_num({node.value});"
+
+    def write_tone(self, pin, hz: str) -> str:
+        return f"tone_set({hz});"
+
+    def write_pwm(self, pin, value: str) -> str:
+        """Duty, as the percentage of time the LOAD is on.
+
+        pwm_set() takes the percentage of time the PIN is HIGH, so an
+        active-low load -- which is every LED in this toolchain, because a
+        quasi-bidirectional pin sinks 20 mA and sources 230 uA -- inverts
+        here. Emitted as a visible `100 - x` rather than folded away, so the
+        generated C still reads like the pseudocode did.
+        """
+        if pin.active_low:
+            return f"pwm_set({pin.pca_module}, 100 - ({value}));"
+        return f"pwm_set({pin.pca_module}, {value});"
+
+    # ---- time -----------------------------------------------------------
+    def delay(self, ms):
+        return f"delay_ms({ms});"
+
+    def now(self):
+        return "bw_now()"
+
+    # ---- the shell ------------------------------------------------------
+    def prologue(self, program):
+        return [
+            f"#include <{self.header}>",
+            "",
+            f"#define FOSC_HZ {program.clock}UL",
+            "",
+            "/* Timer 0, mode 1, clocked at FOSC/12 -- accuracy depends only on",
+            " * FOSC, and every supported family counts this mode identically, so",
+            " * the same program is timing-correct on a 12T STC89 and a 1T STC12",
+            " * or STC15. Nothing in the generated code ever busy-waits. */",
+            "#define T0_RELOAD (65536UL - (FOSC_HZ / 12UL / 1000UL))",
+            "",
+        ]
+
+    def runtime(self, program, tasks):
+        out = []
+        if tasks:
+            out += [
+                "/* One WHEN block = one cooperative task. Timer 0 interrupts",
+                " * every millisecond; tasks yield at every wait and at every",
+                " * loop iteration (Scratch's own scheduling contract), so no",
+                " * task can starve the others. */",
+                "static volatile unsigned int bw_ms;",
+                "",
+                "void bw_tick(void) __interrupt(1)",
+                "{",
+                "    TL0 = (unsigned char)(T0_RELOAD & 0xFF);",
+                "    TH0 = (unsigned char)(T0_RELOAD >> 8);",
+                "    bw_ms++;",
+                "}",
+                "",
+                "/* A 16-bit read is not atomic on an 8051; hold the tick off. */",
+                "static unsigned int bw_now(void)",
+                "{",
+                "    unsigned int t;",
+                "    ET0 = 0;",
+                "    t = bw_ms;",
+                "    ET0 = 1;",
+                "    return t;",
+                "}",
+                "",
+            ]
+        else:
+            out += [
+                "static void delay_ms(unsigned int ms)",
+                "{",
+                "    while (ms--) {",
+                "        TL0 = (unsigned char)(T0_RELOAD & 0xFF);",
+                "        TH0 = (unsigned char)(T0_RELOAD >> 8);",
+                "        TF0 = 0;",
+                "        TR0 = 1;",
+                "        while (!TF0) ;",
+                "        TR0 = 0;",
+                "        TF0 = 0;",
+                "    }",
+                "}",
+                "",
+            ]
+        if program.uses_adc:
+            out += [
+                "/* 10-bit ADC, polled. Channel n is on P1.n; the channel is selected",
+                " * and the conversion started in one write, as STC's examples do. */",
+                "static unsigned int adc_read(unsigned char channel)",
+                "{",
+                "    unsigned char settle;",
+                "    ADC_CONTR = (unsigned char)(0xE8 | channel);  /* power|fast|start|chan */",
+                "    for (settle = 0; settle < 8; settle++) ;      /* let the mux settle */",
+                "    while (!(ADC_CONTR & 0x10)) ;                 /* wait for ADC_FLAG */",
+                "    ADC_CONTR &= ~0x10;                           /* clear it by hand */",
+                "    return ((unsigned int)ADC_RES << 2) | (ADC_RESL & 0x03);",
+                "}",
+                "",
+            ]
+        for part in program.parts.values():
+            out += [
+                f"/* {part.name}: a 74HC595, eight outputs for three pins.",
+                " *",
+                " * Admitted to the parts library because its correctness depends on the",
+                " * ORDER of the edges and not on their duration: the part is specified",
+                " * into the tens of megahertz and has no minimum clock period an 8051",
+                " * could violate, so there is no delay here to get wrong. Data is sampled",
+                " * on the rising edge of the shift clock, and the latch transfers on its",
+                " * own rising edge. docs/PARTS-MODEL.md.",
+                " *",
+                " * MSB first, so the byte reads left to right on the outputs. */",
+                f"static void bw_part_{part.name}(unsigned char value)",
+                "{",
+                "    unsigned char i;",
+                f"    {part.clock.sfr} = 0;",
+                f"    {part.latch.sfr} = 0;",
+                "    for (i = 0; i < 8; i++) {",
+                f"        {part.data.sfr} = (value & 0x80) ? 1 : 0;",
+                "        value = (unsigned char)(value << 1);",
+                f"        {part.clock.sfr} = 1;",
+                f"        {part.clock.sfr} = 0;",
+                "    }",
+                f"    {part.latch.sfr} = 1;      /* transfer to the outputs */",
+                f"    {part.latch.sfr} = 0;",
+                "}",
+                "",
+            ]
+        if program.tables:
+            out += [
+                "/* Lookup tables live in code space: flash is the abundant resource",
+                " * here and RAM is not. `const __code` keeps them out of the 256 bytes",
+                " * that matter. */",
+            ]
+            for name, values in program.tables.items():
+                body = ", ".join(f"0x{v:02X}" for v in values)
+                out += [f"static const __code unsigned char bw_tab_{name}[] "
+                        f"= {{ {body} }};"]
+            out += [
+                "",
+                "/* A computed index is clamped rather than trusted. Reading past a",
+                " * table means reading a random byte of flash and, on a display,",
+                " * showing it -- which looks like data rather than like a fault. A",
+                " * constant index is checked at compile time and costs nothing. */",
+                "static unsigned char bw_clamp(int i, unsigned char last)",
+                "{",
+                "    if (i < 0) return 0;",
+                "    if (i > (int)last) return last;",
+                "    return (unsigned char)i;",
+                "}",
+                "",
+            ]
+        if program.uses_uart:
+            out += [
+                "/* Serial console on UART1, 8N1 at " + str(BW_BAUD) + " baud.",
+                " *",
+                " * P3.0/P3.1 are also the ISP pins, so you cannot hold a terminal open",
+                " * while flashing -- and the debug monitor owns this same UART, which is",
+                " * why a program that prints cannot currently run under it.",
+                " *",
+                " * Blocking on TI is deliberate. A ring buffer would need RAM this part",
+                " * does not have to spare, and a dropped diagnostic is worse than a slow",
+                " * one: at " + str(BW_BAUD) + " baud a character costs about "
+                + f"{1000000 * 10 // BW_BAUD} us. */",
+                "static void bw_putc(char c)",
+                "{",
+                "    SBUF = c;",
+                "    while (!TI)",
+                "        ;",
+                "    TI = 0;",
+                "}",
+                "",
+                "static void bw_print(const char *s)",
+                "{",
+                "    while (*s)",
+                "        bw_putc(*s++);",
+                "    bw_putc('\\r');",
+                "    bw_putc('\\n');",
+                "}",
+                "",
+                "static void bw_print_num(int v)",
+                "{",
+                "    unsigned char digits[6];",
+                "    unsigned char n = 0;",
+                "    unsigned int u;",
+                "    if (v < 0) { bw_putc('-'); u = (unsigned int)(-v); }",
+                "    else       { u = (unsigned int)v; }",
+                "    do { digits[n++] = (unsigned char)('0' + u % 10); u /= 10; } while (u);",
+                "    while (n)",
+                "        bw_putc((char)digits[--n]);",
+                "    bw_putc('\\r');",
+                "    bw_putc('\\n');",
+                "}",
+                "",
+            ]
+        tone = program.tone_pin
+        if tone is not None:
+            idle = 1 if tone.active_low else 0
+            out += [
+                "/* Tone on " + tone.name + ". Timer 1 in mode 1 toggles the pin, so the",
+                " * frequency is FOSC/24/(65536 - reload) and the whole audible band is",
+                " * reachable -- roughly 7 Hz upward. The hardware clock outputs (T1CLKO",
+                " * and friends) divide an 8-BIT reload and bottom out at 1800 Hz, which",
+                " * is a beeper rather than a tone; and clocking the PCA from Timer 0 gives",
+                " * 3.9 Hz, because Timer 0 is already the millisecond tick. See",
+                " * STC12-PERIPHERAL-MODEL.md 5b.",
+                " *",
+                " * This costs Timer 1 outright. The debug monitor wants it too, as the",
+                " * wall clock behind skew_ms, so a program with a tone cannot also be run",
+                " * under the monitor. */",
+                "#define BW_TONE_NUM (FOSC_HZ / 24UL)",
+                "",
+                "static unsigned char bw_tone_h, bw_tone_l;",
+                "",
+                "static void bw_tone_isr(void) __interrupt(3)",
+                "{",
+                "    TH1 = bw_tone_h;               /* mode 1 is not auto-reload */",
+                "    TL1 = bw_tone_l;",
+                f"    {tone.sfr} = !{tone.sfr};",
+                "}",
+                "",
+                "static void tone_set(unsigned long hz)",
+                "{",
+                "    unsigned long div;",
+                "    if (hz == 0) {                 /* silence, and park the pin */",
+                "        TR1 = 0;",
+                "        ET1 = 0;",
+                f"        {tone.sfr} = {idle};",
+                "        return;",
+                "    }",
+                "    div = (BW_TONE_NUM + (hz >> 1)) / hz;   /* round, do not truncate: */",
+                "                                       /* truncating puts 1000 Hz at */",
+                "                                       /* 1001.7 rather than 999.6   */",
+                "    if (div < 1UL)     div = 1UL;",
+                "    if (div > 65535UL) div = 65535UL;",
+                "    div = 65536UL - div;",
+                "    bw_tone_h = (unsigned char)(div >> 8);",
+                "    bw_tone_l = (unsigned char)(div & 0xFF);",
+                "    TH1 = bw_tone_h;",
+                "    TL1 = bw_tone_l;",
+                "    ET1 = 1;",
+                "    TR1 = 1;",
+                "}",
+                "",
+            ]
+        if program.uses_pwm:
+            out += [
+                "/* PCA PWM. The comparator is 9 bits, {EPCnH,CCAPnH} against (0,CL),",
+                " * and it drives the pin LOW while CL is BELOW the compare value -- so a",
+                " * LARGER value is a LONGER low time and the duty as a fraction HIGH is",
+                " * (256 - value)/256. Getting that backwards inverts every brightness and",
+                " * looks entirely plausible doing it.",
+                " *",
+                " * Writing CCAPnH rather than CCAPnL is deliberate: the hardware reloads",
+                " * CCAPnH into CCAPnL when CL wraps, so an update cannot glitch mid-period.",
+                " * The 9th bit (EPCnH) is what expresses 0% and 100%, which an 8-bit",
+                " * compare cannot. Datasheet 10.3.4. */",
+                "static void pwm_set(unsigned char module, unsigned int percent_high)",
+                "{",
+                "    unsigned int v;",
+                "    if (percent_high > 100) percent_high = 100;",
+                "    v = 256 - ((percent_high * 256 + 50) / 100);",
+                "    if (module == 0) {",
+                "        CCAP0H = (unsigned char)v;",
+                "        if (v > 255) PCA_PWM0 |= 0x02; else PCA_PWM0 &= (unsigned char)~0x02;",
+                "    } else {",
+                "        CCAP1H = (unsigned char)v;",
+                "        if (v > 255) PCA_PWM1 |= 0x02; else PCA_PWM1 &= (unsigned char)~0x02;",
+                "    }",
+                "}",
+                "",
+            ]
+        return out
+
+    def setup(self, program):
+        out: list[str] = []
+        outputs: dict = {}
+        for pin in program.pins.values():
+            # PWM pins are outputs as far as the port mode goes; the PCA
+            # drives the level, but the pin still has to be able to drive.
+            if pin.direction in ("output", "pwm"):
+                outputs[pin.port] = outputs.get(pin.port, 0) | pin.mask
+        for port in program.ports.values():
+            if port.direction == "output":
+                outputs[port.port] = outputs.get(port.port, 0) | 0xFF
+        for part in program.parts.values():
+            for claimed in part.claimed:
+                outputs[claimed.port] = outputs.get(claimed.port, 0) | claimed.mask
+        if self.port_modes:
+            for port in sorted(outputs):
+                mask = outputs[port]
+                out += [f"    P{port}M1 &= ~0x{mask:02X};   /* push-pull */",
+                        f"    P{port}M0 |=  0x{mask:02X};"]
+        # On a quasi-bidirectional-only part (STC89) there is nothing to set up:
+        # active-low wiring sinks the LED current either way.
+        for pin in program.pins.values():
+            if pin.direction == "output":
+                out.append(f"    {pin.sfr} = {1 if pin.active_low else 0};"
+                           f"   /* {pin.name} off */")
+
+        analog = 0
+        for pin in program.pins.values():
+            if pin.direction == "analog":
+                analog |= pin.mask
+        if analog:
+            out += ["",
+                    f"    P1ASF = 0x{analog:02X};                 /* analog function on P1 */",
+                    f"    P1M1 |=  0x{analog:02X};                /* high-impedance input */",
+                    f"    P1M0 &= ~0x{analog:02X};",
+                    "    ADC_CONTR = 0xE0;              /* ADC on, fastest conversion */"]
+
+        if program.uses_uart:
+            out += ["", "    SCON = 0x50;                   /* UART mode 1, 8-bit, RX on */"]
+            if self.baud_from_brt:
+                div = program.clock // (32 * BW_BAUD)
+                out += [f"    BRT  = {256 - div};"
+                        f"                     /* {BW_BAUD} baud from the BRT */",
+                        "    AUXR |= 0x15;                  /* BRTR, BRTx12, S1BRS */"]
+            else:
+                div = program.clock // (12 * 32 * BW_BAUD)
+                out += [f"    TH1  = TL1 = {256 - div};"
+                        f"               /* {BW_BAUD} baud from Timer 1 */",
+                        "    TMOD = (TMOD & 0x0F) | 0x20;   /* Timer 1, mode 2 */",
+                        "    TR1  = 1;"]
+            out.append("    TI = 0;  RI = 0;")
+
+        pwm_pins = [p for p in program.pins.values() if p.direction == "pwm"]
+        if pwm_pins:
+            out += ["",
+                    "    CCON = 0x00;                   /* PCA off while configuring */",
+                    "    CL = 0;  CH = 0;",
+                    "    CMOD = 0x00;                   /* CPS=000: PCA clock = FOSC/12 */"]
+            for pin in sorted(pwm_pins, key=lambda p: p.pca_module):
+                out.append(f"    CCAPM{pin.pca_module} = 0x42;"
+                           f"                /* ECOM|PWM: {pin.name} */")
+            # Start at "off", which is 100% high on an active-low load.
+            for pin in sorted(pwm_pins, key=lambda p: p.pca_module):
+                out.append("    " + self.write_pwm(pin, "0")
+                           + f"   /* {pin.name} off */")
+            out.append("    CCON = 0x40;                   /* CR: run the PCA counter */")
+
+        out.append("")
+        if self.aux_1t_bit:
+            if program.tone_pin is not None:
+                out.append("    AUXR &= ~0xC0;                 /* Timer 0 AND Timer 1 at FOSC/12 */")
+            else:
+                out.append("    AUXR &= ~0x80;                 /* Timer 0 at FOSC/12 */")
+        out.append("    TMOD  = (TMOD & 0xF0) | 0x01;  /* Timer 0, mode 1 */")
+        if program.tone_pin is not None:
+            out += ["    TMOD  = (TMOD & 0x0F) | 0x10;  /* Timer 1, mode 1: the tone */",
+                    "    PT1   = 1;                     /* the tone outranks the tick:",
+                    "                                    * jitter here is audible */",
+                    "    tone_set(0);                   /* silent until asked */"]
+        return out
+
+    def start_scheduler(self, task_names):
+        return ["    TL0 = (unsigned char)(T0_RELOAD & 0xFF);",
+                "    TH0 = (unsigned char)(T0_RELOAD >> 8);",
+                "    ET0 = 1;                       /* millisecond tick */",
+                "    EA  = 1;",
+                "    TR0 = 1;",
+                "",
+                "    for (;;) {",
+                *(f"        {name}();" for name in task_names),
+                "    }"]
+
+    def main(self, program, setup_lines, body_lines, task_names):
+        out = ["void main(void)", "{"] + setup_lines
+        if task_names:
+            out += self.start_scheduler(task_names)
+        else:
+            out.append("")
+            out += body_lines
+        return out + ["}", ""]
+
+
+ARDUINO_PIN_RE = re.compile(r"^(?:d(\d{1,2})|a(\d{1,2})|(\d{1,2}))$", re.I)
+
+# The three timers bring six compare outputs to the header. Everything else is
+# digital-only, exactly as the PCA pins are on the STC12.
+ARDUINO_PWM_PINS = {3, 5, 6, 9, 10, 11}
+# tone() is Timer 2, and Timer 2 is what drives PWM on D3 and D11.
+ARDUINO_TONE_STEALS = {3, 11}
+
+
+@dataclass
+class ArduinoPin(Pin):
+    """The Arduino view: whatever expression the core's functions accept.
+
+    A digital pin is its bare number; an analog one is the `A0` macro, which
+    is also a perfectly good argument to digitalWrite. So one string covers
+    both, and nothing here needs to know about a port or a register.
+    """
+    ref: str = ""
+
+
+class ArduinoTarget(Target):
+    """Boards programmed through the Arduino core, emitted as core C++.
+
+    This target writes almost no runtime of its own, and that is the point.
+    The scheduler contract the 8051 back end had to build by hand -- a
+    millisecond tick that never busy-waits, so cooperative tasks can share the
+    processor -- is what `millis()` already is. So `runtime()` is empty, and
+    the generated code is the AST lowering and nothing else.
+
+    The debt is at the other end: `millis()` is 32-bit, so the deadline
+    statics and the wraparound compare have to widen with it (see
+    `time_type`). Truncating it to 16 bits would look right and would break
+    every wait longer than 32 seconds.
+    """
+
+    # millis() is `unsigned long`, and the deadline arithmetic must match it.
+    time_type = "unsigned long"
+    time_signed = "long"
+
+    # Core C++ needs the Arduino build system; SDCC cannot touch it.
+    toolchain = "arduino-cli"
+
+    # PORT stays out: eight bits of one register is exactly what the core
+    # hides behind digitalWrite, and reaching past it would give up the
+    # portability that is the reason to emit core C++ at all. A PART needs
+    # only three pins the core is happy to drive.
+    supports = frozenset({"pwm", "tone", "print", "table", "part"})
+    compile_hint = ("DEVICE ATMEGA328P: is the same board without the Arduino "
+                    "core, and that one does compile here.")
+    source_extension = "ino"
+
+    def __init__(self, key: str, display: str, digital_max: int, analog_max: int):
+        self.key = key
+        self.display = display
+        self.digital_max = digital_max
+        self.analog_max = analog_max
+
+    # ---- pins -----------------------------------------------------------
+    def resolve_pin(self, program, name, where, direction, active_low, line):
+        match = ARDUINO_PIN_RE.match(where)
+        if not match:
+            raise PseudocodeError(
+                line, f"{where.upper()} is not a pin on the {self.display}; "
+                      f"use D0-D{self.digital_max} or A0-A{self.analog_max}")
+        digital, analog, bare = match.groups()
+
+        if analog is not None:
+            number = int(analog)
+            if number > self.analog_max:
+                raise PseudocodeError(
+                    line, f"the {self.display} has A0-A{self.analog_max}, "
+                          f"not A{number}")
+            # An analog pin is still a perfectly good digital one, so this
+            # deliberately does not check the direction.
+            return ArduinoPin(name, f"A{number}", direction, active_low,
+                              f"A{number}")
+
+        number = int(digital if digital is not None else bare)
+        if number > self.digital_max:
+            raise PseudocodeError(
+                line, f"the {self.display} has D0-D{self.digital_max}, "
+                      f"not D{number}")
+        if direction == "pwm" and number not in ARDUINO_PWM_PINS:
+            usable = ", ".join(f"D{n}" for n in sorted(ARDUINO_PWM_PINS))
+            raise PseudocodeError(
+                line, f"PWM on the {self.display} is only on the timer compare "
+                      f"outputs: {usable}. D{number} is digital-only.")
+        if direction == "tone":
+            # tone() drives one pin at a time, and it is Timer 2 -- the same
+            # timer behind PWM on D3 and D11. Both are silent breakage if left
+            # to run: a second tone replaces the first, and the PWM pin simply
+            # stops fading.
+            for other in program.pins.values():
+                if other.direction == "tone":
+                    raise PseudocodeError(
+                        line, f"only one TONE pin ({other.name!r} already has "
+                              f"it): the Arduino core plays one tone at a time")
+                if other.direction == "pwm" and other.ref.isdigit() \
+                        and int(other.ref) in ARDUINO_TONE_STEALS:
+                    raise PseudocodeError(
+                        line, f"a TONE pin and PWM on D{other.ref} both need "
+                              f"Timer 2 -- {other.name!r} would stop fading "
+                              f"while a note sounds. Move it to D5, D6, D9 "
+                              f"or D10.")
+        if direction == "pwm" and number in ARDUINO_TONE_STEALS:
+            for other in program.pins.values():
+                if other.direction == "tone":
+                    raise PseudocodeError(
+                        line, f"PWM on D{number} and the TONE pin "
+                              f"{other.name!r} both need Timer 2. Use D5, D6, "
+                              f"D9 or D10 for PWM instead.")
+        if direction == "analog":
+            raise PseudocodeError(
+                line, f"ANALOG needs an analog input, and D{number} is "
+                      f"digital-only on the {self.display}; "
+                      f"use A0-A{self.analog_max}")
+        return ArduinoPin(name, f"D{number}", direction, active_low, str(number))
+
+    def write_pin(self, pin, high):
+        return f"digitalWrite({pin.ref}, {'HIGH' if high else 'LOW'});"
+
+    def toggle_pin(self, pin):
+        return f"digitalWrite({pin.ref}, !digitalRead({pin.ref}));"
+
+    def read_pin(self, pin):
+        read = f"digitalRead({pin.ref})"
+        return f"!{read}" if pin.active_low else read
+
+    def read_analog(self, pin):
+        return f"analogRead({pin.ref})"
+
+    def write_pwm(self, pin, value: str) -> str:
+        # analogWrite takes 0-255 as the proportion of time the PIN is high,
+        # while the AST stores the percentage of time the LOAD is on. The
+        # outer parentheses matter: `100 - x * 255 / 100` binds the wrong way.
+        duty = f"(100 - ({value}))" if pin.active_low else f"({value})"
+        return f"analogWrite({pin.ref}, ({duty} * 255) / 100);"
+
+    def write_tone(self, pin, hz: str) -> str:
+        # Through a helper because 0 Hz means silence and the frequency is an
+        # expression, so the choice is a run-time one and this hook may only
+        # return a single statement.
+        return f"bw_tone({pin.ref}, {hz});"
+
+    def write_print(self, node) -> str:
+        if node.value is None:
+            return f'Serial.println("{_c_string(node.text)}");'
+        return f"Serial.println({node.value});"
+
+    # ---- time -----------------------------------------------------------
+    def delay(self, ms):
+        return f"delay({ms});"
+
+    def now(self):
+        return "millis()"
+
+    # ---- the shell ------------------------------------------------------
+    def prologue(self, program):
+        return [
+            "#include <Arduino.h>",
+            "",
+            "/* No clock constant here on purpose: millis() and delay() are",
+            " * already correct for whatever the board is actually clocked at,",
+            " * so a CLOCK line in the pseudocode is carried for the other",
+            " * targets and deliberately ignored on this one. */",
+            "",
+        ]
+
+    def runtime(self, program, tasks):
+        # Almost nothing to emit: the timebase, the blocking delay, the ADC,
+        # tone() and Serial are all in the core already. What is left is the
+        # handful of helpers the shared walkers expect by name.
+        out: list[str] = []
+        if program.tables:
+            out += [
+                "/* Lookup tables. `const` on an AVR still costs RAM -- the",
+                " * Harvard split means a plain const array is copied out of",
+                " * flash at startup -- but PROGMEM would need pgm_read_byte at",
+                " * every use, and the index expression is shared with the",
+                " * other targets. A font is tens of bytes; a big table is the",
+                " * case that would need a target hook for reads. */",
+            ]
+            for name, values in program.tables.items():
+                body = ", ".join(f"0x{v:02X}" for v in values)
+                out.append(f"static const unsigned char bw_tab_{name}[] "
+                           f"= {{ {body} }};")
+            out += [
+                "",
+                "/* A computed index is clamped rather than trusted: reading",
+                " * past a table gives a plausible-looking wrong byte. */",
+                "static unsigned char bw_clamp(int i, unsigned char last)",
+                "{",
+                "    if (i < 0) return 0;",
+                "    if (i > (int)last) return last;",
+                "    return (unsigned char)i;",
+                "}",
+                "",
+            ]
+        if program.tone_pin is not None:
+            out += [
+                "/* 0 Hz means silence, and the frequency is an expression, so",
+                " * the choice has to be made at run time. */",
+                "static void bw_tone(unsigned char pin, unsigned int hz)",
+                "{",
+                "    if (hz) tone(pin, hz); else noTone(pin);",
+                "}",
+                "",
+            ]
+        for part in program.parts.values():
+            out += self.shift_helper(part)
+        return out
+
+    def setup(self, program):
+        out: list[str] = []
+        for pin in program.pins.values():
+            if pin.direction == "output":
+                out.append(f"    pinMode({pin.ref}, OUTPUT);")
+            elif pin.direction == "input":
+                # An ACTIVE LOW input is a button wired to ground, which is
+                # exactly what the internal pull-up is for. An active-high one
+                # needs its own external pull-down, and enabling the pull-up
+                # would fight it.
+                mode = "INPUT_PULLUP" if pin.active_low else "INPUT"
+                out.append(f"    pinMode({pin.ref}, {mode});")
+            elif pin.direction == "pwm":
+                out.append(f"    pinMode({pin.ref}, OUTPUT);")
+            # analog needs no pinMode (analogRead configures the mux), and
+            # neither does tone (tone() drives the pin itself).
+        for part in program.parts.values():
+            for claimed in part.claimed:
+                out.append(f"    pinMode({claimed.ref}, OUTPUT);"
+                           f"   /* {part.name} */")
+        for pin in program.pins.values():
+            if pin.direction == "output":
+                level = "HIGH" if pin.active_low else "LOW"
+                out.append(f"    digitalWrite({pin.ref}, {level});"
+                           f"   /* {pin.name} off */")
+            elif pin.direction == "pwm":
+                # Start at the off end, whichever end that is.
+                out.append("    " + self.write_pwm(pin, "0")
+                           + f"   /* {pin.name} off */")
+        if program.uses_uart:
+            out.append(f"    Serial.begin({BW_BAUD});")
+        return out
+
+    def start_scheduler(self, task_names):
+        # loop() *is* the forever loop; wrapping another one inside it would
+        # starve the core's own housekeeping (serialEventRun between calls).
+        return [f"    {name}();" for name in task_names]
+
+    def main(self, program, setup_lines, body_lines, task_names):
+        out = ["void setup()", "{"] + setup_lines
+        if body_lines:
+            # A single script runs once, so it belongs in setup(). Scratch
+            # semantics: the script is not restarted when it finishes.
+            out.append("")
+            out += body_lines
+        out += ["}", "", "void loop()", "{"]
+        out += (self.start_scheduler(task_names) if task_names else
+                ["    /* the script ran once, in setup(); nothing repeats here */"])
+        return out + ["}", ""]
+
+
+# ------------------------------------------------------------------ bare AVR
+
+# The ATmega328P as the board silkscreen labels it. D8-D13 are port B, D0-D7
+# port D, A0-A5 port C -- an ordering that looks arbitrary because it is: it
+# follows the physical layout of the DIP package, not the ports.
+AVR_328P_PINS = {
+    **{f"D{n}": ("D", n) for n in range(8)},
+    **{f"D{8 + n}": ("B", n) for n in range(6)},
+    **{f"A{n}": ("C", n) for n in range(6)},
+}
+AVR_328P_BY_PORT = {location: label for label, location in AVR_328P_PINS.items()}
+
+AVR_PIN_RE = re.compile(r"^(?:([da])(\d{1,2})|p([b-d])(\d))$", re.I)
+
+# Timer 0 prescalers, smallest first, with their CS02:CS00 bits. The tick wants
+# an EXACT millisecond, so the emitter picks the first prescaler that divides
+# the clock evenly into 1 kHz and still fits an 8-bit compare register.
+# Which timer drives which compare output, and therefore which pins can do
+# PWM at all. D5 and D6 are OC0B/OC0A -- Timer 0 -- and Timer 0 is the
+# millisecond tick, so they are NOT offered: taking them would silently stop
+# every wait in the program.
+AVR_PWM_PINS = {
+    9:  ("OCR1A", "TCCR1A", "COM1A1", 1),
+    10: ("OCR1B", "TCCR1A", "COM1B1", 1),
+    11: ("OCR2A", "TCCR2A", "COM2A1", 2),
+    3:  ("OCR2B", "TCCR2A", "COM2B1", 2),
+}
+AVR_TICK_PINS = {5: "OC0B", 6: "OC0A"}
+# The tone is Timer 1 in CTC mode toggling OC1A, which is D9 and only D9.
+AVR_TONE_PIN = 9
+
+AVR_PRESCALERS = [(1, "_BV(CS00)"), (8, "_BV(CS01)"),
+                  (64, "_BV(CS01) | _BV(CS00)"), (256, "_BV(CS02)"),
+                  (1024, "_BV(CS02) | _BV(CS00)")]
+
+
+@dataclass
+class AvrPin(Pin):
+    """A port letter and a bit, plus the ADC channel where there is one."""
+    port: str = ""
+    bit: int = 0
+    channel: int | None = None
+
+
+class AvrTarget(Target):
+    """ATmega parts compiled by avr-gcc, with no Arduino core underneath.
+
+    Same boards as the Arduino target -- an ATmega328P *is* an Uno -- and
+    deliberately not the same output. The core's digitalWrite looks up the
+    port in a PROGMEM table and checks whether it has to disable a PWM channel,
+    on every call, at runtime. This generator already knows the pin at emit
+    time, so the same statement becomes one instruction:
+
+        turn on led   ->   PORTB |= _BV(PB5);
+
+    That is the identical discipline the 8051 target uses, it removes the
+    LGPL-licensed core from the output, and it is what lets this service
+    compile the result with a ~25 MB vendored toolchain instead of a 250 MB
+    one. Pins are still written the way the board is labelled (`D13`, `A0`),
+    because that is what the silkscreen says; `PB5` is accepted too.
+    """
+
+    toolchain = "avr-gcc"
+
+    # Everything the 8051 has. PORT is PORTB/PORTC/PORTD, and a PART is three
+    # ordinary output pins bit-banged in the right order.
+    supports = frozenset({"pwm", "tone", "print", "table", "port", "part"})
+
+    # Our own tick, so we choose the width -- but 16 bits would wrap every 65 s
+    # and these deadlines are compared against a free-running counter, so it is
+    # the same 32-bit choice millis() forces on the Arduino target.
+    time_type = "unsigned long"
+    time_signed = "long"
+
+    def __init__(self, key: str, display: str, mcu: str, flash: int):
+        self.key = key
+        self.display = display
+        self.mcu = mcu              # what avr-gcc wants for -mmcu
+        self.flash = flash          # bytes, for the size check after linking
+
+    # ---- pins -----------------------------------------------------------
+    def resolve_pin(self, program, name, where, direction, active_low, line):
+        match = AVR_PIN_RE.match(where)
+        label = None
+        if match:
+            kind, number, port, bit = match.groups()
+            if kind:
+                label = f"{kind.upper()}{int(number)}"
+            else:
+                label = AVR_328P_BY_PORT.get((port.upper(), int(bit)))
+        if label is None or label not in AVR_328P_PINS:
+            raise PseudocodeError(
+                line, f"{where.upper()} is not a pin on the {self.display}; "
+                      "use D0-D13, A0-A5, or the port name (PB5)")
+
+        port, bit = AVR_328P_PINS[label]
+        channel = int(label[1:]) if label[0] == "A" else None
+        if direction == "analog" and channel is None:
+            raise PseudocodeError(
+                line, f"ANALOG needs an analog input, and {label} is "
+                      f"digital-only on the {self.display}; use A0-A5")
+
+        digital = int(label[1:]) if label[0] == "D" else None
+        if direction == "pwm":
+            if digital in AVR_TICK_PINS:
+                raise PseudocodeError(
+                    line, f"{label} is {AVR_TICK_PINS[digital]}, which is "
+                          f"Timer 0 -- and Timer 0 is the millisecond tick "
+                          f"every wait in the program is measured against. "
+                          f"Use D9, D10, D11 or D3.")
+            if digital not in AVR_PWM_PINS:
+                usable = ", ".join(f"D{n}" for n in sorted(AVR_PWM_PINS))
+                raise PseudocodeError(
+                    line, f"PWM on the {self.display} is only on the timer "
+                          f"compare outputs: {usable}. {label} is "
+                          f"digital-only.")
+            for other in program.pins.values():
+                if other.direction == "tone" and AVR_PWM_PINS[digital][3] == 1:
+                    raise PseudocodeError(
+                        line, f"PWM on {label} and the TONE pin "
+                              f"{other.name!r} both need Timer 1. Use D11 or "
+                              f"D3 for PWM instead -- those are Timer 2.")
+        if direction == "tone":
+            if digital != AVR_TONE_PIN:
+                raise PseudocodeError(
+                    line, f"the tone is Timer 1 toggling OC1A, so it can only "
+                          f"be D{AVR_TONE_PIN} on the {self.display}, "
+                          f"not {label}")
+            for other in program.pins.values():
+                if other.direction == "tone":
+                    raise PseudocodeError(
+                        line, f"only one TONE pin ({other.name!r} already has "
+                              f"it): there is one Timer 1")
+                if other.direction == "pwm" and other.where[0] == "D" \
+                        and AVR_PWM_PINS.get(int(other.where[1:]), (0, 0, 0, 0))[3] == 1:
+                    raise PseudocodeError(
+                        line, f"a TONE pin and PWM on {other.where} both need "
+                              f"Timer 1 -- {other.name!r} would stop fading "
+                              f"while a note sounds. Move it to D11 or D3.")
+        return AvrPin(name, label, direction, active_low, port, bit, channel)
+
+    def _bit(self, pin) -> str:
+        return f"_BV(P{pin.port}{pin.bit})"
+
+    def write_pin(self, pin, high):
+        if high:
+            return f"PORT{pin.port} |= {self._bit(pin)};"
+        return f"PORT{pin.port} &= (unsigned char)~{self._bit(pin)};"
+
+    def toggle_pin(self, pin):
+        # Writing a one to a PINx bit toggles PORTxn in hardware (datasheet
+        # 14.2.2) -- one instruction, and no read-modify-write to be
+        # interrupted halfway through.
+        return f"PIN{pin.port} = {self._bit(pin)};"
+
+    def read_pin(self, pin):
+        read = f"(PIN{pin.port} & {self._bit(pin)})"
+        return f"!{read}" if pin.active_low else read
+
+    def read_analog(self, pin):
+        return f"adc_read({pin.channel})"
+
+    def resolve_port(self, program, name, where, direction, active_low, line):
+        match = re.fullmatch(r"(?:port)?([b-d])", where, re.I)
+        if not match:
+            raise PseudocodeError(
+                line, f"{where.upper()} is not a port on the {self.display}; "
+                      "use B, C or D (PORTB, PORTC, PORTD)")
+        letter = match.group(1).upper()
+        # PORTx is the output latch and PINx the actual pin levels. Reading
+        # PORTx back would return what was last written, which on an input
+        # port is the pull-up configuration and not the world.
+        # `port` is the letter itself, so it compares equal to an AvrPin's
+        # `.port` when checking whether a pin sits inside a declared port.
+        return Port(name, letter, direction, active_low, where=letter,
+                    write_sfr=f"PORT{letter}", read_sfr=f"PIN{letter}")
+
+    def _pwm(self, pin):
+        return AVR_PWM_PINS[int(pin.where[1:])]
+
+    def write_pwm(self, pin, value: str) -> str:
+        # The compare register holds the proportion of time the PIN is high;
+        # the AST stores the percentage of time the LOAD is on. Same number
+        # only on an active-high pin, and the outer parentheses matter.
+        register = self._pwm(pin)[0]
+        duty = f"(100 - ({value}))" if pin.active_low else f"({value})"
+        return f"{register} = ({duty} * 255) / 100;"
+
+    def write_tone(self, pin, hz: str) -> str:
+        return f"bw_tone({hz});"
+
+    def write_print(self, node) -> str:
+        if node.value is None:
+            return f'bw_print("{_c_string(node.text)}");'
+        return f"bw_print_num({node.value});"
+
+    # ---- time -----------------------------------------------------------
+    def delay(self, ms):
+        return f"delay_ms({ms});"
+
+    def now(self):
+        return "bw_now()"
+
+    def _tick(self, program) -> tuple[int, str, int]:
+        """Compare value, CS bits and divisor for an exact 1 kHz tick."""
+        for divisor, bits in AVR_PRESCALERS:
+            counts = program.clock / (divisor * 1000)
+            if counts.is_integer() and 1 <= counts <= 256:
+                return int(counts) - 1, bits, divisor
+        raise PseudocodeError(
+            1, f"{program.clock} Hz cannot be divided into an exact "
+               f"millisecond by Timer 0 on the {self.display}; use a clock "
+               f"like 16 MHz, 8 MHz or 1 MHz")
+
+    # ---- the shell ------------------------------------------------------
+    def prologue(self, program):
+        return [
+            "#include <avr/io.h>",
+            "#include <avr/interrupt.h>",
+            "",
+            f"#define F_CPU {program.clock}UL",
+            "",
+        ]
+
+    def runtime(self, program, tasks):
+        compare, _bits, divisor = self._tick(program)
+        out = [
+            "/* Timer 0 in CTC mode, one interrupt per millisecond. Nothing",
+            " * here busy-waits on the clock, so a wait costs no accuracy, and",
+            f" * the tick is exact rather than near: {program.clock} / {divisor}"
+            f" / {compare + 1} = 1000 Hz. */",
+            "static volatile unsigned long bw_ms;",
+            "",
+            "ISR(TIMER0_COMPA_vect)",
+            "{",
+            "    bw_ms++;",
+            "}",
+            "",
+            "/* A 32-bit read is four instructions on an 8-bit core; hold the",
+            " * tick off rather than risk tearing across the increment. */",
+            "static unsigned long bw_now(void)",
+            "{",
+            "    unsigned long t;",
+            "    unsigned char sreg = SREG;",
+            "    cli();",
+            "    t = bw_ms;",
+            "    SREG = sreg;",
+            "    return t;",
+            "}",
+            "",
+        ]
+        if not tasks:
+            out += [
+                "static void delay_ms(unsigned int ms)",
+                "{",
+                "    unsigned long until = bw_now() + ms;",
+                "    while ((long)(bw_now() - until) < 0) ;",
+                "}",
+                "",
+            ]
+        if program.tables:
+            out += [
+                "/* Lookup tables. A plain `const` array on an AVR is copied",
+                " * from flash into RAM at startup -- the Harvard split means",
+                " * `[]` cannot read flash directly. PROGMEM would avoid that,",
+                " * but the index expression is shared with the other targets",
+                " * and would have to become a target hook to say pgm_read_byte.",
+                " * A font costs tens of bytes; a big table is the case that",
+                " * would justify the hook. */",
+            ]
+            for name, values in program.tables.items():
+                body = ", ".join(f"0x{v:02X}" for v in values)
+                out.append(f"static const unsigned char bw_tab_{name}[] "
+                           f"= {{ {body} }};")
+            out += [
+                "",
+                "/* A computed index is clamped rather than trusted: reading",
+                " * past a table gives a plausible-looking wrong byte. */",
+                "static unsigned char bw_clamp(int i, unsigned char last)",
+                "{",
+                "    if (i < 0) return 0;",
+                "    if (i > (int)last) return last;",
+                "    return (unsigned char)i;",
+                "}",
+                "",
+            ]
+
+        if program.tone_pin is not None:
+            out += [
+                "/* Tone: Timer 1 in CTC mode toggling OC1A, so the frequency",
+                " * is F_CPU/(2*8*(OCR1A+1)) and the whole audible band is",
+                " * reachable. Toggling in hardware costs no interrupts and",
+                " * does not drift, which a software square wave would while",
+                " * the scheduler is busy elsewhere.",
+                " *",
+                " * This takes Timer 1 outright, which is why PWM on D9 and",
+                " * D10 is refused in the same program. */",
+                "static void bw_tone(unsigned int hz)",
+                "{",
+                "    if (hz) {",
+                "        OCR1A  = (unsigned int)(F_CPU / 16UL / (unsigned long)hz - 1UL);",
+                "        TCCR1A = _BV(COM1A0);          /* toggle OC1A on match */",
+                "        TCCR1B = _BV(WGM12) | _BV(CS11);",
+                "    } else {",
+                "        TCCR1A = 0;                    /* release the pin */",
+                "        TCCR1B = 0;",
+                "        PORTB &= (unsigned char)~_BV(PB1);",
+                "    }",
+                "}",
+                "",
+            ]
+
+        if program.uses_uart:
+            out += [
+                "/* Serial console on USART0, 8N1. Blocking on UDRE0 is",
+                " * deliberate: a ring buffer costs RAM this part has little of,",
+                " * and a dropped diagnostic is worse than a slow one. */",
+                "static void bw_putc(char c)",
+                "{",
+                "    while (!(UCSR0A & _BV(UDRE0))) ;",
+                "    UDR0 = (unsigned char)c;",
+                "}",
+                "",
+                "static void bw_print(const char *s)",
+                "{",
+                "    while (*s) bw_putc(*s++);",
+                "    bw_putc('\\r');",
+                "    bw_putc('\\n');",
+                "}",
+                "",
+                "static void bw_print_num(int v)",
+                "{",
+                "    char buffer[7];",
+                "    unsigned char i = 0;",
+                "    unsigned int u;",
+                "    if (v < 0) { bw_putc('-'); u = (unsigned int)(-v); }",
+                "    else u = (unsigned int)v;",
+                "    do { buffer[i++] = (char)('0' + (u % 10)); u /= 10; } while (u);",
+                "    while (i) bw_putc(buffer[--i]);",
+                "    bw_putc('\\r');",
+                "    bw_putc('\\n');",
+                "}",
+                "",
+            ]
+
+        for part in program.parts.values():
+            out += self.shift_helper(part)
+
+        if program.uses_adc:
+            out += [
+                "/* 10-bit ADC, polled, AVcc as reference. The prescaler is set",
+                " * once in main(); this only selects the channel and waits. */",
+                "static unsigned int adc_read(unsigned char channel)",
+                "{",
+                "    ADMUX = (unsigned char)(_BV(REFS0) | (channel & 0x0F));",
+                "    ADCSRA |= _BV(ADSC);",
+                "    while (ADCSRA & _BV(ADSC)) ;",
+                "    return ADC;",
+                "}",
+                "",
+            ]
+        return out
+
+    def setup(self, program):
+        out: list[str] = []
+        for pin in program.pins.values():
+            if pin.direction == "output":
+                out.append(f"    DDR{pin.port} |= {self._bit(pin)};"
+                           f"   /* {pin.name} */")
+            elif pin.direction == "input":
+                out.append(f"    DDR{pin.port} &= (unsigned char)~{self._bit(pin)};")
+                if pin.active_low:
+                    # A button to ground; the internal pull-up is what holds
+                    # the pin high while it is not pressed.
+                    out.append(f"    PORT{pin.port} |= {self._bit(pin)};"
+                               f"   /* {pin.name} pull-up */")
+            elif pin.direction in ("pwm", "tone"):
+                # Both drive the pin from a timer, and a compare output only
+                # reaches the pad if the pin is configured as an output.
+                out.append(f"    DDR{pin.port} |= {self._bit(pin)};"
+                           f"   /* {pin.name} ({pin.direction}) */")
+            else:
+                out.append(f"    DDR{pin.port} &= (unsigned char)~{self._bit(pin)};"
+                           f"   /* {pin.name} analog in */")
+        for pin in program.pins.values():
+            if pin.direction == "output":
+                out.append("    " + self.write_pin(pin, pin.active_low)
+                           + f"   /* {pin.name} off */")
+
+        for part in program.parts.values():
+            for claimed in part.claimed:
+                out.append(f"    DDR{claimed.port} |= {self._bit(claimed)};"
+                           f"   /* {part.name} */")
+
+        for whole in program.ports.values():
+            letter = whole.port
+            if whole.direction == "output":
+                out.append(f"    DDR{letter} = 0xFF;"
+                           f"               /* {whole.name} */")
+            else:
+                out.append(f"    DDR{letter} = 0x00;")
+                if whole.active_low:
+                    out.append(f"    PORT{letter} = 0xFF;"
+                               f"              /* {whole.name} pull-ups */")
+
+        pwm_pins = [p for p in program.pins.values() if p.direction == "pwm"]
+        if pwm_pins:
+            out.append("")
+            timers = {}
+            for pin in pwm_pins:
+                _reg, control, com, timer = self._pwm(pin)
+                timers.setdefault(timer, (control, []))[1].append(com)
+            for timer in sorted(timers):
+                control, coms = timers[timer]
+                enable = " | ".join(f"_BV({c})" for c in sorted(coms))
+                # Fast PWM, 8-bit, /64 -- about 980 Hz on Timer 2 and 490 Hz
+                # on Timer 1, which is what the Arduino core picks too and is
+                # well above anything an LED or a motor driver cares about.
+                if timer == 1:
+                    out += [f"    {control} = {enable} | _BV(WGM10);",
+                            "    TCCR1B = _BV(WGM12) | _BV(CS11) | _BV(CS10);"]
+                else:
+                    out += [f"    {control} = {enable} | _BV(WGM20) | _BV(WGM21);",
+                            "    TCCR2B = _BV(CS22);"]
+            for pin in pwm_pins:
+                out.append("    " + self.write_pwm(pin, "0")
+                           + f"   /* {pin.name} off */")
+
+        if program.uses_uart:
+            out += ["",
+                    "    /* USART0, 8N1. UBRR0 is the divisor for the baud",
+                    "     * rate, derived from F_CPU at compile time. */",
+                    f"    UBRR0 = (unsigned int)(F_CPU / 16UL / {BW_BAUD}UL - 1UL);",
+                    "    UCSR0B = _BV(TXEN0);",
+                    "    UCSR0C = _BV(UCSZ01) | _BV(UCSZ00);"]
+
+        if program.uses_adc:
+            out += ["",
+                    "    ADCSRA = _BV(ADEN) | _BV(ADPS2) | _BV(ADPS1) | _BV(ADPS0);"]
+
+        compare, bits, _divisor = self._tick(program)
+        out += ["",
+                "    TCCR0A = _BV(WGM01);           /* CTC */",
+                f"    OCR0A  = {compare};" + " " * max(1, 20 - len(str(compare)))
+                + "/* 1 kHz */",
+                "    TIMSK0 = _BV(OCIE0A);",
+                f"    TCCR0B = {bits};",
+                "    sei();"]
+        return out
+
+    def start_scheduler(self, task_names):
+        return ["", "    for (;;) {",
+                *(f"        {name}();" for name in task_names),
+                "    }"]
+
+    def main(self, program, setup_lines, body_lines, task_names):
+        out = ["int main(void)", "{"] + setup_lines
+        if task_names:
+            out += self.start_scheduler(task_names)
+        else:
+            out.append("")
+            out += body_lines
+            # main() must not fall off the end on a bare-metal part: there is
+            # no exit(), and returning lands in avr-libc's infinite loop by
+            # luck rather than intent.
+            out += ["", "    for (;;) ;"]
+        return out + ["}", ""]
+
+
+def _stc(key, display, header, port_modes, aux_1t_bit, adc, pwm=False):
+    return Stc8051Target(key, display, header, port_modes, aux_1t_bit, adc, pwm)
+
+
+TARGETS = {
+    "stc12c5a60s2": _stc("stc12c5a60s2", "STC12C5A60S2", "stc12.h", True, True, True, True),
+    "stc12c5a16s2": _stc("stc12c5a16s2", "STC12C5A16S2", "stc12.h", True, True, True, True),
+    "stc89c52rc": _stc("stc89c52rc", "STC89C52RC", "8052.h", False, False, False),
+    "stc89c52": _stc("stc89c52", "STC89C52", "8052.h", False, False, False),
+    # The STC15 borrows stc12.h deliberately: every register the EMITTER
+    # touches (P0-P3, PxM0/PxM1, AUXR, Timer 0, P1ASF, the ADC block) sits at
+    # the same address on the STC15F2K60S2. The famous divergences (Timer 2
+    # at 0xD6/0xD7, S3CON...) are registers this generator never writes.
+    # Keil TRANSLATION of arbitrary STC15 code is a different problem with
+    # its own family shim.
+    "stc15f2k60s2": _stc("stc15f2k60s2", "STC15F2K60S2", "stc12.h", True, True, True, True),
+
+    # Both are ATmega328P boards and differ here only in how many analog pins
+    # the package brings out: the Uno's header stops at A5, the Nano carries
+    # A6 and A7 as well (input-only, which this generator never violates
+    # because ANALOG is read-only by construction).
+    "arduino-uno": ArduinoTarget("arduino-uno", "Arduino Uno", 13, 5),
+    "arduino-nano": ArduinoTarget("arduino-nano", "Arduino Nano", 13, 7),
+
+    # The same silicon as an Uno/Nano/Pro Mini, emitted without the Arduino
+    # core -- which is the form this service can actually compile. Pins keep
+    # the board's own labels, so a program moves between `arduino-uno` and
+    # `atmega328p` unchanged and only the generated C differs.
+    "atmega328p": AvrTarget("atmega328p", "ATmega328P", "atmega328p", 32768),
+    "atmega168p": AvrTarget("atmega168p", "ATmega168P", "atmega168p", 16384),
+}
+
+
+@dataclass
+class Program:
+    part: str = "stc12c5a60s2"
+    clock: int = 11059200
+    # What to call the generated file. Empty means "main", which is what every
+    # program was called before NAME existed. The Arduino IDE in particular
+    # wants a sketch folder named after the sketch, so `blink.ino` in `blink/`
+    # beats `main.ino` in `main/`.
+    name: str = ""
+    pins: dict = field(default_factory=dict)
+    variables: list = field(default_factory=list)
+    procedures: dict = field(default_factory=dict)
+    parts: dict = field(default_factory=dict)    # name -> ShiftPart
+    tables: dict = field(default_factory=dict)   # name -> list[int], in flash
+    ports: dict = field(default_factory=dict)    # name -> Port, whole-byte I/O
+    # One entry per `WHEN started:` block. `body` mirrors whens[0] so older
+    # call sites keep working; with several blocks the C back end emits a
+    # cooperative scheduler instead of straight-line code.
+    whens: list = field(default_factory=list)
+    # Index-aligned with `whens`: None for `WHEN started:`, or (pin, edge) for
+    # an event hat. Kept parallel rather than folded into `whens` so that every
+    # existing walker over `whens` keeps working unchanged.
+    when_hats: list = field(default_factory=list)
+    body: list = field(default_factory=list)
+    locals_: set = field(default_factory=set)
+
+    @property
+    def uses_adc(self) -> bool:
+        return any(pin.direction == "analog" for pin in self.pins.values())
+
+    @property
+    def uses_pwm(self) -> bool:
+        return any(pin.direction == "pwm" for pin in self.pins.values())
+
+    @property
+    def uses_uart(self) -> bool:
+        def walk(body):
+            for node in body:
+                if isinstance(node, Print):
+                    return True
+                for attr in ("body", "then", "otherwise"):
+                    inner = getattr(node, attr, None)
+                    if inner and walk(inner):
+                        return True
+            return False
+        # whens are plain statement lists; procedures carry theirs on .body.
+        return (walk(self.body)
+                or any(walk(w) for w in self.whens)
+                or any(walk(getattr(pr, "body", [])) for pr in self.procedures.values()))
+
+    @property
+    def tone_pin(self):
+        for pin in self.pins.values():
+            if pin.direction == "tone":
+                return pin
+        return None
+
+    @property
+    def target(self) -> Target:
+        return TARGETS[self.part]
+
+
+# ====================================================================== lexing
+
+@dataclass
+class Line:
+    number: int
+    indent: int
+    text: str
+
+
+def read_lines(source: str) -> list[Line]:
+    out = []
+    for number, raw in enumerate(source.splitlines(), 1):
+        # `#` and `//` both comment, so neither Python nor C habits surprise you.
+        stripped = re.sub(r"\s*(?:#|//).*$", "", raw)
+        if not stripped.strip():
+            continue
+        lead = stripped[: len(stripped) - len(stripped.lstrip())]
+        if "\t" in lead:
+            raise PseudocodeError(number, "tabs in indentation; use spaces")
+        out.append(Line(number, len(lead), stripped.strip()))
+    return out
+
+
+TOKEN_RE = re.compile(r"""\s*(?:
+      (?P<number>0[xX][0-9A-Fa-f]+|0[bB][01]+|\d+\.\d+|\d+)
+    | (?P<op><=|>=|!=|<>|==|[-+*/%()<>=\[\]])
+    | (?P<word>[A-Za-z_][A-Za-z0-9_]*)
+    )""", re.X)
+
+
+def tokenize(text: str, line: int) -> list[str]:
+    tokens, pos = [], 0
+    while pos < len(text):
+        match = TOKEN_RE.match(text, pos)
+        if not match or match.end() == pos:
+            if text[pos:].strip():
+                raise PseudocodeError(line, f"cannot parse {text[pos:].strip()!r}")
+            break
+        tokens.append(match.group().strip())
+        pos = match.end()
+    return [token for token in tokens if token]
+
+
+# ================================================================= expressions
+
+class ExprParser:
+    def __init__(self, tokens, program: Program, line: int):
+        self.tokens, self.pos, self.program, self.line = tokens, 0, program, line
+
+    def peek(self):
+        return self.tokens[self.pos] if self.pos < len(self.tokens) else None
+
+    def take(self):
+        token = self.peek()
+        self.pos += 1
+        return token
+
+    def parse(self, level: int = 0) -> Expr:
+        if level >= len(PRECEDENCE):
+            return self.atom()
+        node = self.parse(level + 1)
+        while True:
+            token = self.peek()
+            if token is None:
+                return node
+            op = SYNONYM.get(token, token.lower())
+            if op not in PRECEDENCE[level]:
+                return node
+            self.take()
+            node = Binary(op, node, self.parse(level + 1))
+
+    def atom(self) -> Expr:
+        token = self.take()
+        if token is None:
+            raise PseudocodeError(self.line, "expression ended early")
+        if token == "(":
+            inner = self.parse()
+            if self.take() != ")":
+                raise PseudocodeError(self.line, "missing ')'")
+            return inner
+        if token == "-":
+            return Unary("-", self.atom())
+        if token.lower() == "not":
+            return Unary("not", self.atom())
+        if re.fullmatch(r"0[xX][0-9A-Fa-f]+", token):
+            return Num(float(int(token, 16)))
+        if re.fullmatch(r"0[bB][01]+", token):
+            # A seven-segment font is written in binary or it is written wrong.
+            return Num(float(int(token[2:], 2)))
+        if re.fullmatch(r"\d+\.\d+|\d+", token):
+            return Num(float(token))
+        lowered = token.lower()
+        if lowered in self.program.pins:
+            return PinRef(lowered)
+        if lowered in ("true", "on", "high"):
+            return Num(1)
+        if lowered in ("false", "off", "low"):
+            return Num(0)
+        if lowered in self.program.ports:
+            return PortRef(lowered)
+        if lowered in self.program.tables:
+            if self.take() != "[":
+                raise PseudocodeError(
+                    self.line, f"{token!r} is a TABLE; read it as {token}[<index>]")
+            where = self.parse()
+            if self.take() != "]":
+                raise PseudocodeError(self.line, f"missing ']' after {token}[")
+            return Index(lowered, where)
+        if NAME_RE.match(token):
+            if token not in self.program.locals_ and token not in self.program.variables:
+                self.program.variables.append(token)
+            return Var(token)
+        raise PseudocodeError(self.line, f"unexpected {token!r}")
+
+
+def expression(text: str, program: Program, line: int) -> Expr:
+    parser = ExprParser(tokenize(text, line), program, line)
+    node = parser.parse()
+    if parser.peek() is not None:
+        raise PseudocodeError(line, f"trailing {parser.peek()!r} in expression")
+    return node
+
+
+# ================================================================== statements
+
+def parse_block(lines: list[Line], index: int, parent_indent: int,
+                program: Program) -> tuple[list, int]:
+    """Parse the block nested under `parent_indent` into a list of Stmt.
+
+    The block's own indent is whatever its first line uses, so 2 spaces, 4
+    spaces or any other width work -- only consistency within one block matters.
+    """
+    body: list = []
+    if index >= len(lines) or lines[index].indent <= parent_indent:
+        return body, index
+    indent = lines[index].indent
+
+    while index < len(lines):
+        line = lines[index]
+        if line.indent <= parent_indent:
+            break
+        if line.indent != indent:
+            raise PseudocodeError(
+                line.number,
+                f"inconsistent indentation: expected {indent} spaces, got {line.indent}")
+        text, lowered = line.text, line.text.lower()
+
+        if lowered in ("forever:", "forever"):
+            inner, index = parse_block(lines, index + 1, indent, program)
+            body.append(Forever(inner))
+            continue
+
+        loop = re.fullmatch(r"(while|repeat\s+until)\s+(.+?)\s*:", lowered)
+        if loop:
+            keyword = loop.group(1)
+            raw = text[len(keyword):].strip().rstrip(":").strip()
+            cond = expression(raw, program, line.number)
+            inner, index = parse_block(lines, index + 1, indent, program)
+            body.append(Loop(cond, inner, until=keyword.startswith("repeat")))
+            continue
+
+        repeat = re.fullmatch(r"repeat\s+(?!until\b)(.+?)\s*:", lowered)
+        if repeat:
+            count = expression(text[len("repeat"):].rstrip(":").strip(),
+                               program, line.number)
+            inner, index = parse_block(lines, index + 1, indent, program)
+            body.append(Repeat(count, inner))
+            continue
+
+        conditional = re.fullmatch(r"if\s+(.+?)\s+then\s*:", lowered)
+        if conditional:
+            raw = text[len("if"):].strip()
+            raw = raw[: raw.lower().rindex("then")].strip()
+            cond = expression(raw, program, line.number)
+            inner, index = parse_block(lines, index + 1, indent, program)
+            node = If(cond, inner)
+            if (index < len(lines) and lines[index].indent == indent
+                    and lines[index].text.lower() in ("else:", "else")):
+                node.orelse, index = parse_block(lines, index + 1, indent, program)
+            body.append(node)
+            continue
+
+        if lowered in ("else:", "else"):
+            raise PseudocodeError(line.number, "ELSE without a matching IF")
+
+        body.append(simple_statement(text, program, line.number))
+        index += 1
+    return body, index
+
+
+def require(program: Program, feature: str, line: int, what: str) -> None:
+    """Refuse a feature the target cannot emit, naming both."""
+    if feature not in program.target.supports:
+        raise PseudocodeError(
+            line, f"{what} is not available on the {program.target.display}. "
+                  f"Devices that have it: "
+                  + ", ".join(sorted({t.display for t in TARGETS.values()
+                                      if feature in t.supports})))
+
+
+def simple_statement(text: str, program: Program, line: int) -> Stmt:
+    lowered = text.lower()
+
+    def output_pin(name: str) -> str:
+        pin = program.pins.get(name.lower())
+        if pin is None:
+            raise PseudocodeError(line, f"unknown pin {name!r}; declare it with PIN")
+        if pin.direction == "tone":
+            return pin.name          # "turn off <tone>" is silence; see below
+        if pin.direction != "output":
+            what = pin.direction.upper()
+            article = "an" if what[0] in "AEIOU" else "a"
+            raise PseudocodeError(
+                line, f"{name!r} is {article} {what} pin and cannot be driven"
+                      + (f"; use 'set {name} to <n> percent'" if what == "PWM" else ""))
+        return pin.name
+
+    until = re.match(r"wait\s+until\s+(.+)$", text, re.I)
+    if until:
+        return WaitUntil(expression(until.group(1), program, line))
+
+    wait = re.fullmatch(r"wait\s+(.+?)\s*(seconds?|secs?|s|ms|milliseconds?)", lowered)
+    if wait:
+        unit = "ms" if wait.group(2).startswith("m") else "seconds"
+        return Wait(expression(wait.group(1), program, line), unit)
+
+    turn = re.fullmatch(r"turn\s+(on|off)\s+(\w+)", lowered)
+    if turn:
+        pin = program.pins[output_pin(turn.group(2)).lower()]
+        if pin.direction == "tone":
+            if turn.group(1) == "on":
+                raise PseudocodeError(
+                    line, f"{pin.name!r} is a TONE pin and has no 'on'; "
+                          f"use 'set {pin.name} to <n> hz'")
+            return SetTone(pin.name, Num(0))
+        on = turn.group(1) == "on"
+        return SetPin(pin.name, high=(not on) if pin.active_low else on, style="onoff")
+
+    level = re.fullmatch(r"set\s+(\w+)\s+(high|low)", lowered)
+    if level:
+        return SetPin(output_pin(level.group(1)), high=(level.group(2) == "high"))
+
+    into = re.match(r"set\s+(\w+)\s+to\s+(.+)$", text.strip(), re.I)
+    if into and into.group(1).lower() in program.parts:
+        return SetPart(into.group(1).lower(),
+                       expression(into.group(2), program, line))
+    if into and into.group(1).lower() in program.ports:
+        port = program.ports[into.group(1).lower()]
+        if port.direction != "output":
+            raise PseudocodeError(
+                line, f"{port.name!r} is an INPUT port and cannot be written")
+        return SetPort(port.name, expression(into.group(2), program, line))
+
+    say = re.match(r'print\s+"([^"]*)"\s*$', text.strip(), re.I)
+    if say:
+        require(program, "print", line, "print")
+        return Print(text=say.group(1))
+    say = re.match(r"print\s+(.+)$", text.strip(), re.I)
+    if say:
+        require(program, "print", line, "print")
+        return Print(value=expression(say.group(1), program, line))
+
+    hertz = re.fullmatch(r"set\s+(\w+)\s+to\s+(.+?)\s*(?:hz|hertz)", text.strip(), re.I)
+    if hertz:
+        name = hertz.group(1)
+        pin = program.pins.get(name.lower())
+        if pin is None:
+            raise PseudocodeError(line, f"unknown pin {name!r}; declare it with PIN")
+        require(program, "tone", line, "a frequency")
+        if pin.direction != "tone":
+            raise PseudocodeError(
+                line, f"{name!r} is a {pin.direction.upper()} pin; only a TONE pin "
+                      f"takes a frequency")
+        value = expression(hertz.group(2), program, line)
+        if isinstance(value, Num):
+            hz = value.value
+            # 8 Hz to 460 kHz at 11.0592 MHz. Out of range would be CLAMPED at
+            # run time, which sounds like a plausible wrong note rather than
+            # like an error -- so catch the constant case here.
+            lo, hi = program.clock / 24 / 65535, program.clock / 24
+            if hz != 0 and not (lo <= hz <= hi):
+                raise PseudocodeError(
+                    line, f"{hz:g} Hz is outside what Timer 1 can make at "
+                          f"CLOCK {program.clock} ({lo:.0f} Hz to {hi:.0f} Hz); "
+                          f"it would be clamped and sound like the wrong note")
+        return SetTone(pin.name, value)
+
+    duty = re.fullmatch(r"set\s+(\w+)\s+to\s+(.+?)\s*(?:percent|%)", text.strip(), re.I)
+    if duty:
+        name = duty.group(1)
+        pin = program.pins.get(name.lower())
+        if pin is None:
+            raise PseudocodeError(line, f"unknown pin {name!r}; declare it with PIN")
+        require(program, "pwm", line, "a duty cycle")
+        if pin.direction != "pwm":
+            what = pin.direction.upper()
+            raise PseudocodeError(
+                line, f"{name!r} is {'an' if what[0] in 'AEIOU' else 'a'} {what} pin; "
+                      f"only a PWM pin takes a percentage")
+        return SetPwm(pin.name, expression(duty.group(2), program, line))
+
+    assign = re.match(r"set\s+([A-Za-z_]\w*)\s+to\s+(.+)$", text, re.I)
+    if assign:
+        name = assign.group(1)
+        if name.lower() in program.pins:
+            direction = program.pins[name.lower()].direction
+            how = ("set {0} to <n> percent" if direction == "pwm"
+                   else "set {0} high/low").format(name)
+            raise PseudocodeError(line, f"{name!r} is a pin; use '{how}'")
+        value = expression(assign.group(2), program, line)
+        if name not in program.variables and name not in program.locals_:
+            program.variables.append(name)
+        return SetVar(name, value)
+
+    change = re.match(r"change\s+([A-Za-z_]\w*)\s+by\s+(.+)$", text, re.I)
+    if change:
+        name = change.group(1)
+        delta = expression(change.group(2), program, line)
+        if name not in program.variables and name not in program.locals_:
+            program.variables.append(name)
+        return ChangeVar(name, delta)
+
+    toggle = re.fullmatch(r"toggle\s+(\w+)", lowered)
+    if toggle:
+        return Toggle(output_pin(toggle.group(1)))
+
+    if lowered in ("stop", "stop all", "halt"):
+        return Stop()
+
+    call = re.match(r"([A-Za-z_]\w*)\s*(?:\((.*)\)|\s+(.*))?$", text)
+    if call and call.group(1).lower() in program.procedures:
+        procedure = program.procedures[call.group(1).lower()]
+        raw_args = (call.group(2) or call.group(3) or "").strip()
+        args = [expression(a, program, line) for a in split_arguments(raw_args)]
+        if len(args) != len(procedure.params):
+            raise PseudocodeError(
+                line, f"{procedure.name!r} takes {len(procedure.params)} "
+                      f"argument(s), got {len(args)}")
+        return Call(procedure.name, args)
+
+    raise PseudocodeError(line, f"do not understand {text!r}")
+
+
+def split_arguments(text: str) -> list[str]:
+    """Split on commas that are not inside parentheses."""
+    if not text:
+        return []
+    parts, depth, current = [], 0, ""
+    for char in text:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        if char == "," and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += char
+    parts.append(current)
+    return [part.strip() for part in parts if part.strip()]
+
+
+# ===================================================================== parsing
+
+DEFINE_RE = re.compile(r"define\s+(?:fast\s+)?([A-Za-z_]\w*)\s*(.*?):\s*$", re.I)
+WHEN_RE = re.compile(r"when\s+(started|flag\s+clicked|powered\s+on)\s*:", re.I)
+# `WHEN btn pressed:` -- an event hat on a declared INPUT pin. Lowered to a
+# POLLED task rather than to INT0/INT1: there are only two external-interrupt
+# pins, so an interrupt-based hat would work for two buttons and then silently
+# stop being available; the millisecond tick is already a debounce interval;
+# and polling is the same state-machine shape the scheduler already has.
+# docs/PARTS-TO-BLOCKS.md in the lab repo has the full reasoning.
+WHEN_PIN_RE = re.compile(r"when\s+(\w+)\s+(pressed|released)\s*:", re.I)
+PIN_RE = re.compile(r"pin\s+(\w+)\s*=\s*(\S+)\s+(output|input|analog|pwm|tone)"
+                    r"(?:\s+active\s+(low|high))?", re.I)
+PART_RE = re.compile(r"part\s+(\w+)\s*=\s*74hc595\s+data\s+(\S+)\s+"
+                     r"clock\s+(\S+)\s+latch\s+(\S+)"
+                     r"(?:\s+active\s+(low|high))?", re.I)
+PORT_DECL_RE = re.compile(r"port\s+(\w+)\s*=\s*(\S+)\s+(output|input)"
+                          r"(?:\s+active\s+(low|high))?", re.I)
+TABLE_RE = re.compile(r"table\s+(\w+)\s*=\s*(.+)$", re.I)
+CLOCK_RE = re.compile(r"clock\s+([\d_]+)\s*(hz|mhz)?", re.I)
+# Deliberately strict, and not only for tidiness: this string is handed back in
+# a Content-Disposition header and used as a filename. Letters, digits,
+# underscore and dash, starting with a letter or underscore -- no dots, no
+# separators, no quotes, nothing that can escape either context.
+PROGRAM_NAME_RE = re.compile(r"name\s+([A-Za-z_][A-Za-z0-9_-]{0,39})\s*", re.I)
+
+
+def parse(source: str) -> Program:
+    lines = read_lines(source)
+    if not lines:
+        raise PseudocodeError(1, "empty program")
+
+    program = Program()
+    index = 0
+
+    device = re.fullmatch(r"device\s+([\w-]+)\s*:", lines[0].text, re.I)
+    if device:
+        program.part = device.group(1).lower()
+        if program.part not in TARGETS:
+            raise PseudocodeError(
+                lines[0].number,
+                f"unknown device {device.group(1)!r}; known: "
+                + ", ".join(sorted(TARGETS)))
+        index = 1
+
+    # Pass one: register every DEFINE header, so a procedure may be called
+    # before its definition appears -- the order people actually write in.
+    for line in lines:
+        header = DEFINE_RE.fullmatch(line.text)
+        if header:
+            name = header.group(1)
+            params = re.findall(r"\(\s*([A-Za-z_]\w*)\s*\)", header.group(2))
+            if name.lower() in program.procedures:
+                raise PseudocodeError(line.number, f"procedure {name!r} defined twice")
+            program.procedures[name.lower()] = Procedure(name, params)
+
+    started = False
+    while index < len(lines):
+        line = lines[index]
+        text, lowered = line.text, line.text.lower()
+
+        named = PROGRAM_NAME_RE.fullmatch(text.strip())
+        if named and not started:
+            program.name = named.group(1)
+            index += 1
+            continue
+
+        clock = CLOCK_RE.fullmatch(lowered)
+        if clock and not started:
+            value = int(clock.group(1).replace("_", ""))
+            program.clock = value * 1_000_000 if clock.group(2) == "mhz" else value
+            index += 1
+            continue
+
+        part = PART_RE.fullmatch(lowered)
+        if part and not started:
+            require(program, "part", line.number, "a PART")
+            (name, data, clock, latch, active) = part.groups()
+            if name in program.parts or name in program.ports or name in program.pins:
+                raise PseudocodeError(line.number, f"{name!r} declared twice")
+            # The three pins are ordinary OUTPUT pins, so the target resolves
+            # them exactly as it resolves any other -- which is what lets a
+            # 74HC595 hang off an Arduino or an ATmega as readily as an 8051.
+            # Resolved against an EMPTY program of the same device: all we
+            # want here is "is this a real pin on this board, and what is it
+            # called". A target's resolve_pin also runs its own clash checks,
+            # and letting those fire would answer a PART question with a PIN
+            # answer -- the reason a user needs is "a PART claims its pins",
+            # which the checks just below give.
+            scratch = Program(part=program.part)
+            claims = [program.target.resolve_pin(
+                          scratch, f"{name}_{role}", token, "output", False,
+                          line.number)
+                      for role, token in (("data", data), ("clock", clock),
+                                          ("latch", latch))]
+            if len({pin.where for pin in claims}) != 3:
+                raise PseudocodeError(
+                    line.number, f"{name!r} names the same pin twice; data, clock and "
+                                 f"latch must be three different pins")
+            for claimed in claims:
+                for other in program.pins.values():
+                    if other.where == claimed.where:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is already declared as "
+                                         f"{other.name!r}; a PART claims its pins")
+                for whole in program.ports.values():
+                    if getattr(claimed, "port", None) == whole.port:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is inside the whole port "
+                                         f"{whole.name!r}, which would clobber it")
+                for prev in program.parts.values():
+                    if claimed.where in prev.claimed_where:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is already claimed by "
+                                         f"{prev.name!r}")
+            program.parts[name] = ShiftPart(name, "74hc595", claims[0], claims[1],
+                                            claims[2], active == "low")
+            index += 1
+            continue
+
+        port = PORT_DECL_RE.fullmatch(lowered)
+        if port and not started:
+            require(program, "port", line.number, "a whole-port PORT")
+            name, where, direction, active = port.groups()
+            if name in program.ports or name in program.pins:
+                raise PseudocodeError(line.number, f"{name!r} declared twice")
+            whole = program.target.resolve_port(
+                program, name, where, direction, active == "low", line.number)
+            # A PORT and a PIN on the same port would fight: writing the byte
+            # clobbers the bit, and neither declaration would look wrong.
+            for other in program.pins.values():
+                if getattr(other, "port", None) == whole.port:
+                    raise PseudocodeError(
+                        line.number,
+                        f"{where.upper()} is already used one bit at a time, by "
+                        f"{other.name!r} ({other.where}); a PORT writes all eight at "
+                        f"once and would clobber it")
+            for other in program.ports.values():
+                if other.port == whole.port:
+                    raise PseudocodeError(
+                        line.number,
+                        f"{where.upper()} is already declared as {other.name!r}")
+            program.ports[name] = whole
+            index += 1
+            continue
+
+        table = TABLE_RE.fullmatch(text.strip())
+        if table and not started:
+            require(program, "table", line.number, "a TABLE")
+            name = table.group(1)
+            if name.lower() in program.tables:
+                raise PseudocodeError(line.number, f"table {name!r} declared twice")
+            values = []
+            for item in table.group(2).split(","):
+                item = item.strip()
+                try:
+                    values.append(int(item, 0) if not item.startswith(("0b", "0B"))
+                                  else int(item[2:], 2))
+                except ValueError:
+                    raise PseudocodeError(
+                        line.number, f"{item!r} is not a constant; a TABLE holds "
+                                     f"numbers only, and lives in flash")
+            if not values:
+                raise PseudocodeError(line.number, f"table {name!r} is empty")
+            if any(v < 0 or v > 255 for v in values):
+                raise PseudocodeError(
+                    line.number, f"table {name!r} holds bytes: 0 to 255")
+            program.tables[name.lower()] = values
+            index += 1
+            continue
+
+        pin = PIN_RE.fullmatch(lowered)
+        if pin and not started:
+            name, where, direction, active = pin.groups()
+            if name in program.pins:
+                raise PseudocodeError(line.number, f"pin {name!r} declared twice")
+            # The target decides what that location token means, and whether
+            # it can offer the requested direction there at all.
+            if direction in ("pwm", "tone"):
+                require(program, direction, line.number, f"a {direction.upper()} pin")
+            program.pins[name] = program.target.resolve_pin(
+                program, name, where, direction, active == "low", line.number)
+            index += 1
+            continue
+
+        header = DEFINE_RE.fullmatch(text)
+        if header:
+            procedure = program.procedures[header.group(1).lower()]
+            program.locals_ = set(procedure.params)
+            procedure.body, index = parse_block(lines, index + 1, line.indent, program)
+            program.locals_ = set()
+            if not procedure.body:
+                raise PseudocodeError(line.number,
+                                      f"procedure {procedure.name!r} has an empty body")
+            continue
+
+        if WHEN_RE.fullmatch(lowered):
+            started = True
+            block, index = parse_block(lines, index + 1, line.indent, program)
+            if not block:
+                raise PseudocodeError(line.number, "'WHEN started:' block is empty")
+            program.whens.append(block)
+            program.when_hats.append(None)
+            continue
+
+        hat = WHEN_PIN_RE.fullmatch(lowered)
+        if hat:
+            name, edge = hat.group(1), hat.group(2).lower()
+            pin = program.pins.get(name)
+            if pin is None:
+                raise PseudocodeError(
+                    line.number, f"unknown pin {name!r}; declare it with PIN before "
+                                 f"reacting to it")
+            if pin.direction != "input":
+                raise PseudocodeError(
+                    line.number, f"{name!r} is {pin.direction.upper()} and cannot be "
+                                 f"waited on; only an INPUT pin has an edge to react to")
+            started = True
+            block, index = parse_block(lines, index + 1, line.indent, program)
+            if not block:
+                raise PseudocodeError(
+                    line.number, f"'WHEN {name} {edge}:' block is empty")
+            program.whens.append(block)
+            program.when_hats.append((pin.name, edge))
+            continue
+
+        raise PseudocodeError(
+            line.number, f"do not understand {text!r}"
+            + ("" if started else " (expected NAME, CLOCK, PIN, DEFINE or "
+                                  "WHEN started:)"))
+
+    if not started:
+        raise PseudocodeError(lines[-1].number, "no 'WHEN started:' block")
+    program.body = program.whens[0]
+
+    if len(program.whens) > 1:
+        # Each WHEN block becomes a cooperative task; a wait inside a
+        # procedure would have to suspend the CALLER's state machine, which
+        # single-level state machines cannot express. Scratch has the same
+        # shape (scripts yield, custom blocks run to completion).
+        def waits(body):
+            for node in body:
+                if isinstance(node, (Wait, WaitUntil)):
+                    return True
+                for inner in ("body", "orelse"):
+                    if waits(getattr(node, inner, [])):
+                        return True
+            return False
+        for procedure in program.procedures.values():
+            if waits(procedure.body):
+                raise PseudocodeError(
+                    lines[0].number,
+                    f"with several WHEN blocks, procedures must not wait -- "
+                    f"{procedure.name!r} does; move the wait into the WHEN block")
+    # One Timer 1, two claimants. On a part whose baud rate comes from Timer 1
+    # -- the STC89 -- a serial console and a TONE pin both want it, and they
+    # want it in different MODES, so the loser is decided by whichever line of
+    # setup runs last. Refuse instead. The STC12 is fine: its baud comes from
+    # the dedicated BRT, leaving Timer 1 for the tone.
+    if (program.uses_uart and program.tone_pin is not None
+            and not program.target.baud_from_brt):
+        raise PseudocodeError(
+            0, f"on the {program.part} the serial console and a TONE pin both need "
+               f"Timer 1, in different modes -- {program.tone_pin.name!r} cannot sound "
+               f"while the program prints. The STC12 has a dedicated baud-rate timer "
+               f"and can do both.")
+
+    return program
+
+
+# ========================================================= pseudocode back end
+
+def expr_pseudo(node: Expr, parent_level: int = -1) -> str:
+    """Render an expression, parenthesising only where precedence demands it."""
+    if isinstance(node, Num):
+        return node.text()
+    if isinstance(node, PortRef):
+        return node.port
+    if isinstance(node, Index):
+        return f"{node.table}[{expr_pseudo(node.where)}]"
+    if isinstance(node, (Var, PinRef)):
+        return node.name
+    if isinstance(node, Unary):
+        inner = expr_pseudo(node.operand, UNARY_LEVEL)
+        return f"not {inner}" if node.op == "not" else f"-{inner}"
+    if isinstance(node, Binary):
+        level = LEVEL[node.op]
+        # The right operand binds one level tighter so that `a - (b - c)` keeps
+        # its parentheses; without that, re-parsing would give `(a - b) - c`.
+        text = (f"{expr_pseudo(node.left, level)} {node.op} "
+                f"{expr_pseudo(node.right, level + 1)}")
+        return f"({text})" if level < parent_level else text
+    raise TypeError(node)
+
+
+def stmts_pseudo(body: list, depth: int, active_low: dict) -> list[str]:
+    pad = "  " * depth
+    out = []
+    for node in body:
+        if isinstance(node, SetPart):
+            out.append(f"{pad}set {node.part} to {expr_pseudo(node.value)}")
+        elif isinstance(node, SetPort):
+            out.append(f"{pad}set {node.port} to {expr_pseudo(node.value)}")
+        elif isinstance(node, Print):
+            out.append(f'{pad}print "{node.text}"' if node.value is None
+                       else f"{pad}print {expr_pseudo(node.value)}")
+        elif isinstance(node, SetTone):
+            if isinstance(node.hz, Num) and node.hz.value == 0:
+                out.append(f"{pad}turn off {node.pin}")
+            else:
+                out.append(f"{pad}set {node.pin} to {expr_pseudo(node.hz)} hz")
+        elif isinstance(node, SetPwm):
+            out.append(f"{pad}set {node.pin} to {expr_pseudo(node.value)} percent")
+        elif isinstance(node, SetPin):
+            if node.style == "onoff":
+                on = (not node.high) if active_low.get(node.pin) else node.high
+                out.append(f"{pad}turn {'on' if on else 'off'} {node.pin}")
+            else:
+                out.append(f"{pad}set {node.pin} {'high' if node.high else 'low'}")
+        elif isinstance(node, Toggle):
+            out.append(f"{pad}toggle {node.pin}")
+        elif isinstance(node, Wait):
+            out.append(f"{pad}wait {expr_pseudo(node.amount)} {node.unit}")
+        elif isinstance(node, WaitUntil):
+            out.append(f"{pad}wait until {expr_pseudo(node.cond)}")
+        elif isinstance(node, SetVar):
+            out.append(f"{pad}set {node.name} to {expr_pseudo(node.value)}")
+        elif isinstance(node, ChangeVar):
+            out.append(f"{pad}change {node.name} by {expr_pseudo(node.delta)}")
+        elif isinstance(node, Forever):
+            out.append(f"{pad}FOREVER:")
+            out += stmts_pseudo(node.body, depth + 1, active_low)
+        elif isinstance(node, Repeat):
+            out.append(f"{pad}REPEAT {expr_pseudo(node.count)}:")
+            out += stmts_pseudo(node.body, depth + 1, active_low)
+        elif isinstance(node, Loop):
+            keyword = "REPEAT UNTIL" if node.until else "WHILE"
+            out.append(f"{pad}{keyword} {expr_pseudo(node.cond)}:")
+            out += stmts_pseudo(node.body, depth + 1, active_low)
+        elif isinstance(node, If):
+            out.append(f"{pad}IF {expr_pseudo(node.cond)} THEN:")
+            out += stmts_pseudo(node.body, depth + 1, active_low)
+            if node.orelse:
+                out.append(f"{pad}ELSE:")
+                out += stmts_pseudo(node.orelse, depth + 1, active_low)
+        elif isinstance(node, Call):
+            args = ", ".join(expr_pseudo(a) for a in node.args)
+            out.append(f"{pad}{node.name}{' ' + args if args else ''}")
+        elif isinstance(node, Stop):
+            out.append(f"{pad}stop")
+        else:
+            raise TypeError(node)
+    return out
+
+
+def emit_pseudocode(program: Program) -> str:
+    """Walk the AST back to canonical pseudocode.
+
+    Canonical rather than byte-identical to whatever was parsed: comments are
+    gone, DEVICE and CLOCK are always written out, and the layout is
+    normalised. What matters is that it is a *fixed point* -- parsing this and
+    emitting again gives exactly the same text.
+    """
+    active_low = {pin.name: pin.active_low for pin in program.pins.values()}
+    out = [f"DEVICE {program.part.upper()}:"]
+    if program.name:
+        out.append(f"  NAME {program.name}")
+    out.append(f"  CLOCK {program.clock}")
+    if program.tables:
+        out.append("")
+        for name, values in program.tables.items():
+            out.append(f"  TABLE {name} = " + ", ".join(f"0x{v:02X}" for v in values))
+    if program.parts:
+        out.append("")
+        for part in program.parts.values():
+            polarity = " ACTIVE LOW" if part.active_low else ""
+            out.append(f"  PART {part.name} = 74HC595 "
+                       f"DATA {part.data.where} CLOCK {part.clock.where} "
+                       f"LATCH {part.latch.where}{polarity}")
+    if program.ports:
+        out.append("")
+        for port in program.ports.values():
+            polarity = " ACTIVE LOW" if port.active_low else ""
+            out.append(f"  PORT {port.name} = {port.label} "
+                       f"{port.direction.upper()}{polarity}")
+    if program.pins:
+        out.append("")
+        for pin in program.pins.values():
+            polarity = " ACTIVE LOW" if pin.active_low else ""
+            out.append(f"  PIN {pin.name} = {pin.where} "
+                       f"{pin.direction.upper()}{polarity}")
+    for procedure in program.procedures.values():
+        out.append("")
+        params = "".join(f" ({name})" for name in procedure.params)
+        out.append(f"  DEFINE {procedure.name}{params}:")
+        out += stmts_pseudo(procedure.body, 2, active_low)
+    for number, block in enumerate(program.whens):
+        hat = program.when_hats[number] if number < len(program.when_hats) else None
+        header = "  WHEN started:" if hat is None else f"  WHEN {hat[0]} {hat[1]}:"
+        out += ["", header]
+        out += stmts_pseudo(block, 2, active_low)
+    return "\n".join(out) + "\n"
+
+
+# ================================================================== C back end
+
+@dataclass
+class Emit:
+    """What every walker in the C back end needs, gathered so that adding a
+    target does not mean threading another parameter through six functions."""
+    target: Target
+    pins: dict
+    procs: dict
+    program: "Program" = None    # ports and tables are program-level
+    counter: list = field(default_factory=lambda: [0])
+
+
+def expr_c(node: Expr, ctx: Emit, parent_level: int = -1) -> str:
+    if isinstance(node, Num):
+        return str(int(node.value))
+    if isinstance(node, PortRef):
+        port = ctx.program.ports[node.port]
+        raw = port.read
+        # gcc-avr 5.4 warns "promoted ~unsigned is always non-zero" on
+        # `(unsigned char)~PINC > 0` -- and on `0xFF - PINC` and every other
+        # spelling, including ones containing no `~` at all. It is looking
+        # through the cast at a complement-shaped subexpression, and the cast
+        # is exactly what makes the value a byte again. The generated code is
+        # right; the warning is not, so build_avr turns that one check off
+        # rather than contorting this expression to dodge it.
+        return f"(unsigned char)~{raw}" if port.active_low else raw
+    if isinstance(node, Index):
+        table = ctx.program.tables[node.table]
+        where = expr_c(node.where, ctx)
+        # A constant index is checked here and costs nothing at run time. A
+        # computed one is clamped, because the alternative is reading a random
+        # byte of flash and showing it on a display -- which looks like data.
+        if isinstance(node.where, Num):
+            i = int(node.where.value)
+            if not 0 <= i < len(table):
+                raise PseudocodeError(
+                    0, f"{node.table}[{i}] is outside the table "
+                       f"(0 to {len(table) - 1})")
+            return f"bw_tab_{node.table}[{i}]"
+        return f"bw_tab_{node.table}[bw_clamp({where}, {len(table) - 1})]"
+    if isinstance(node, Var):
+        return node.name
+    if isinstance(node, PinRef):
+        pin = ctx.pins[node.name]
+        if pin.direction == "analog":
+            return ctx.target.read_analog(pin)
+        return ctx.target.read_pin(pin)
+    if isinstance(node, Unary):
+        inner = expr_c(node.operand, ctx, UNARY_LEVEL)
+        return f"!({inner})" if node.op == "not" else f"-({inner})"
+    if isinstance(node, Binary):
+        level = LEVEL[node.op]
+        text = (f"{expr_c(node.left, ctx, level)} {TO_C[node.op]} "
+                f"{expr_c(node.right, ctx, level + 1)}")
+        return f"({text})" if level < parent_level else text
+    raise TypeError(node)
+
+
+def ms_of(node: Wait, ctx: Emit) -> str:
+    """A Wait in milliseconds, folded to a constant where it can be."""
+    if isinstance(node.amount, Num):
+        value = node.amount.value
+        return str(int(round(value * 1000 if node.unit == "seconds" else value)))
+    inner = expr_c(node.amount, ctx, UNARY_LEVEL)
+    return inner if node.unit == "ms" else f"(unsigned int)(({inner}) * 1000)"
+
+
+def stmts_c(body: list, depth: int, ctx: Emit) -> list[str]:
+    pad = "    " * depth
+    out = []
+    for node in body:
+        if isinstance(node, SetPin):
+            out.append(pad + ctx.target.write_pin(ctx.pins[node.pin], node.high))
+        elif isinstance(node, SetPwm):
+            out.append(pad + ctx.target.write_pwm(ctx.pins[node.pin],
+                                                  expr_c(node.value, ctx)))
+        elif isinstance(node, SetTone):
+            out.append(pad + ctx.target.write_tone(ctx.pins[node.pin],
+                                                   expr_c(node.hz, ctx)))
+        elif isinstance(node, Print):
+            rendered = Print(text=node.text,
+                             value=None if node.value is None else expr_c(node.value, ctx))
+            out.append(pad + ctx.target.write_print(rendered))
+        elif isinstance(node, SetPart):
+            part = ctx.program.parts[node.part]
+            value = expr_c(node.value, ctx)
+            if part.active_low:
+                out.append(f"{pad}bw_part_{part.name}((unsigned char)~({value}));")
+            else:
+                out.append(f"{pad}bw_part_{part.name}((unsigned char)({value}));")
+        elif isinstance(node, SetPort):
+            port = ctx.program.ports[node.port]
+            value = expr_c(node.value, ctx)
+            if port.active_low:
+                out.append(f"{pad}{port.sfr} = (unsigned char)~({value});")
+            else:
+                out.append(f"{pad}{port.sfr} = (unsigned char)({value});")
+        elif isinstance(node, Toggle):
+            out.append(pad + ctx.target.toggle_pin(ctx.pins[node.pin]))
+        elif isinstance(node, Wait):
+            out.append(pad + ctx.target.delay(ms_of(node, ctx)))
+        elif isinstance(node, WaitUntil):
+            # `{ }` rather than a bare `;`: an empty statement after a while
+            # clause is what -Wmisleading-indentation fires on, since the
+            # NEXT generated line is indented as if the loop guarded it. The
+            # braces say "this loop has no body" unambiguously, to the
+            # compiler and to anyone reading the output.
+            out.append(f"{pad}while (!({expr_c(node.cond, ctx)})) {{ }}")
+        elif isinstance(node, SetVar):
+            out.append(f"{pad}{node.name} = {expr_c(node.value, ctx)};")
+        elif isinstance(node, ChangeVar):
+            out.append(f"{pad}{node.name} += {expr_c(node.delta, ctx)};")
+        elif isinstance(node, Forever):
+            out.append(f"{pad}for (;;) {{")
+            out += stmts_c(node.body, depth + 1, ctx)
+            out.append(f"{pad}}}")
+        elif isinstance(node, Repeat):
+            ctx.counter[0] += 1
+            var = f"_i{ctx.counter[0]}"
+            out.append(f"{pad}{{ unsigned int {var};")
+            out.append(f"{pad}  for ({var} = 0; {var} < "
+                       f"({expr_c(node.count, ctx)}); {var}++) {{")
+            out += stmts_c(node.body, depth + 2, ctx)
+            out += [f"{pad}  }}", f"{pad}}}"]
+        elif isinstance(node, Loop):
+            test = expr_c(node.cond, ctx, UNARY_LEVEL if node.until else -1)
+            if node.until:
+                test = f"!({test})"      # REPEAT UNTIL c  ==  WHILE not c
+            out.append(f"{pad}while ({test}) {{")
+            out += stmts_c(node.body, depth + 1, ctx)
+            out.append(f"{pad}}}")
+        elif isinstance(node, If):
+            out.append(f"{pad}if ({expr_c(node.cond, ctx)}) {{")
+            out += stmts_c(node.body, depth + 1, ctx)
+            if node.orelse:
+                out.append(f"{pad}}} else {{")
+                out += stmts_c(node.orelse, depth + 1, ctx)
+            out.append(f"{pad}}}")
+        elif isinstance(node, Call):
+            args = ", ".join(expr_c(a, ctx) for a in node.args)
+            out.append(f"{pad}{ctx.procs[node.name.lower()].c_name}({args});")
+        elif isinstance(node, Stop):
+            out.append(f"{pad}for (;;) ;   /* stop */")
+        else:
+            raise TypeError(node)
+    return out
+
+
+def has_wait(body: list) -> bool:
+    for node in body:
+        if isinstance(node, Wait):
+            return True
+        if has_wait(getattr(node, "body", [])) or has_wait(getattr(node, "orelse", [])):
+            return True
+    return False
+
+
+def stmts_task(body: list, depth: int, ctx: Emit,
+               task: str, states: list, statics: list) -> list[str]:
+    """One task's statements as the interior of a Duff's-device state machine.
+
+    The switch sits in the caller; case labels land inside whatever nesting
+    the statements build, which C allows as long as no inner switch appears
+    (we emit none). Every wait AND every loop back-edge is a numbered yield
+    -- the latter is Scratch's own scheduling contract, and it is what makes
+    a busy FOREVER loop unable to starve the other tasks.
+
+    This lowering is what a target without `goto` -- MicroPython, say -- cannot
+    use, and that is the reason the seam runs through statements and not only
+    through primitives."""
+    pad = "    " * depth
+    out = []
+
+    def yield_state():
+        states[0] += 1
+        return states[0]
+
+    for node in body:
+        if isinstance(node, SetPin):
+            out.append(pad + ctx.target.write_pin(ctx.pins[node.pin], node.high))
+        elif isinstance(node, SetPwm):
+            out.append(pad + ctx.target.write_pwm(ctx.pins[node.pin],
+                                                  expr_c(node.value, ctx)))
+        elif isinstance(node, SetTone):
+            out.append(pad + ctx.target.write_tone(ctx.pins[node.pin],
+                                                   expr_c(node.hz, ctx)))
+        elif isinstance(node, Print):
+            rendered = Print(text=node.text,
+                             value=None if node.value is None else expr_c(node.value, ctx))
+            out.append(pad + ctx.target.write_print(rendered))
+        elif isinstance(node, SetPart):
+            part = ctx.program.parts[node.part]
+            value = expr_c(node.value, ctx)
+            if part.active_low:
+                out.append(f"{pad}bw_part_{part.name}((unsigned char)~({value}));")
+            else:
+                out.append(f"{pad}bw_part_{part.name}((unsigned char)({value}));")
+        elif isinstance(node, SetPort):
+            port = ctx.program.ports[node.port]
+            value = expr_c(node.value, ctx)
+            if port.active_low:
+                out.append(f"{pad}{port.sfr} = (unsigned char)~({value});")
+            else:
+                out.append(f"{pad}{port.sfr} = (unsigned char)({value});")
+        elif isinstance(node, Toggle):
+            out.append(pad + ctx.target.toggle_pin(ctx.pins[node.pin]))
+        elif isinstance(node, Wait):
+            state = yield_state()
+            out += [f"{pad}{task}_until = {ctx.target.now()} + ({ms_of(node, ctx)});",
+                    f"{pad}{task}_state = {state};",
+                    f"{pad}case {state}:",
+                    f"{pad}if (({ctx.target.time_signed})"
+                    f"({ctx.target.now()} - {task}_until) < 0) return;"]
+        elif isinstance(node, WaitUntil):
+            state = yield_state()
+            out += [f"{pad}{task}_state = {state};",
+                    f"{pad}case {state}:",
+                    f"{pad}if (!({expr_c(node.cond, ctx)})) return;"]
+        elif isinstance(node, SetVar):
+            out.append(f"{pad}{node.name} = {expr_c(node.value, ctx)};")
+        elif isinstance(node, ChangeVar):
+            out.append(f"{pad}{node.name} += {expr_c(node.delta, ctx)};")
+        elif isinstance(node, Forever):
+            state = yield_state()
+            out += [f"{pad}{task}_state = {state};", f"{pad}case {state}:"]
+            out += stmts_task(node.body, depth, ctx, task, states, statics)
+            out += [f"{pad}{task}_state = {state};", f"{pad}return;"]
+        elif isinstance(node, Repeat):
+            ctx.counter[0] += 1
+            var = f"bw_i{ctx.counter[0]}"
+            statics.append(var)
+            state = yield_state()
+            out += [f"{pad}{var} = ({expr_c(node.count, ctx)});",
+                    f"{pad}{task}_state = {state};",
+                    f"{pad}case {state}:",
+                    f"{pad}if ({var}) {{"]
+            out += stmts_task(node.body, depth + 1, ctx, task, states, statics)
+            out += [f"{pad}    {var}--;",
+                    f"{pad}    {task}_state = {state};",
+                    f"{pad}    return;",
+                    f"{pad}}}"]
+        elif isinstance(node, Loop):
+            test = expr_c(node.cond, ctx, UNARY_LEVEL if node.until else -1)
+            if node.until:
+                test = f"!({test})"
+            state = yield_state()
+            out += [f"{pad}{task}_state = {state};",
+                    f"{pad}case {state}:",
+                    f"{pad}if ({test}) {{"]
+            out += stmts_task(node.body, depth + 1, ctx, task, states, statics)
+            out += [f"{pad}    {task}_state = {state};",
+                    f"{pad}    return;",
+                    f"{pad}}}"]
+        elif isinstance(node, If):
+            out.append(f"{pad}if ({expr_c(node.cond, ctx)}) {{")
+            out += stmts_task(node.body, depth + 1, ctx, task, states, statics)
+            if node.orelse:
+                out.append(f"{pad}}} else {{")
+                out += stmts_task(node.orelse, depth + 1, ctx, task, states, statics)
+            out.append(f"{pad}}}")
+        elif isinstance(node, Call):
+            args = ", ".join(expr_c(a, ctx) for a in node.args)
+            out.append(f"{pad}{ctx.procs[node.name.lower()].c_name}({args});")
+        elif isinstance(node, Stop):
+            out += [f"{pad}{task}_state = 0xFFFF;   /* stop this script */",
+                    f"{pad}return;"]
+        else:
+            raise TypeError(node)
+    return out
+
+
+def emit_c(program: Program) -> str:
+    """Walk the AST to C, asking the target for everything chip-specific.
+
+    What stays here is the portable part: declaration order, the shape of the
+    scheduler, which statements become which control flow. What the target
+    supplies is every line that names a register, a header or a timebase."""
+    target = program.target
+    ctx = Emit(target, {pin.name: pin for pin in program.pins.values()},
+               program.procedures, program)
+    # A pin hat must be sampled every tick, so it forces the cooperative
+    # scheduler even when it is the only script in the program.
+    tasks = len(program.whens) > 1 or any(program.when_hats)
+
+    out = [
+        "/* Generated from BrickWright pseudocode by stc-compiler.",
+        " * Hand edits will be lost; change the pseudocode instead. */",
+    ]
+    out += target.prologue(program)
+    out += target.runtime(program, tasks)
+
+    if program.variables:
+        out.append("/* Variables (16-bit signed, like Scratch's integers). */")
+        out += [f"static int {name} = 0;" for name in program.variables]
+        out.append("")
+
+    if ctx.procs:
+        for procedure in ctx.procs.values():
+            params = ", ".join(f"int {p}" for p in procedure.params) or "void"
+            out.append(f"static void {procedure.c_name}({params});")
+        out.append("")
+        for procedure in ctx.procs.values():
+            params = ", ".join(f"int {p}" for p in procedure.params) or "void"
+            out += [f"/* DEFINE {procedure.name} */",
+                    f"static void {procedure.c_name}({params})", "{",
+                    *stmts_c(procedure.body, 1, ctx), "}", ""]
+
+    task_names: list[str] = []
+    if tasks:
+        task_lines: list[str] = []
+        statics: list[str] = []
+        for number, block in enumerate(program.whens):
+            task = f"bw_task{number}"
+            task_names.append(task)
+            hat = program.when_hats[number] if number < len(program.when_hats) else None
+
+            # A hat's body starts at case 1; case 0 is the edge test.
+            states = [1] if hat else [0]
+            body = stmts_task(block, 1, ctx, task, states, statics)
+            head = [f"static unsigned int {task}_state;"]
+            if has_wait(block):
+                head.append(f"static {target.time_type} {task}_until;")
+
+            if hat is None:
+                task_lines += head
+                task_lines += [f"/* WHEN started: (script {number + 1}) */",
+                               f"static void {task}(void)", "{",
+                               f"    switch ({task}_state) {{",
+                               "    case 0:",
+                               *body,
+                               "    }",
+                               f"    {task}_state = 0xFFFF;   /* ran to the end */",
+                               "}", ""]
+                continue
+
+            pin_name, edge = hat
+            pin = ctx.pins[pin_name]
+            level = target.read_pin(pin)          # polarity-aware: the LOGICAL level
+            rising = "pressed" if edge == "pressed" else "released"
+            test = (f"now && !{task}_prev" if edge == "pressed"
+                    else f"!now && {task}_prev")
+            head.append(f"static unsigned char {task}_prev;")
+            task_lines += head
+            task_lines += [
+                f"/* WHEN {pin_name} {rising}: (script {number + 1})",
+                " *",
+                " * Polled once per dispatch and EDGE-triggered: `_prev` is updated on every",
+                " * pass, so a held button runs the body once rather than every millisecond,",
+                " * and a release during the body does not queue a second run. The level read",
+                " * is the LOGICAL one, so an ACTIVE LOW button reads as pressed when the pin",
+                " * is low. */",
+                f"static void {task}(void)",
+                "{",
+                f"    unsigned char now = ({level}) ? 1 : 0;",
+                f"    unsigned char fired = ({test}) ? 1 : 0;",
+                f"    {task}_prev = now;",
+                "",
+                f"    switch ({task}_state) {{",
+                "    case 0:",
+                "        if (!fired)",
+                "            return;",
+                f"        {task}_state = 1;",
+                "    case 1:",
+                *body,
+                "    }",
+                f"    {task}_state = 0;   /* ready for the next edge */",
+                "}", ""]
+        if statics:
+            task_lines[0:0] = ["/* REPEAT counters live across yields. */",
+                               *(f"static unsigned int {name};" for name in statics),
+                               ""]
+        out += task_lines
+
+    # Exactly one of these is non-empty; the target decides what shell they go
+    # in, because "the program starts here" is not `main()` everywhere.
+    body_lines = [] if tasks else stmts_c(program.body, 1, ctx)
+    out += target.main(program, target.setup(program), body_lines, task_names)
+    return "\n".join(out)
+
+
+# ======================================================================= facade
+
+def emit(program: Program) -> str:
+    """Generated source for `program`, in whatever language its target uses.
+
+    `emit_c` remains the C back end and the only one most targets need;
+    a target that cannot use it supplies its own `emit`."""
+    custom = getattr(program.target, "emit", None)
+    return custom(program) if custom else emit_c(program)
+
+
+def source_language(program: Program) -> str:
+    """"c" or "python" -- what `emit` just produced, for callers that have to
+    label it (a filename, a syntax highlighter, an editor tab)."""
+    return "python" if getattr(program.target, "emit", None) else "c"
+
+
+def transpile(source: str) -> tuple[str, Program]:
+    program = parse(source)
+    return emit(program), program
+
+
+def decompile(source: str) -> str:
+    """pseudocode -> AST -> canonical pseudocode. A fixed point by construction."""
+    return emit_pseudocode(parse(source))
+
+
+EXAMPLE = """DEVICE STC12C5A60S2:
+  CLOCK 11059200
+
+  PIN led1 = P1.0 OUTPUT ACTIVE LOW
+  PIN led2 = P1.1 OUTPUT ACTIVE LOW
+
+  WHEN started:
+    set counter to 0
+    FOREVER:
+      REPEAT 6:
+        turn on led1
+        turn off led2
+        wait 0.15 seconds
+        turn off led1
+        turn on led2
+        wait 0.15 seconds
+      change counter by 1
+      IF counter > 2 THEN:
+        turn on led1
+        turn on led2
+        wait 1 seconds
+        turn off led1
+        turn off led2
+        wait 1 seconds
+        set counter to 0
+"""
+
+
+# Registered last, and imported here rather than above, because bw_microbit
+# subclasses Target and everything it needs is defined by this point. Keeping
+# it in its own module keeps a 300-line Python back end out of the file that
+# every other target shares.
+from bw_microbit import MicrobitTarget  # noqa: E402
+
+TARGETS["microbit"] = MicrobitTarget()
+TARGETS["micro-bit"] = TARGETS["microbit"]
