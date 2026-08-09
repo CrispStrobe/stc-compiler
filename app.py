@@ -59,6 +59,26 @@ INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]*)"',
                         re.MULTILINE)
 
 
+def reject_path_options(options) -> dict | None:
+    """No caller-supplied option may contain a path separator.
+
+    Blocking a bare path was not enough on its own. `-I/etc` starts with a
+    dash, so it went straight through -- and it moves where a RELATIVE
+    `#include "os-release"` resolves to, which means the source-side check
+    never sees a suspicious path at all. Same for -B, -L and --include-dir.
+
+    Nothing this service legitimately accepts needs a slash: the memory and
+    size flags come from TARGETS, and the shim's include paths from
+    keil2sdcc.shim_args(). Neither passes through here.
+    """
+    for opt in options or ():
+        opt = str(opt)
+        if "/" in opt or "\\" in opt:
+            return {"success": False, "stage": "options",
+                    "error": f"options cannot contain a path; rejected {opt!r}"}
+    return None
+
+
 def reject_escaping_includes(source: str):
     """None if the source only includes files beside it, else an error dict."""
     for path in INCLUDE_RE.findall(source):
@@ -249,6 +269,10 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
     filename, bytes, log, memory -- so a client that already speaks to this
     service does not learn a second one.
     """
+    refusal = reject_path_options(req.options)
+    if refusal:
+        return refusal
+
     bin_dir = stage_avr()
     if bin_dir is None:
         return {"success": False, "stage": "compile",
@@ -398,7 +422,7 @@ def build(req: CompileReq) -> dict:
     if len(req.code.encode("utf-8")) > MAX_SOURCE_BYTES:
         return {"success": False, "error": "source too large"}
 
-    refusal = reject_escaping_includes(req.code)
+    refusal = reject_escaping_includes(req.code) or reject_path_options(req.options)
     if refusal:
         return refusal
 
@@ -694,6 +718,9 @@ async def translate_project_endpoint(req: ProjectReq):
         if refusal:
             refusal["error"] = f"{path}: {refusal['error']}"
             return refusal
+    refusal = reject_path_options(req.options)
+    if refusal:
+        return refusal
 
     stage_toolchain()
     result = keil2sdcc.translate_project(req.files)

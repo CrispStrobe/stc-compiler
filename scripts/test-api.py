@@ -167,6 +167,20 @@ for probe, why in [('#include "/etc/os-release"\nvoid main(void){}', "an absolut
           result.get("success") is False
           and "outside the build directory" in (result.get("error") or ""),
           (result.get("error") or "")[:56])
+# And the way round the first fix: an include-path flag moves where a
+# RELATIVE include resolves, so the source looks innocent.
+for opts, why in [(["-I/etc"], "-I with a path"),
+                  (["--include-dir=/etc"], "a long-form include dir"),
+                  (["-L/usr/lib"], "a library path")]:
+    result, _ = post({"code": '#include "os-release"\nvoid main(void){}', "options": opts})
+    check(f"refuses {why} in options",
+          result.get("success") is False
+          and "cannot contain a path" in (result.get("error") or ""),
+          (result.get("error") or "")[:56])
+result, _ = post({"code": SOURCE, "options": ["--opt-code-size"]})
+check("a flag without a path still works", result.get("success") is True,
+      (result.get("error") or "")[:56])
+
 for allowed, why in [('#include <stc12.h>\nvoid main(void){ P1 = 0; for(;;); }', "a system header"),
                      ('#include "nope.h"\nvoid main(void){}', "a relative header (fails to compile, but is not refused)")]:
     result, _ = post({"code": allowed})
