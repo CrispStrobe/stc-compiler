@@ -125,7 +125,7 @@
 
 <script src="https://cdn.jsdelivr.net/pyodide/v314.0.3/full/pyodide.js"></script>
 <script type=module>
-import { flashAvr, flashMicrobit, flashStc } from './flash.js';
+import { flashAvr, flashMicroPython, flashStc } from './flash.js';
 const API = "https://stc-compiler.vercel.app";
 const $ = id => document.getElementById(id);
 let py = null, result = null, image = null;
@@ -190,6 +190,26 @@ const EXAMPLES = {
       wait 200 ms
       set buzz to 0 hz
       change i by 1
+`,
+  "PWM and a tone — Pico": `DEVICE PICO:
+  NAME bench
+  PIN led = GP25 OUTPUT
+  PIN dim = GP15 PWM ACTIVE LOW
+  PIN buzz = GP16 TONE
+  PIN pot = GP26 ANALOG
+
+  WHEN started:
+    FOREVER:
+      toggle led
+      set dim to 60 percent
+      wait pot ms
+
+  WHEN started:
+    FOREVER:
+      set buzz to 440 hz
+      wait 200 ms
+      set buzz to 0 hz
+      wait 800 ms
 `,
   "a 74HC595 — ATmega328P": `DEVICE ATMEGA328P:
   NAME expander
@@ -258,7 +278,7 @@ async function boot() {
     py = await loadPyodide();
     setStatus('loading the transpiler…');
     py.FS.mkdirTree('/app');
-    for (const name of ['stc_pseudocode.py', 'bw_microbit.py']) {
+    for (const name of ['stc_pseudocode.py', 'bw_micropython.py']) {
       const response = await fetch(name + '?v=1');
       if (!response.ok) throw new Error(name + ': HTTP ' + response.status);
       py.FS.writeFile('/app/' + name, await response.text());
@@ -305,7 +325,8 @@ function transpile() {
   const lines = data.code.split('\n').length;
   setStatus(`${data.device} → ${data.filename} · ${lines} lines of ` +
             `${data.language === 'python' ? 'MicroPython' : 'C'}` +
-            (data.compilable ? '' : ' · nothing to compile: ' + data.hint), 'ok');
+            (data.compilable ? '' : ' · nothing to compile: ' + data.hint) +
+            (apiWarning && data.compilable ? ' · note: ' + apiWarning : ''), 'ok');
 }
 
 function render() {
@@ -388,9 +409,12 @@ async function checkApiAge(local) {
     const theirs = new Set(health.devices || []);
     const missing = local.map(d => d.key).filter(k => !theirs.has(k));
     if (missing.length) {
+      // A warning, not a failure: transpiling is unaffected, and for a
+      // micro:bit or a Pico there is nothing to compile anyway. It is
+      // appended to the status line rather than replacing it, so it cannot
+      // make a successful transpile look broken.
       apiWarning = `the hosted compiler is older than this page and does not `
-                 + `know ${missing.join(', ')} — Compile to .hex will refuse those`;
-      setStatus(apiWarning, 'err');
+                 + `know ${missing.join(', ')}`;
     }
   } catch {
     apiWarning = '';       // offline is fine; only compiling needs the API
@@ -411,7 +435,7 @@ function flashable() {
   // genuinely different protocols, and saying so before the user power-cycles
   // a board beats failing afterwards.
   if (result.toolchain === 'sdcc-mcs51') return result.isp === 'stc12' && !!image;
-  if (result.toolchain === 'uflash') return true;
+  if (result.toolchain === 'uflash' || result.toolchain === 'uf2') return true;
   return false;
 }
 
@@ -428,10 +452,11 @@ function refreshFlash() {
     $('flash').title = 'Compile to .hex first, then pull the power and reapply '
                      + 'it when asked — the STC bootloader answers only after a '
                      + 'COLD power-on.';
-  } else if (result && result.toolchain === 'uflash') {
+  } else if (result && (result.toolchain === 'uflash'
+                        || result.toolchain === 'uf2')) {
     $('flash').title = 'Writes main.py over the REPL. The board needs '
-                     + 'MicroPython on it already — flash that once from '
-                     + 'python.microbit.org.';
+                     + 'MicroPython on it already — once from '
+                     + 'python.microbit.org, or a UF2 via BOOTSEL on a Pico.';
   } else if (!image) {
     $('flash').title = 'Compile to .hex first — there is nothing to write yet.';
   } else {
@@ -454,8 +479,8 @@ $('flash').onclick = async () => {
   try {
     setStatus('flashing…');
     let done;
-    if (result.toolchain === 'uflash') {
-      done = await flashMicrobit(port, result.code, { log });
+    if (result.toolchain === 'uflash' || result.toolchain === 'uf2') {
+      done = await flashMicroPython(port, result.code, { log });
       setStatus(`wrote main.py, ${done.bytes} bytes, and restarted`, 'ok');
     } else if (result.toolchain === 'sdcc-mcs51') {
       done = await flashStc(port, new TextDecoder().decode(image.bytes), {

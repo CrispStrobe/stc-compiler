@@ -166,7 +166,7 @@ loads" and "CPython starts in it and emits MicroPython" are different claims.
 | board | how | in the page? |
 |---|---|---|
 | ATmega328P / Uno / Nano | Web Serial → STK500v1 (the Arduino bootloader) | **yes** — *Flash* |
-| micro:bit | Web Serial → MicroPython's raw REPL, writing `main.py` | **yes** — *Flash* |
+| micro:bit, Pico | Web Serial → MicroPython's raw REPL, writing `main.py` | **yes** — *Flash* |
 | STC12C5A60S2 / 5A16S2 | STC ISP over serial, after a cold power-on | **yes** — *Flash* |
 | STC15, STC89 | a *different* ISP protocol | no — `stcgal` |
 
@@ -518,6 +518,7 @@ Two things about the file itself:
 | `arduino-uno`, `arduino-nano` | Arduino core C++ | no — paste into the IDE |
 | `atmega328p`, `atmega168p` | bare AVR C | **yes**, via avr-gcc |
 | `microbit` | MicroPython | nothing to compile — see above |
+| `pico` / `rp2040` | MicroPython | nothing to compile — see above |
 
 ### What works where
 
@@ -533,6 +534,7 @@ the board.
 | ATmega328P / 168P | yes | yes | yes | yes | yes | yes |
 | Arduino Uno / Nano | yes | yes | yes | yes | no² | yes |
 | micro:bit | yes | yes | yes | yes | no³ | yes |
+| Raspberry Pi Pico | yes | yes | yes | yes | no³ | yes |
 
 ¹ no PCA, so there is no PWM pin to declare.
 ² the Arduino core hides ports behind `digitalWrite`; reaching past it would

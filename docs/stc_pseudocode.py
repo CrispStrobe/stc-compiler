@@ -3110,11 +3110,13 @@ EXAMPLE = """DEVICE STC12C5A60S2:
 """
 
 
-# Registered last, and imported here rather than above, because bw_microbit
+# Registered last, and imported here rather than above, because bw_micropython
 # subclasses Target and everything it needs is defined by this point. Keeping
 # it in its own module keeps a 300-line Python back end out of the file that
 # every other target shares.
-from bw_microbit import MicrobitTarget  # noqa: E402
+from bw_micropython import MicrobitTarget, PicoTarget  # noqa: E402
 
 TARGETS["microbit"] = MicrobitTarget()
 TARGETS["micro-bit"] = TARGETS["microbit"]
+TARGETS["pico"] = PicoTarget()
+TARGETS["rp2040"] = TARGETS["pico"]

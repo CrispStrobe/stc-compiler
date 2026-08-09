@@ -12,7 +12,10 @@ def bw_part_sr(value):
     pin7.write_digital(0)
     pin8.write_digital(0)
     for _ in range(8):
-        pin6.write_digital(1 if value & 0x80 else 0)
+        if value & 0x80:
+            pin6.write_digital(1)
+        else:
+            pin6.write_digital(0)
         value = (value << 1) & 0xFF
         pin7.write_digital(1)
         pin7.write_digital(0)

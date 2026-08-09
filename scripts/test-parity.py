@@ -55,6 +55,9 @@ DEVICES = {
     "MICROBIT":     dict(out="P0",   pwm="P1",   tone="P2",   ana="P4",
                          port=None,  part="P6 CLOCK P7 LATCH P8",
                          clock="16000000"),
+    "PICO":         dict(out="GP25", pwm="GP15", tone="GP16", ana="GP26",
+                         port=None,  part="GP6 CLOCK GP7 LATCH GP8",
+                         clock="125000000"),
 }
 
 FEATURES = ["pwm", "tone", "print", "table", "port", "part"]
@@ -94,8 +97,8 @@ def program(device, feature):
 
 # Something that must appear in the output when the feature really works.
 EVIDENCE = {
-    "pwm":   ["pwm_set", "OCR", "analogWrite", "write_analog"],
-    "tone":  ["tone_set", "bw_tone", "music.pitch"],
+    "pwm":   ["pwm_set", "OCR", "analogWrite", "write_analog", "duty_u16"],
+    "tone":  ["tone_set", "bw_tone", "music.pitch", ".freq("],
     "print": ["bw_print", "Serial.println", "print("],
     "table": ["bw_tab_", "f = (", "bw_clamp"],
     "port":  ["P2 =", "PORT", "bw_port"],
@@ -162,7 +165,8 @@ for device in DEVICES:
         sp.emit(program)
         check(f"{device} works with no CLOCK line", True)
         check(f"{device} default clock is plausible for the board",
-              program.clock in (11059200, 16000000), str(program.clock))
+              program.clock in (11059200, 16000000, 125000000),
+              str(program.clock))
     except sp.PseudocodeError as exc:
         check(f"{device} works with no CLOCK line", False, str(exc)[:78])
 

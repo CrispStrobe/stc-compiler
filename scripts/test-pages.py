@@ -16,7 +16,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs"
-MIRRORED = ["stc_pseudocode.py", "bw_microbit.py"]
+MIRRORED = ["stc_pseudocode.py", "bw_micropython.py"]
 
 passed = failed = 0
 
@@ -56,7 +56,7 @@ if index.exists():
           "/compile" in page and "stc-compiler.vercel.app" in page)
     check("the flasher is wired in", "flash.js" in page and "id=flash" in page)
     check("all three flash paths reach the button",
-          all(t in page for t in ("flashAvr", "flashMicrobit", "flashStc")))
+          all(t in page for t in ("flashAvr", "flashMicroPython", "flashStc")))
     check("the STC cold power-on is told to the user, not assumed",
           "COLD power-on" in page)
     check("Web Serial absence is explained rather than left as a dead button",

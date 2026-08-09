@@ -345,6 +345,43 @@ WHEN started:
     turn on led
 """,
 
+    # The Pico: the same MicroPython lowering, a different vocabulary.
+    # machine.Pin objects, a 16-bit ADC scaled to the 0-1023 every other
+    # target reports, and ticks_diff because ticks_ms() wraps.
+    "pico": """DEVICE PICO:
+  NAME bench
+  CLOCK 125000000
+  TABLE font = 0x3F, 0x06, 0x5B
+  PIN led = GP25 OUTPUT
+  PIN dim = GP15 PWM ACTIVE LOW
+  PIN buzz = GP16 TONE
+  PIN pot = GP26 ANALOG
+  PIN btn = GP14 INPUT ACTIVE LOW
+  WHEN started:
+    print "ready"
+    set i to 0
+    FOREVER:
+      toggle led
+      set dim to font[i] percent
+      wait pot ms
+      change i by 1
+  WHEN btn pressed:
+    set buzz to 880 hz
+    wait 100 ms
+    set buzz to 0 hz
+""",
+
+    "pico-once": """DEVICE PICO:
+  CLOCK 125000000
+  PIN led = GP25 OUTPUT
+  WHEN started:
+    REPEAT 3:
+      set led high
+      wait 100 ms
+      set led low
+      wait 100 ms
+""",
+
     "microbit-once": """DEVICE MICROBIT:
   CLOCK 16000000
   PIN led = P0 OUTPUT

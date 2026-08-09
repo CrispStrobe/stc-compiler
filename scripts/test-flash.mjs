@@ -13,7 +13,7 @@
 //
 //   node scripts/test-flash.mjs
 //
-import { parseIntelHex, Stk500, flashAvr, flashMicrobit, flashStc, stcPacket,
+import { parseIntelHex, Stk500, flashAvr, flashMicroPython, flashStc, stcPacket,
          stcBaud, stcStatus, pythonBytes, STK } from '../docs/flash.js';
 
 let passed = 0, failed = 0;
@@ -347,7 +347,7 @@ const SOURCE = 'from microbit import *\n\n' +
   Array.from({ length: 12 }, (_, i) => `display.show(${i})`).join('\n') + '\n';
 
 const mp = new FakeMicroPython();
-const written = await flashMicrobit(microbitPort(mp), SOURCE, { log: () => {} });
+const written = await flashMicroPython(microbitPort(mp), SOURCE, { log: () => {} });
 const landed = new TextDecoder().decode(Uint8Array.from(mp.files['main.py'] || []));
 ok('main.py lands byte for byte', landed === SOURCE,
    landed === SOURCE ? `${written.bytes} bytes in ${mp.chunks} chunks`
@@ -358,7 +358,7 @@ ok('the board was restarted afterwards', mp.resets === 1, `${mp.resets} reset(s)
 // size back rather than trusting the writes.
 const lossy = new FakeMicroPython({ dropChunk: 2 });
 let replError = null;
-try { await flashMicrobit(microbitPort(lossy), SOURCE, { log: () => {} }); }
+try { await flashMicroPython(microbitPort(lossy), SOURCE, { log: () => {} }); }
 catch (e) { replError = e; }
 ok('a dropped chunk is caught by the size read-back',
    replError && /but the board has/.test(replError.message),

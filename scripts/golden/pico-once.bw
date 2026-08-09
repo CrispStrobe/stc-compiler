@@ -1,0 +1,11 @@
+DEVICE PICO:
+  CLOCK 125000000
+
+  PIN led = GP25 OUTPUT
+
+  WHEN started:
+    REPEAT 3:
+      set led high
+      wait 100 ms
+      set led low
+      wait 100 ms

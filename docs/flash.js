@@ -236,17 +236,23 @@ export async function flashAvr(port, hexText, {
 }
 
 
-// ---------------------------------------------------------------- micro:bit
+// ------------------------------------------------- micro:bit and Pico
 //
-// A micro:bit has no serial bootloader to talk STK500 to. What it has, once
-// MicroPython is on it, is a REPL over the DAPLink CDC port -- and MicroPython's
-// "raw REPL" is a perfectly good file-transfer channel. That is what microfs
-// and the official editors use, and it is far less machinery than splicing a
-// script into a 1.8 MB runtime hex and asking the user to drag it to a drive.
+// Neither has a serial bootloader to talk STK500 to. What both have, once
+// MicroPython is on them, is a REPL over USB CDC -- and MicroPython's "raw
+// REPL" is a perfectly good file-transfer channel. That is what microfs and
+// the official editors use, and it is far less machinery than splicing a
+// script into a runtime image and asking the user to drag it to a drive.
+//
+// One function serves both, because at this level they are the same device:
+// interrupt, enter raw mode, write main.py, read the size back, restart. The
+// differences between them are all in what the PROGRAM says, which is the
+// code generator's problem and not this one's.
 //
 // The trade is explicit: this writes main.py to a board that ALREADY has
-// MicroPython. It does not install MicroPython. Flash that once from
-// python.microbit.org and this works from then on.
+// MicroPython. It does not install it. For a micro:bit that is a one-off from
+// python.microbit.org; for a Pico it is holding BOOTSEL and dropping a UF2 on
+// the drive that appears.
 
 const CTRL_A = 0x01, CTRL_B = 0x02, CTRL_C = 0x03, CTRL_D = 0x04;
 
@@ -322,7 +328,7 @@ export class RawRepl {
  * Write `source` to main.py on an attached micro:bit and restart it.
  * `chunk` stays small because each write becomes one REPL line.
  */
-export async function flashMicrobit(port, source, {
+export async function flashMicroPython(port, source, {
   baud = 115200, chunk = 96, log = () => {}, name = 'main.py',
 } = {}) {
   const bytes = new TextEncoder().encode(source);
@@ -564,3 +570,6 @@ export async function flashStc(port, hexText, {
     try { await port.close(); } catch {}
   }
 }
+
+/** The micro:bit's name for it, kept so existing callers still work. */
+export const flashMicrobit = flashMicroPython;

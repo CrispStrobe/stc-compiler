@@ -335,5 +335,147 @@ for decl, why in [
     except sp.PseudocodeError as exc:
         check(why, True, f"-> {exc}")
 
+# --- the Pico: same lowering, a different runtime ------------------------
+print()
+
+def make_machine(budget=40000):
+    """A stub `machine` + `time`, and the log of what the program did."""
+    log = []
+    state = {"clock": 0, "reads": 0}
+
+    class Budgeted(Exception):
+        pass
+
+    def ticks_ms():
+        state["reads"] += 1
+        if state["reads"] > budget:
+            raise Budget
+        state["clock"] += 1
+        return state["clock"]
+
+    class Pin:
+        OUT, IN, PULL_UP, PULL_DOWN = 1, 0, 2, 3
+
+        def __init__(self, number, mode=None, pull=None):
+            self.number = number
+            self.level = 0
+            log.append(("pin", number, mode))
+
+        def value(self, level=None):
+            if level is None:
+                return self.level
+            self.level = int(level)
+            log.append(("write", self.number, self.level, state["clock"]))
+            return None
+
+    class ADC:
+        def __init__(self, number):
+            self.number = number
+            log.append(("adc", number))
+
+        def read_u16(self):
+            return 32768                       # mid-scale; 512 after scaling
+
+    class PWM:
+        def __init__(self, pin):
+            self.number = pin.number
+            log.append(("pwm", pin.number))
+
+        def freq(self, hz):
+            log.append(("freq", self.number, hz))
+
+        def duty_u16(self, duty):
+            log.append(("duty", self.number, duty))
+
+    machine = types.ModuleType("machine")
+    machine.Pin, machine.ADC, machine.PWM = Pin, ADC, PWM
+    timemod = types.ModuleType("time")
+    timemod.ticks_ms = ticks_ms
+    timemod.ticks_add = lambda a, b: a + b
+    timemod.ticks_diff = lambda a, b: a - b
+    timemod.sleep_ms = lambda ms: state.__setitem__("clock", state["clock"] + int(ms))
+    sys.modules["machine"] = machine
+    sys.modules["time"] = timemod
+    return log, state
+
+
+def run_pico(source, **kw):
+    log, state = make_machine(**kw)
+    real_time = sys.modules.get("time")
+    try:
+        exec(compile(source, "<generated>", "exec"), {"__name__": "__main__"})
+    except Budget:
+        pass
+    finally:
+        sys.modules.pop("machine", None)
+        import importlib
+        sys.modules["time"] = importlib.import_module("time") if real_time is None else real_time
+    return log, state
+
+
+# Two scripts, so the cooperative path runs: a single script would lower its
+# waits to time.sleep_ms and never reach the deadline arithmetic that has to
+# survive ticks_ms wrapping.
+PICO = """DEVICE PICO:
+  PIN led = GP25 OUTPUT
+  PIN dim = GP15 PWM ACTIVE LOW
+  PIN buzz = GP16 TONE
+  PIN pot = GP26 ANALOG
+  WHEN started:
+    FOREVER:
+      toggle led
+      set dim to 60 percent
+      wait pot ms
+  WHEN started:
+    FOREVER:
+      set buzz to 440 hz
+      wait 50 ms
+"""
+
+PICO_ONE_SCRIPT = """DEVICE PICO:
+  PIN led = GP25 OUTPUT
+  WHEN started:
+    REPEAT 2:
+      toggle led
+      wait 10 ms
+"""
+code = sp.emit(sp.parse(PICO))
+try:
+    compile(code, "<generated>", "exec")
+    check("pico: parses as Python", True)
+except SyntaxError as exc:
+    check("pico: parses as Python", False, str(exc))
+
+check("pico: constructs its pin objects before use",
+      "_pin25 = Pin(25, Pin.OUT)" in code and "_adc26 = ADC(26)" in code)
+check("pico: the 16-bit ADC is scaled to the 0-1023 every other target reports",
+      "read_u16() >> 6" in code)
+check("pico: uses ticks_diff, because ticks_ms wraps",
+      "time.ticks_diff" in code and "time.ticks_add" in code)
+check("pico: a single script still lowers a wait to sleep_ms",
+      "time.sleep_ms" in sp.emit(sp.parse(PICO_ONE_SCRIPT)))
+check("pico: no _level dict -- value() reads the output latch back",
+      "_level" not in code)
+
+log, _ = run_pico(code)
+writes = [e for e in log if e[0] == "write" and e[1] == 25]
+duties = [e for e in log if e[0] == "duty" and e[1] == 15]
+# Filtered by pin: the PWM pin also gets a freq() call, for its carrier.
+freqs = [e for e in log if e[0] == "freq" and e[1] == 16]
+check("pico: the LED toggles", len(writes) > 4, f"{len(writes)} writes")
+check("pico: toggling alternates",
+      all(a[2] != b[2] for a, b in zip(writes, writes[1:])),
+      str([w[2] for w in writes[:6]]))
+# 60% duty on an ACTIVE LOW load: the pin is high 40% of the time.
+check("pico: PWM duty inverts for an active-low load",
+      duties and duties[0][2] == (100 - 60) * 65535 // 100,
+      str(duties[:1]))
+check("pico: the PWM carrier is set once, separately from any tone",
+      any(e[0] == "freq" and e[1] == 15 and e[2] == 1000 for e in log))
+check("pico: a tone sets its own frequency and half duty",
+      freqs and freqs[0][2] == 440
+      and any(e[0] == "duty" and e[1] == 16 and e[2] == 32768 for e in log),
+      str(freqs[:1]))
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
