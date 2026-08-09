@@ -37,6 +37,24 @@ jobs:
       - name: Build the vendored bundle
         run: ./scripts/fetch-avr-gcc.sh
 
+      # Where the toolchain ACTUALLY looks, printed before anything asserts.
+      # Debian bakes absolute paths into gcc and relocates them relative to
+      # argv[0]; guessing which ones survive a move has cost two CI rounds
+      # already, so it is recorded here rather than reasoned about.
+      - name: Where the driver looks
+        continue-on-error: true
+        run: |
+          AVR="$PWD/avr"
+          echo "--- tree ---"
+          find avr -maxdepth 3 -type d | sort | head -30
+          echo "--- symlinks ---"
+          find avr -maxdepth 2 -type l -exec ls -l {} \; || true
+          echo "--- -print-search-dirs ---"
+          "$AVR/bin/avr-gcc" -print-search-dirs || true
+          echo "--- include search path ---"
+          echo | "$AVR/bin/avr-gcc" -mmcu=atmega328p -E -v -x c - 2>&1 \
+            | sed -n '/search starts here/,/End of search/p' || true
+
       - name: Verify it runs, compiles and links
         run: ./scripts/verify-avr.sh
 

@@ -157,14 +157,27 @@ done
 # The headers are ~19 MB because there is one per part. Kept whole: avr/io.h
 # dispatches to them by device macro, and a trimmed set turns an unsupported
 # part into a confusing #include error rather than a clear one.
-mkdir -p "$ROOT/avr/avr/lib"
-cp -R "$WORK/x/usr/lib/avr/include" "$ROOT/avr/avr/include"
+#
+# They go in TWICE, by symlink, because there are two places this gcc might
+# look and which one wins is a property of how Debian configured it:
+#
+#   avr/lib/avr/...   Debian's own path (/usr/lib/avr) after GCC relocates it
+#                     relative to the prefix it finds itself at
+#   avr/avr/...       the standard cross-compiler tooldir
+#
+# The symlink costs nothing and removes an entire class of "works on Debian,
+# fails once the tree moves" from the equation.
+mkdir -p "$ROOT/avr/lib/avr/lib"
+cp -R "$WORK/x/usr/lib/avr/include" "$ROOT/avr/lib/avr/include"
 for m in $MULTILIBS; do
   test -d "$WORK/x/usr/lib/avr/lib/$m" \
-    && cp -R "$WORK/x/usr/lib/avr/lib/$m" "$ROOT/avr/avr/lib/$m"
+    && cp -R "$WORK/x/usr/lib/avr/lib/$m" "$ROOT/avr/lib/avr/lib/$m"
 done
 find "$WORK/x/usr/lib/avr/lib" -maxdepth 1 -type f \
-     -exec cp {} "$ROOT/avr/avr/lib/" \;
+     -exec cp {} "$ROOT/avr/lib/avr/lib/" \;
+
+ln -sfn ../lib/avr/include "$ROOT/avr/avr/include"
+ln -sfn ../lib/avr/lib "$ROOT/avr/avr/lib"
 
 # GPL section 1: the licences travel with the binaries. avr-gcc is GPL-3.0
 # (with the GCC Runtime Library Exception, which is what leaves compiled
