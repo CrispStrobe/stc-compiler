@@ -382,11 +382,15 @@ const STC_START = [0x46, 0xb9], STC_HOST = 0x6a, STC_MCU = 0x68, STC_END = 0x16;
 // model has to be recognised from the magic the bootloader announces. Only
 // the parts this project targets are listed; an unknown one falls back to the
 // image size, which erases enough to program it and no more.
+// `isp` is which protocol the part's bootloader speaks. Only "stc12" is
+// implemented here; the STC15 and STC89 families are different protocols, not
+// dialects, so they are listed in order to be REFUSED by name rather than
+// spoken to in a language they do not understand.
 export const STC_MODELS = {
-  0xd17e: { name: 'STC12C5A60S2', code: 61440 },
-  0xd168: { name: 'STC12C5A16S2', code: 16384 },
-  0xf408: { name: 'STC15F2K60S2', code: 61440 },
-  0xf002: { name: 'STC89C52RC', code: 8192 },
+  0xd17e: { name: 'STC12C5A60S2', code: 61440, isp: 'stc12' },
+  0xd168: { name: 'STC12C5A16S2', code: 16384, isp: 'stc12' },
+  0xf408: { name: 'STC15F2K60S2', code: 61440, isp: 'stc15' },
+  0xf002: { name: 'STC89C52RC', code: 8192, isp: 'stc89' },
 };
 
 export function stcPacket(data) {
@@ -519,6 +523,11 @@ export async function flashStc(port, hexText, {
     }
 
     const model = STC_MODELS[info.magic];
+    if (model && model.isp !== 'stc12') {
+      throw new Error(
+        `this is a ${model.name}, whose bootloader speaks the ${model.isp} ISP ` +
+        `protocol; only stc12 is implemented here. Use stcgal for this part.`);
+    }
     const codeSize = model ? model.code : image.length;
     if (model) log(`part: ${model.name}, ${codeSize} bytes of flash`);
     else log(`unknown magic ${info.magic.toString(16)}; erasing only what is written`);

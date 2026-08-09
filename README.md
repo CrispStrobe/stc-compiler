@@ -167,7 +167,8 @@ loads" and "CPython starts in it and emits MicroPython" are different claims.
 |---|---|---|
 | ATmega328P / Uno / Nano | Web Serial → STK500v1 (the Arduino bootloader) | **yes** — *Flash* |
 | micro:bit | Web Serial → MicroPython's raw REPL, writing `main.py` | **yes** — *Flash* |
-| STC12 / STC15 | STC ISP over serial, after a cold power-on | **yes** — *Flash* |
+| STC12C5A60S2 / 5A16S2 | STC ISP over serial, after a cold power-on | **yes** — *Flash* |
+| STC15, STC89 | a *different* ISP protocol | no — `stcgal` |
 
 A micro:bit has no serial bootloader, but once MicroPython is on it the raw
 REPL is a perfectly good file channel — which is what `microfs` and the
@@ -196,6 +197,14 @@ have agreed with an implementation written from the same reading. It caught
 two things reading had not — stcgal pads the image to a 512-byte boundary
 before erasing, and the erase command carries the *part's* flash size (from a
 magic-number table) rather than the image's.
+
+Only the **stc12** ISP is implemented. The STC15 and STC89 families are
+different protocols rather than dialects of it — stcgal classifies parts by
+model name and hands them to separate handlers, and the STC15's handshake does
+frequency calibration the STC12's has no notion of. Both the page and the
+flasher refuse them by name: the page from the `DEVICE` line, before you have
+power-cycled anything, and the flasher again from the magic the bootloader
+announces.
 
 Option bytes are deliberately **not** programmed, though stcgal rewrites them
 on every run: an option byte is how you disable the ISP pin and lock yourself

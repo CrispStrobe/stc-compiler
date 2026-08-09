@@ -453,5 +453,14 @@ ok('every packet is byte-identical to the reference implementation\'s',
    differs === -1 ? `${mine.length} packets`
      : `packet ${differs}:\n        stcgal ${theirs[differs]}\n        ours   ${mine[differs]}`);
 
+// An STC15 must be refused, not spoken to in STC12.
+const wrongPart = stcDevice(SESSION.clock_hz, 0xf408, SESSION.handshake_baud);
+let ispError = null;
+try { await flashStc(stcPort(wrongPart), stcHex, { log: () => {}, sink: true }); }
+catch (e) { ispError = e; }
+ok('an STC15 is refused by name rather than spoken to in STC12',
+   ispError && /stc15 ISP protocol/.test(ispError.message),
+   ispError ? ispError.message.slice(0, 62) : 'it proceeded!');
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

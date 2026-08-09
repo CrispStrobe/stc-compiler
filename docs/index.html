@@ -239,6 +239,7 @@ def bw_transpile(source):
             "language": sp.source_language(program),
             "device": target.display,
             "toolchain": target.toolchain,
+            "isp": target.isp_protocol,
             "compilable": target.toolchain in ("sdcc-mcs51", "avr-gcc"),
             "hint": target.compile_hint,
             "filename": (program.name or "main") + "." + target.source_extension,
@@ -406,7 +407,10 @@ function flashable() {
   // An AVR needs the compiled image; a micro:bit does not need a compiler at
   // all -- MicroPython's REPL takes the source straight.
   if (result.toolchain === 'avr-gcc') return !!image;
-  if (result.toolchain === 'sdcc-mcs51') return !!image;
+  // Only the STC12 family's ISP is implemented. The STC15 and STC89 speak
+  // genuinely different protocols, and saying so before the user power-cycles
+  // a board beats failing afterwards.
+  if (result.toolchain === 'sdcc-mcs51') return result.isp === 'stc12' && !!image;
   if (result.toolchain === 'uflash') return true;
   return false;
 }
@@ -416,6 +420,10 @@ function refreshFlash() {
   if (!CAN_SERIAL) {
     $('flash').title = 'Web Serial is not available in this browser; '
                      + 'Chrome or Edge can do this.';
+  } else if (result && result.isp && result.isp !== 'stc12') {
+    $('flash').title = `${result.device} speaks the ${result.isp} ISP protocol, `
+                     + 'which this page does not implement — only stc12. '
+                     + 'Use stcgal for this part.';
   } else if (result && result.toolchain === 'sdcc-mcs51' && !image) {
     $('flash').title = 'Compile to .hex first, then pull the power and reapply '
                      + 'it when asked — the STC bootloader answers only after a '

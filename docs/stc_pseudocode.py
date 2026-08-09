@@ -447,6 +447,13 @@ class Target:
     # complaint about millisecond division that never named the real problem.
     default_clock = 11059200
 
+    # Which ISP protocol the part's bootloader speaks, where that is a
+    # question at all. The browser flasher implements "stc12" only, and the
+    # STC15 and STC89 families are genuinely different protocols rather than
+    # dialects of it -- so naming this lets the page refuse up front instead
+    # of failing after the user has already power-cycled the board.
+    isp_protocol = None
+
     # Extension for the generated source when it is handed back as a file.
     # Not always "c": Arduino core source wants .ino so the IDE opens it as a
     # sketch, and a micro:bit target emits Python.
@@ -597,6 +604,15 @@ class Stc8051Target(Target):
         # are mutually exclusive, and saying so is better than a silent
         # fight over TMOD.
         self.baud_from_brt = port_modes
+        # The same classification stcgal uses, which is by model NAME rather
+        # than by magic: STC12C5A60S2 and STC12C5A16S2 speak "stc12", the
+        # STC15 and STC89 families do not.
+        if re.match(r"stc(89|90)(c|le)\d", key):
+            self.isp_protocol = "stc89"
+        elif re.match(r"(stc|iap|irc)15\D", key):
+            self.isp_protocol = "stc15"
+        elif re.match(r"(stc|iap)(10|11|12)\D", key):
+            self.isp_protocol = "stc12"
 
     # ---- pins -----------------------------------------------------------
     def resolve_port(self, program, name, where, direction, active_low, line):

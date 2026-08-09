@@ -817,6 +817,7 @@ async def transpile_only(req: CompileReq):
         # field keeps its name so existing callers keep working, and this says
         # what is actually in it.
         "language": stc_pseudocode.source_language(program),
+        "isp": program.target.isp_protocol,
         "filename": f"{program.name or 'main'}.{program.target.source_extension}",
         "part": program.part,
         "clock": program.clock,
