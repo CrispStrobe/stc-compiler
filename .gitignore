@@ -6,7 +6,8 @@ __pycache__/
 # Agent context: local paths and operational detail, not for the public repo.
 CLAUDE.md
 
-# The vendored AVR toolchain, 45 MB, built by ./scripts/fetch-avr-gcc.sh.
+# The vendored AVR toolchain, 33 MB, built by ./scripts/fetch-avr-gcc.sh and
+# verified green by the avr-bundle job in CI.
 #
 # Ignored rather than committed ON PURPOSE, and this is a decision to revisit
 # rather than a permanent state: Vercel deploys from git and vercel.json's
@@ -14,8 +15,11 @@ CLAUDE.md
 # parts will NOT work in production until this is committed. SDCC's 8 MB
 # bin/ + share/ are committed for exactly that reason.
 #
-# 45 MB is 5.6x that, it lands in git history permanently, and roughly 19 MB
-# of it is avr-libc headers for ~300 parts we do not support. Trimming those
-# to the avr5 family would bring it near 26 MB. Worth choosing deliberately
-# before it becomes irreversible.
+# 33 MB is 4x that and it lands in git history permanently, which is why it is
+# a choice rather than a side effect. Already trimmed: no cc1plus, no lto1,
+# one multilib, and 2 of avr-libc's 267 device headers. The remainder is cc1
+# (12 MB) and the binutils, and neither compresses away.
+#
+# CI uploads the verified bundle as an artifact, so it can be inspected or
+# fetched without committing anything.
 avr/

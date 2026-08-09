@@ -387,7 +387,7 @@ that cannot produce an exact millisecond rather than silently drifting.
 Building the toolchain bundle:
 
 ```bash
-./scripts/fetch-avr-gcc.sh    # ~45 MB: avr-gcc, binutils, avr-libc (avr5 only)
+./scripts/fetch-avr-gcc.sh    # ~33 MB: avr-gcc, binutils, avr-libc (avr5 only)
 ./scripts/verify-avr.sh       # MUST run on Linux — see below
 ```
 
@@ -397,12 +397,20 @@ trick and the same reason as `fetch-sdcc.sh`: bullseye's `cc1` needs only
 Amazon Linux 2023 (2.34). `cc1plus` and the other 41 multilibs are dropped;
 nothing here emits C++.
 
-The bundle is Linux x86_64, so **building it on macOS does not verify it**.
-`verify-avr.sh` compiles, links and objcopies a real program using only the
-vendored binaries, and must be run where they can execute:
+The bundle is Linux x86_64, so **building it on macOS does not verify it** —
+and that gap is not theoretical. Four separate failures got through a
+successful-looking build before CI caught them: the host `as` being handed
+`-mmcu=avr5`, a missing `avr/io.h`, an absent LTO linker plugin, and `ld`'s
+linker scripts. Each one produced a 45 MB bundle that looked complete.
+
+So verification runs in CI (`.github/workflows/ci.yml`), on Linux, on every
+push: `verify-avr.sh` compiles, links and objcopies using only the vendored
+binaries, and both goldens are then built for **every** part in `AVR_TARGETS`
+under `-Werror`. The job also asserts the GLIBC floor and uploads the verified
+bundle as an artifact. To run the check by hand on any Linux box:
 
 ```bash
-docker run --rm -v "$PWD:/w" -w /w debian:bullseye-slim ./scripts/verify-avr.sh
+./scripts/fetch-avr-gcc.sh && ./scripts/verify-avr.sh
 ```
 
 The Arduino core is deliberately **not** vendored: it is LGPL-2.1, and static
