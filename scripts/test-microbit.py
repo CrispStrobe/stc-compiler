@@ -477,5 +477,50 @@ check("pico: a tone sets its own frequency and half duty",
       and any(e[0] == "duty" and e[1] == 16 and e[2] == 32768 for e in log),
       str(freqs[:1]))
 
+# --- a 74HC595 on a Pico, reconstructed from the wire --------------------
+print()
+PICO_PART = """DEVICE PICO:
+  PART sr = 74HC595 DATA GP6 CLOCK GP7 LATCH GP8
+  WHEN started:
+    set sr to 0xA5
+"""
+code = sp.emit(sp.parse(PICO_PART))
+try:
+    compile(code, "<generated>", "exec")
+    check("pico part: parses as Python", True)
+except SyntaxError as exc:
+    check("pico part: parses as Python", False, str(exc))
+log, _ = run_pico(code)
+
+# Replay the wire the way the 74HC595 does: sample DATA on each rising edge
+# of CLOCK, then LATCH transfers. If the emitter shifted LSB-first, or pulsed
+# the clock before setting the data, this comes out wrong.
+data = clock = latch = 0
+shifted, latched = [], None
+for entry in log:
+    if entry[0] != "write":
+        continue
+    _, pin, level, _t = entry
+    if pin == 6:
+        data = level
+    elif pin == 7:
+        if level == 1 and clock == 0:
+            shifted.append(data)          # rising edge samples DATA
+        clock = level
+    elif pin == 8:
+        if level == 1 and latch == 0:
+            latched = list(shifted)
+        latch = level
+
+byte = 0
+for bit in (latched or []):
+    byte = ((byte << 1) | bit) & 0xFF
+check("pico part: eight bits are clocked out", len(latched or []) == 8,
+      f"{len(latched or [])} bits")
+check("pico part: the byte arrives MSB first and intact", byte == 0xA5,
+      f"0x{byte:02X} (wanted 0xA5)")
+check("pico part: the latch pulses after the shifting, not during",
+      latched is not None and len(latched) == 8)
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
