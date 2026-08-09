@@ -42,6 +42,24 @@ GCC_AVR="gcc-avr_5.4.0+Atmel3.6.2-1+b1_amd64.deb"
 BINUTILS_AVR="binutils-avr_2.26.20160125+Atmel3.6.2-2+b1_amd64.deb"
 AVR_LIBC="avr-libc_2.0.0+Atmel3.6.2-1.1_all.deb"
 
+# cc1 and the binutils are dynamically linked against GCC's multiprecision
+# libraries and zlib, and NONE of them exist on Vercel's Amazon Linux 2023.
+# They do exist on every developer machine and on GitHub's Ubuntu runners,
+# which is exactly why this was invisible until production: /health passed,
+# because the DRIVER needs none of them, and then cc1 died with
+#
+#   cc1: error while loading shared libraries: libmpc.so.3
+#
+# So they travel with the bundle, and app.py points LD_LIBRARY_PATH at them.
+# scripts/elf-needed.py --check avr is the static audit that catches the next
+# one of these without waiting for a deploy.
+RUNTIME_LIBS="
+  g/gmp/libgmp10_6.2.1+dfsg-1+deb11u1_amd64.deb
+  m/mpclib3/libmpc3_1.2.0-1_amd64.deb
+  m/mpfr4/libmpfr6_4.1.0-3_amd64.deb
+  z/zlib/zlib1g_1.2.11.dfsg-2+deb11u2_amd64.deb
+"
+
 # The ATmega328P and ATmega168P are both avr5. If a part outside that family
 # is ever added to AVR_TARGETS in app.py, its multilib has to be added here
 # too, or the link fails with a missing libgcc.
@@ -67,6 +85,11 @@ for pkg in "$GCC_AVR" "$BINUTILS_AVR" "$AVR_LIBC"; do
   esac
   say "  $pkg"
   curl -fsSL --max-time 600 -o "$WORK/$pkg" "$POOL/$dir/$pkg"
+done
+
+for path in $RUNTIME_LIBS; do
+  say "  $(basename "$path")"
+  curl -fsSL --max-time 600 -o "$WORK/$(basename "$path")" "$POOL/$path"
 done
 
 say "Unpacking ..."
@@ -235,6 +258,17 @@ cp -R "$WORK/x/usr/lib/avr/lib/ldscripts" "$ROOT/avr/lib/avr/lib/ldscripts"
 # which way the compiler was configured.
 ln -sfn lib/avr "$ROOT/avr/avr"
 
+# The shared libraries cc1 and the binutils need, which Amazon Linux 2023 does
+# not ship. Copied with -a so the SONAME symlinks (libgmp.so.10 ->
+# libgmp.so.10.4.1) survive: the loader looks up the SONAME, not the real file.
+mkdir -p "$ROOT/avr/lib-deps"
+for so in "$WORK"/x/usr/lib/x86_64-linux-gnu/lib*.so.*; do
+  test -e "$so" && cp -a "$so" "$ROOT/avr/lib-deps/"
+done
+for so in "$WORK"/x/lib/x86_64-linux-gnu/lib*.so.*; do
+  test -e "$so" && cp -a "$so" "$ROOT/avr/lib-deps/"
+done
+
 # GPL section 1: the licences travel with the binaries. avr-gcc is GPL-3.0
 # (with the GCC Runtime Library Exception, which is what leaves compiled
 # output unencumbered); avr-libc is BSD-3-Clause.
@@ -268,6 +302,11 @@ echo "tooldir as:      $(test -x "$ROOT/avr/lib/avr/bin/as" && echo yes || echo 
 echo "io.h present:    $(test -f "$ROOT/avr/lib/avr/include/avr/io.h" && echo yes || echo NO)"
 echo "avr5 crt:        $(ls "$ROOT/avr/lib/avr/lib/avr5"/crtatmega328p.o >/dev/null 2>&1 \
                           && echo yes || echo NO)"
+echo "runtime libs:    $(ls "$ROOT/avr/lib-deps" 2>/dev/null | tr '\n' ' ')"
+echo
+echo "Dependency audit (must be clean, or it dies on Vercel and not before):"
+"$ROOT/scripts/elf-needed.py" --check "$ROOT/avr" | sed 's/^/    /'
+echo
 echo
 echo "GLIBC requirement (must be <= 2.34 to start on Vercel):"
 strings "$DST/cc1" 2>/dev/null | grep -oE 'GLIBC_2\.[0-9]+' | sort -V | tail -1 \

@@ -55,6 +55,14 @@ jobs:
           echo | "$AVR/bin/avr-gcc" -mmcu=atmega328p -E -v -x c - 2>&1 \
             | sed -n '/search starts here/,/End of search/p' || true
 
+      # The check CI cannot make by running things: the runner HAS libmpc,
+      # libmpfr, libgmp and libz installed, so a bundle that forgot to vendor
+      # them compiles perfectly here and dies on Vercel with "error while
+      # loading shared libraries". That happened. This is static, so it does
+      # not care what the runner has installed.
+      - name: Every non-glibc dependency travels with the bundle
+        run: python3 ./scripts/elf-needed.py --check avr
+
       - name: Verify it runs, compiles and links
         run: ./scripts/verify-avr.sh
 

@@ -211,6 +211,16 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
                          "vendored in this deployment and no avr-gcc is on PATH",
                 "c": generated_c}
 
+    # cc1 links against libmpc/libmpfr/libgmp and the binutils against libz,
+    # none of which exist on Vercel's Amazon Linux 2023. They are vendored in
+    # lib-deps/; without this the driver starts and cc1 dies with
+    # "error while loading shared libraries". Harmless where the system
+    # already provides them -- ours simply win.
+    deps = os.path.join(os.path.dirname(bin_dir), "lib-deps")
+    env = dict(os.environ)
+    if os.path.isdir(deps):
+        env["LD_LIBRARY_PATH"] = deps + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+
     work = os.path.join(tempfile.gettempdir(), f"build-{uuid.uuid4().hex}")
     os.makedirs(work, exist_ok=True)
     src = os.path.join(work, "main.c")
@@ -250,7 +260,7 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=COMPILE_TIMEOUT, cwd=work)
+                                timeout=COMPILE_TIMEOUT, cwd=work, env=env)
     except subprocess.TimeoutExpired:
         shutil.rmtree(work, ignore_errors=True)
         return {"success": False, "error": f"compile timed out after {COMPILE_TIMEOUT}s"}
@@ -270,7 +280,7 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
             # directly, so there is no packihx step to distinguish them.
             out, name, args = os.path.join(work, "main.hex"), "main.hex", ["-O", "ihex"]
         subprocess.run([objcopy, *args, "-R", ".eeprom", elf, out],
-                       capture_output=True, timeout=10)
+                       capture_output=True, timeout=10, env=env)
         if not os.path.exists(out):
             return {"success": False, "error": "avr-objcopy produced no image",
                     "log": log, "c": generated_c}
@@ -284,7 +294,7 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
             sized = subprocess.run(
                 [os.path.join(bin_dir, "avr-size"), f"--mcu={spec['mcu']}",
                  "--format=avr", elf],
-                capture_output=True, text=True, timeout=10)
+                capture_output=True, text=True, timeout=10, env=env)
             mem = sized.stdout or ""
         except (OSError, subprocess.SubprocessError):
             mem = ""
@@ -294,7 +304,7 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
             try:
                 dumped = subprocess.run(
                     [os.path.join(bin_dir, "avr-objdump"), "-d", "-S", elf],
-                    capture_output=True, text=True, timeout=15)
+                    capture_output=True, text=True, timeout=15, env=env)
                 listing = dumped.stdout or f"(objdump failed: {dumped.stderr})"
             except (OSError, subprocess.SubprocessError) as exc:
                 listing = f"(disassembly failed: {exc})"
@@ -987,9 +997,33 @@ async def health():
     avr_version = ""
     if avr_bin:
         try:
-            avr_version = subprocess.run(
-                [os.path.join(avr_bin, "avr-gcc"), "--version"],
-                capture_output=True, text=True, timeout=10).stdout
+            deps = os.path.join(os.path.dirname(avr_bin), "lib-deps")
+            health_env = dict(os.environ)
+            if os.path.isdir(deps):
+                health_env["LD_LIBRARY_PATH"] = (
+                    deps + os.pathsep + health_env.get("LD_LIBRARY_PATH", ""))
+            # -print-prog-name=cc1 resolves it; running --version on the DRIVER
+            # would pass even when cc1 cannot load its libraries, which is the
+            # exact way this looked healthy while being broken.
+            probe = subprocess.run(
+                [os.path.join(avr_bin, "avr-gcc"), "-print-prog-name=cc1"],
+                capture_output=True, text=True, timeout=10, env=health_env)
+            cc1 = (probe.stdout or "").strip()
+            if cc1 and os.path.exists(cc1):
+                started = subprocess.run([cc1, "--version"], capture_output=True,
+                                         text=True, timeout=10, env=health_env)
+                if started.returncode != 0:
+                    avr_version = f"BROKEN: {(started.stderr or '').strip()[:120]}"
+                else:
+                    avr_version = subprocess.run(
+                        [os.path.join(avr_bin, "avr-gcc"), "--version"],
+                        capture_output=True, text=True, timeout=10,
+                        env=health_env).stdout
+            else:
+                avr_version = subprocess.run(
+                    [os.path.join(avr_bin, "avr-gcc"), "--version"],
+                    capture_output=True, text=True, timeout=10,
+                    env=health_env).stdout
         except Exception:  # noqa: BLE001 - absence is reported, not raised
             avr_version = ""
     return {

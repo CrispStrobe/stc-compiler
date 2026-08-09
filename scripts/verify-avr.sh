@@ -34,6 +34,12 @@ test -x "$GCC" || { bad "no $GCC — run ./scripts/fetch-avr-gcc.sh first"; exit
 # crutches -- better to find that out here.
 FLAGS=""
 
+# The vendored libmpc/libmpfr/libgmp/libz. Exported rather than left to the
+# system so that this script tests OUR copies even on a machine that happens
+# to have them -- which is every developer box and every GitHub runner, and
+# is why a missing one reached production once already.
+export LD_LIBRARY_PATH="$AVR/lib-deps${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
 echo "verifying the vendored AVR bundle"
 echo
 
