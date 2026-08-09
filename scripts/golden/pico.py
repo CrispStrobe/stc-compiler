@@ -1,6 +1,15 @@
 # Generated from BrickWright pseudocode by stc-compiler.
 # Hand edits will be lost; change the pseudocode instead.
 #
+# @bw-begin
+# @bw device pico
+# @bw pin led GP25 output
+# @bw pin dim GP15 pwm active-low
+# @bw pin buzz GP16 tone
+# @bw pin pot GP26 analog
+# @bw pin btn GP14 input active-low
+# @bw-end
+#
 # MicroPython for the Raspberry Pi Pico. Nothing to compile:
 # copy this to the board as main.py.
 from machine import Pin, ADC, PWM

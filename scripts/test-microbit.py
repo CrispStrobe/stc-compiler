@@ -522,5 +522,36 @@ check("pico part: the byte arrives MSB first and intact", byte == 0xA5,
 check("pico part: the latch pulses after the shifting, not during",
       latched is not None and len(latched) == 8)
 
-print(f"\n{passed} passed, {failed} failed")
+
+
+# --- the marker header ------------------------------------------------------
+# A reader can recover almost everything from the generated code: Pin(14,
+# Pin.IN, Pin.PULL_UP) gives the pin, the direction and the polarity, and the
+# parking write at the end names an output. What it cannot recover is the name
+# of a pin that is never parked -- an input, an ADC -- because nothing in the
+# program mentions it. So the header states it.
+def test_markers():
+    print("the @bw header states what the code cannot")
+    src = ("DEVICE PICO:\n"
+           "  PIN led = GP15 OUTPUT ACTIVE LOW\n"
+           "  PIN btn = GP14 INPUT ACTIVE LOW\n"
+           "  PIN pot = GP26 ANALOG\n"
+           "  WHEN started:\n    FOREVER:\n      print pot\n      wait 10 ms\n")
+    out = sp.emit(sp.parse(src))
+    head = out.split("from machine")[0]
+    check("the block is there, before the code", "# @bw-begin" in head and "# @bw-end" in head)
+    check("the device is named", "# @bw device pico" in head)
+    check("polarity travels with the pin", "# @bw pin led GP15 output active-low" in head)
+    check("and so does an input's", "# @bw pin btn GP14 input active-low" in head)
+    check("the ADC pin, whose name is nowhere else", "# @bw pin pot GP26 analog" in head)
+    # Comments, so a board that has never heard of BrickWright still runs it.
+    check("every header line is a comment",
+          all(l.startswith("#") for l in head.strip().splitlines()))
+    # A program with no pins has nothing to state and says nothing.
+    bare = sp.emit(sp.parse("DEVICE MICROBIT:\n  WHEN started:\n    FOREVER:\n      wait 10 ms\n"))
+    check("no pins, no header", "@bw" not in bare)
+
+
+test_markers()
+print(f"\n  {passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

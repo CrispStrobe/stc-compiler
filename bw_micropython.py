@@ -126,6 +126,30 @@ class MicroPythonTarget(sp.Target):
         ]
 
     # ---- the emitter ----------------------------------------------------
+    def markers(self, program) -> list[str]:
+        """What the generated Python cannot say for itself.
+
+        A reader can recover almost everything from the code: `Pin(14, Pin.IN,
+        Pin.PULL_UP)` gives the pin, the direction and the polarity, and the
+        parking write at the end gives an output's name. What it cannot
+        recover is the name of a pin that is never parked -- an input or an
+        ADC -- because nothing in the program mentions it. `_adc26` is what
+        the machine needs; `pot` is what the author wrote.
+
+        So the header states it, in the same `@bw` shape sb3-creator's C
+        emitter uses, and for the same reason. Comments, so the file still
+        runs on a board that has never heard of any of this.
+        """
+        if not program.pins:
+            return []
+        out = ["# @bw-begin", f"# @bw device {self.key}"]
+        for pin in program.pins.values():
+            where = getattr(pin, "where", None) or pin.name
+            out.append(f"# @bw pin {pin.name} {where} {pin.direction}"
+                       + (" active-low" if pin.active_low else ""))
+        out += ["# @bw-end", "#"]
+        return out
+
     def emit(self, program) -> str:
         pins = {pin.name: pin for pin in program.pins.values()}
         tasks = len(program.whens) > 1 or any(program.when_hats)
@@ -138,6 +162,7 @@ class MicroPythonTarget(sp.Target):
             "# Hand edits will be lost; change the pseudocode instead.",
             "#",
         ]
+        out += self.markers(program)
         out += self.imports(program)
         out.append("")
 

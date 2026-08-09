@@ -1,6 +1,11 @@
 # Generated from BrickWright pseudocode by stc-compiler.
 # Hand edits will be lost; change the pseudocode instead.
 #
+# @bw-begin
+# @bw device microbit
+# @bw pin led P0 output
+# @bw-end
+#
 # MicroPython for the BBC micro:bit. Nothing to compile: flash it
 # with uflash, or paste it into python.microbit.org.
 from microbit import *

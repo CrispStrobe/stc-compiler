@@ -1,6 +1,11 @@
 # Generated from BrickWright pseudocode by stc-compiler.
 # Hand edits will be lost; change the pseudocode instead.
 #
+# @bw-begin
+# @bw device pico
+# @bw pin led GP25 output
+# @bw-end
+#
 # MicroPython for the Raspberry Pi Pico. Nothing to compile:
 # copy this to the board as main.py.
 from machine import Pin
