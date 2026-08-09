@@ -158,12 +158,12 @@ def stage_avr() -> str | None:
                 source = os.path.join(SRC_AVR, part)
                 destination = os.path.join(AVR_STAGE, part)
                 if os.path.isdir(source) and not os.path.isdir(destination):
-                    shutil.copytree(source, destination)
+                    shutil.copytree(source, destination, symlinks=True)
                 elif os.path.isfile(source) and not os.path.exists(destination):
                     shutil.copy2(source, destination)
             # cc1, collect2, as and ld are all fork/exec'd and all lose the
             # executable bit on the way through Vercel's deployment.
-            for sub in ("bin", os.path.join("avr", "bin"),
+            for sub in ("bin", os.path.join("lib", "avr", "bin"),
                         os.path.join("lib", "gcc")):
                 for root, _dirs, _files in os.walk(os.path.join(AVR_STAGE, sub)):
                     _make_executable(root)

@@ -80,10 +80,11 @@ say "Assembling the avr5-only bundle ..."
 #
 #   avr/bin/                    avr-gcc, and the prefixed tools WE call
 #   avr/lib/gcc/avr/<ver>/      cc1, collect2, device-specs, avr5 multilib
-#   avr/avr/bin/                as, ld — UNPREFIXED, because that is the name
+#   avr/lib/avr/bin/            as, ld — UNPREFIXED, because that is the name
 #                               the driver looks for
-#   avr/avr/include/            avr-libc headers
-#   avr/avr/lib/                avr-libc libraries, by multilib
+#   avr/lib/avr/include/        avr-libc headers
+#   avr/lib/avr/lib/            avr-libc libraries, by multilib
+#   avr/avr -> lib/avr          for the stock cross-compiler reading
 #
 # The avr/avr/... half is the part that is easy to get wrong, and getting it
 # wrong fails in a way that looks like success: the driver starts, cc1 runs,
@@ -94,7 +95,7 @@ say "Assembling the avr5-only bundle ..."
 # patches gcc to match; we cannot rely on that patch once the tree moves.
 #
 rm -rf "$ROOT/avr"
-mkdir -p "$ROOT/avr/bin" "$ROOT/avr/lib" "$ROOT/avr/avr/bin"
+mkdir -p "$ROOT/avr/bin" "$ROOT/avr/lib"
 
 # The driver plus the binutils it fork/execs. avr-gcc runs `avr-as` and
 # `avr-ld` by name, and objcopy/objdump/size are what turn the .elf into a
@@ -108,13 +109,25 @@ for b in avr-gcc avr-as avr-ld avr-objcopy avr-objdump avr-size avr-ar avr-ranli
   fi
 done
 
-# The same binutils again under their unprefixed names, in the tooldir. This
-# is what the driver and collect2 actually look for; without it, `as` and `ld`
-# resolve from PATH and you assemble AVR code with the host assembler.
+# The same binutils again under their UNPREFIXED names, in the tooldir. This
+# is what the driver and collect2 look for; without it, `as` resolves from
+# PATH and you assemble AVR code with the host's x86 assembler, which fails
+# with the memorable "as: unrecognized option '-mmcu=avr5'".
+#
+# The tooldir is lib/avr/bin, not avr/bin, and that is not a guess -- it is
+# what this gcc reports:
+#
+#   $ avr-gcc -print-search-dirs
+#   programs: =.../avr/bin/../lib/gcc/avr/5.4.0/../../../avr/bin/
+#
+# which resolves to <root>/lib/avr/bin. Debian configures --libdir=/usr/lib,
+# so the whole target tree hangs off lib/avr rather than the plain avr/ a
+# stock cross-compiler build would use. CI prints that line on every run.
+mkdir -p "$ROOT/avr/lib/avr/bin"
 for b in as ld ar ranlib nm objcopy objdump strip; do
   if [ -f "$WORK/x/usr/bin/avr-$b" ]; then
-    cp "$WORK/x/usr/bin/avr-$b" "$ROOT/avr/avr/bin/$b"
-    chmod +x "$ROOT/avr/avr/bin/$b"
+    cp "$WORK/x/usr/bin/avr-$b" "$ROOT/avr/lib/avr/bin/$b"
+    chmod +x "$ROOT/avr/lib/avr/bin/$b"
   fi
 done
 
@@ -176,8 +189,10 @@ done
 find "$WORK/x/usr/lib/avr/lib" -maxdepth 1 -type f \
      -exec cp {} "$ROOT/avr/lib/avr/lib/" \;
 
-ln -sfn ../lib/avr/include "$ROOT/avr/avr/include"
-ln -sfn ../lib/avr/lib "$ROOT/avr/avr/lib"
+# A stock avr-gcc build would look in <prefix>/avr instead of <prefix>/lib/avr.
+# One symlink satisfies that reading as well, so the bundle does not depend on
+# which way the compiler was configured.
+ln -sfn lib/avr "$ROOT/avr/avr"
 
 # GPL section 1: the licences travel with the binaries. avr-gcc is GPL-3.0
 # (with the GCC Runtime Library Exception, which is what leaves compiled
@@ -208,9 +223,9 @@ du -sh "$ROOT/avr" | sed 's/^/    /'
 echo
 echo "avr-gcc present: $(test -x "$ROOT/avr/bin/avr-gcc" && echo yes || echo NO)"
 echo "cc1 present:     $(test -x "$DST/cc1" && echo yes || echo NO)"
-echo "tooldir as:      $(test -x "$ROOT/avr/avr/bin/as" && echo yes || echo NO)"
-echo "io.h present:    $(test -f "$ROOT/avr/avr/include/avr/io.h" && echo yes || echo NO)"
-echo "avr5 crt:        $(ls "$ROOT/avr/avr/lib/avr5"/crtatmega328p.o >/dev/null 2>&1 \
+echo "tooldir as:      $(test -x "$ROOT/avr/lib/avr/bin/as" && echo yes || echo NO)"
+echo "io.h present:    $(test -f "$ROOT/avr/lib/avr/include/avr/io.h" && echo yes || echo NO)"
+echo "avr5 crt:        $(ls "$ROOT/avr/lib/avr/lib/avr5"/crtatmega328p.o >/dev/null 2>&1 \
                           && echo yes || echo NO)"
 echo
 echo "GLIBC requirement (must be <= 2.34 to start on Vercel):"
