@@ -63,18 +63,24 @@ jobs:
           set -euo pipefail
           AVR="$PWD/avr"
           fail=0
-          for f in scripts/golden/avr.c scripts/golden/avr-scripts.c; do
-            echo "== $f"
-            # -Werror is the point: generated code that needs a warning
-            # suppressed at the call site is generated code with a defect.
-            if "$AVR/bin/avr-gcc" -mmcu=atmega328p -Os -std=c99 \
-                 -Wall -Wextra -Werror -Wno-implicit-fallthrough \
-                 -o /tmp/g.elf "$f"; then
-              "$AVR/bin/avr-size" --mcu=atmega328p --format=avr /tmp/g.elf \
-                | grep -E "Program|Data" | sed 's/^/    /'
-            else
-              echo "    FAILED"; fail=1
-            fi
+          # Every part in app.py's AVR_TARGETS, not just the one the goldens
+          # declare: fetch-avr-gcc.sh drops 265 of avr-libc's 267 device
+          # headers, and a part whose header was trimmed away fails HERE
+          # rather than in production.
+          for mcu in atmega328p atmega168p; do
+            for f in scripts/golden/avr.c scripts/golden/avr-scripts.c; do
+              echo "== $mcu  $f"
+              # -Werror is the point: generated code that needs a warning
+              # suppressed at the call site is generated code with a defect.
+              if "$AVR/bin/avr-gcc" -mmcu=$mcu -Os -std=c99 \
+                   -Wall -Wextra -Werror -Wno-implicit-fallthrough \
+                   -o /tmp/g.elf "$f"; then
+                "$AVR/bin/avr-size" --mcu=$mcu --format=avr /tmp/g.elf \
+                  | grep -E "Program:" | sed 's/^/    /'
+              else
+                echo "    FAILED"; fail=1
+              fi
+            done
           done
           exit $fail
 

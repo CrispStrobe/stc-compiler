@@ -47,6 +47,11 @@ AVR_LIBC="avr-libc_2.0.0+Atmel3.6.2-1.1_all.deb"
 # too, or the link fails with a missing libgcc.
 MULTILIBS="avr5"
 
+# Device headers to keep, as globs. One entry per part family in app.py's
+# AVR_TARGETS; everything else in avr-libc's 267-header include/avr is
+# dropped. See the trim below for why.
+DEVICE_HEADERS="iom328*.h iom168*.h"
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -97,10 +102,11 @@ say "Assembling the avr5-only bundle ..."
 rm -rf "$ROOT/avr"
 mkdir -p "$ROOT/avr/bin" "$ROOT/avr/lib"
 
-# The driver plus the binutils it fork/execs. avr-gcc runs `avr-as` and
-# `avr-ld` by name, and objcopy/objdump/size are what turn the .elf into a
-# .hex and report its size.
-for b in avr-gcc avr-as avr-ld avr-objcopy avr-objdump avr-size avr-ar avr-ranlib avr-nm avr-strip; do
+# Only the tools app.py and the verifier invoke BY NAME. Everything the driver
+# reaches internally (as, ld, ar, ranlib...) lives in the tooldir below under
+# its plain name, and shipping a prefixed second copy of each would add ~7 MB
+# of exact duplicates.
+for b in avr-gcc avr-objcopy avr-objdump avr-size; do
   if [ -f "$WORK/x/usr/bin/$b" ]; then
     cp "$WORK/x/usr/bin/$b" "$ROOT/avr/bin/$b"
     chmod +x "$ROOT/avr/bin/$b"
@@ -179,9 +185,16 @@ done
 # /usr/lib/avr instead; putting them back in the standard place is what lets
 # the bundle work without -isystem and -B crutches.
 #
-# The headers are ~19 MB because there is one per part. Kept whole: avr/io.h
-# dispatches to them by device macro, and a trimmed set turns an unsupported
-# part into a confusing #include error rather than a clear one.
+# avr-libc ships one device header per part -- 267 of them, 18 MB, against the
+# two parts AVR_TARGETS actually offers. avr/io.h picks exactly one by device
+# macro, so the rest are dead weight in a bundle that has to live in git.
+#
+# Everything that is NOT a device header is kept (io.h itself, sfr_defs.h,
+# interrupt.h, pgmspace.h, the util/ and compat/ trees), plus the device
+# headers for the families in DEVICE_HEADERS. Adding a part to AVR_TARGETS in
+# app.py means adding its header glob here, exactly as it means adding its
+# multilib above -- and CI compiles one program per supported part precisely
+# so a missing header fails there rather than in production.
 #
 # They go in TWICE, by symlink, because there are two places this gcc might
 # look and which one wins is a property of how Debian configured it:
@@ -194,6 +207,15 @@ done
 # fails once the tree moves" from the equation.
 mkdir -p "$ROOT/avr/lib/avr/lib"
 cp -R "$WORK/x/usr/lib/avr/include" "$ROOT/avr/lib/avr/include"
+INC="$ROOT/avr/lib/avr/include/avr"
+keep="$(mktemp)"
+for glob in $DEVICE_HEADERS; do
+  ls "$INC"/$glob 2>/dev/null || true
+done | sort -u > "$keep"
+find "$INC" -maxdepth 1 -name 'io*.h' ! -name 'io.h' \
+  | sort -u | comm -23 - "$keep" | xargs -r rm -f
+rm -f "$keep"
+test -f "$INC/iom328p.h" || { echo "device header trim removed iom328p.h" >&2; exit 1; }
 for m in $MULTILIBS; do
   test -d "$WORK/x/usr/lib/avr/lib/$m" \
     && cp -R "$WORK/x/usr/lib/avr/lib/$m" "$ROOT/avr/lib/avr/lib/$m"
