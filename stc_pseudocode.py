@@ -1366,6 +1366,10 @@ class Program:
     # call sites keep working; with several blocks the C back end emits a
     # cooperative scheduler instead of straight-line code.
     whens: list = field(default_factory=list)
+    # Index-aligned with `whens`: None for `WHEN started:`, or (pin, edge) for
+    # an event hat. Kept parallel rather than folded into `whens` so that every
+    # existing walker over `whens` keeps working unchanged.
+    when_hats: list = field(default_factory=list)
     body: list = field(default_factory=list)
     locals_: set = field(default_factory=set)
 
@@ -1769,6 +1773,13 @@ def split_arguments(text: str) -> list[str]:
 
 DEFINE_RE = re.compile(r"define\s+(?:fast\s+)?([A-Za-z_]\w*)\s*(.*?):\s*$", re.I)
 WHEN_RE = re.compile(r"when\s+(started|flag\s+clicked|powered\s+on)\s*:", re.I)
+# `WHEN btn pressed:` -- an event hat on a declared INPUT pin. Lowered to a
+# POLLED task rather than to INT0/INT1: there are only two external-interrupt
+# pins, so an interrupt-based hat would work for two buttons and then silently
+# stop being available; the millisecond tick is already a debounce interval;
+# and polling is the same state-machine shape the scheduler already has.
+# docs/PARTS-TO-BLOCKS.md in the lab repo has the full reasoning.
+WHEN_PIN_RE = re.compile(r"when\s+(\w+)\s+(pressed|released)\s*:", re.I)
 PIN_RE = re.compile(r"pin\s+(\w+)\s*=\s*(\S+)\s+(output|input|analog|pwm|tone)"
                     r"(?:\s+active\s+(low|high))?", re.I)
 PART_RE = re.compile(r"part\s+(\w+)\s*=\s*74hc595\s+data\s+P([0-4])\.([0-7])\s+"
@@ -1933,6 +1944,28 @@ def parse(source: str) -> Program:
             if not block:
                 raise PseudocodeError(line.number, "'WHEN started:' block is empty")
             program.whens.append(block)
+            program.when_hats.append(None)
+            continue
+
+        hat = WHEN_PIN_RE.fullmatch(lowered)
+        if hat:
+            name, edge = hat.group(1), hat.group(2).lower()
+            pin = program.pins.get(name)
+            if pin is None:
+                raise PseudocodeError(
+                    line.number, f"unknown pin {name!r}; declare it with PIN before "
+                                 f"reacting to it")
+            if pin.direction != "input":
+                raise PseudocodeError(
+                    line.number, f"{name!r} is {pin.direction.upper()} and cannot be "
+                                 f"waited on; only an INPUT pin has an edge to react to")
+            started = True
+            block, index = parse_block(lines, index + 1, line.indent, program)
+            if not block:
+                raise PseudocodeError(
+                    line.number, f"'WHEN {name} {edge}:' block is empty")
+            program.whens.append(block)
+            program.when_hats.append((pin.name, edge))
             continue
 
         raise PseudocodeError(
@@ -2101,8 +2134,10 @@ def emit_pseudocode(program: Program) -> str:
         params = "".join(f" ({name})" for name in procedure.params)
         out.append(f"  DEFINE {procedure.name}{params}:")
         out += stmts_pseudo(procedure.body, 2, active_low)
-    for block in program.whens:
-        out += ["", "  WHEN started:"]
+    for number, block in enumerate(program.whens):
+        hat = program.when_hats[number] if number < len(program.when_hats) else None
+        header = "  WHEN started:" if hat is None else f"  WHEN {hat[0]} {hat[1]}:"
+        out += ["", header]
         out += stmts_pseudo(block, 2, active_low)
     return "\n".join(out) + "\n"
 
@@ -2381,7 +2416,9 @@ def emit_c(program: Program) -> str:
     target = program.target
     ctx = Emit(target, {pin.name: pin for pin in program.pins.values()},
                program.procedures, program)
-    tasks = len(program.whens) > 1
+    # A pin hat must be sampled every tick, so it forces the cooperative
+    # scheduler even when it is the only script in the program.
+    tasks = len(program.whens) > 1 or any(program.when_hats)
 
     out = [
         "/* Generated from BrickWright pseudocode by stc-compiler.",
@@ -2413,20 +2450,59 @@ def emit_c(program: Program) -> str:
         for number, block in enumerate(program.whens):
             task = f"bw_task{number}"
             task_names.append(task)
-            states = [0]
+            hat = program.when_hats[number] if number < len(program.when_hats) else None
+
+            # A hat's body starts at case 1; case 0 is the edge test.
+            states = [1] if hat else [0]
             body = stmts_task(block, 1, ctx, task, states, statics)
             head = [f"static unsigned int {task}_state;"]
             if has_wait(block):
                 head.append(f"static {target.time_type} {task}_until;")
+
+            if hat is None:
+                task_lines += head
+                task_lines += [f"/* WHEN started: (script {number + 1}) */",
+                               f"static void {task}(void)", "{",
+                               f"    switch ({task}_state) {{",
+                               "    case 0:",
+                               *body,
+                               "    }",
+                               f"    {task}_state = 0xFFFF;   /* ran to the end */",
+                               "}", ""]
+                continue
+
+            pin_name, edge = hat
+            pin = ctx.pins[pin_name]
+            level = target.read_pin(pin)          # polarity-aware: the LOGICAL level
+            rising = "pressed" if edge == "pressed" else "released"
+            test = (f"now && !{task}_prev" if edge == "pressed"
+                    else f"!now && {task}_prev")
+            head.append(f"static unsigned char {task}_prev;")
             task_lines += head
-            task_lines += [f"/* WHEN started: (script {number + 1}) */",
-                           f"static void {task}(void)", "{",
-                           f"    switch ({task}_state) {{",
-                           "    case 0:",
-                           *body,
-                           "    }",
-                           f"    {task}_state = 0xFFFF;   /* ran to the end */",
-                           "}", ""]
+            task_lines += [
+                f"/* WHEN {pin_name} {rising}: (script {number + 1})",
+                " *",
+                " * Polled once per dispatch and EDGE-triggered: `_prev` is updated on every",
+                " * pass, so a held button runs the body once rather than every millisecond,",
+                " * and a release during the body does not queue a second run. The level read",
+                " * is the LOGICAL one, so an ACTIVE LOW button reads as pressed when the pin",
+                " * is low. */",
+                f"static void {task}(void)",
+                "{",
+                f"    unsigned char now = ({level}) ? 1 : 0;",
+                f"    unsigned char fired = ({test}) ? 1 : 0;",
+                f"    {task}_prev = now;",
+                "",
+                f"    switch ({task}_state) {{",
+                "    case 0:",
+                "        if (!fired)",
+                "            return;",
+                f"        {task}_state = 1;",
+                "    case 1:",
+                *body,
+                "    }",
+                f"    {task}_state = 0;   /* ready for the next edge */",
+                "}", ""]
         if statics:
             task_lines[0:0] = ["/* REPEAT counters live across yields. */",
                                *(f"static unsigned int {name};" for name in statics),

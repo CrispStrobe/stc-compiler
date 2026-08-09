@@ -224,6 +224,38 @@ def test_uart():
        "on the STC12 a console and a tone coexist")
 
 
+def test_event_hat():
+    """`WHEN btn pressed:` — polled, edge-triggered, polarity-aware.
+
+    Lowered to a task rather than to INT0 because there are two external
+    interrupt pins, so an interrupt hat works for two buttons and then stops
+    being offered. PARTS-TO-BLOCKS.md has the reasoning.
+    """
+    print("event hats: polled, edge-triggered, and aware which way the button is wired")
+    c = emit(HEAD + "  PIN btn = P3.2 INPUT ACTIVE LOW\n  PIN led = P1.0 OUTPUT ACTIVE LOW\n"
+                    "  WHEN started:\n    turn off led\n"
+                    "  WHEN btn pressed:\n    toggle led\n    wait 200 ms\n")
+    ok("unsigned char now = (!P3_2) ? 1 : 0;" in c,
+       "the level read is LOGICAL: an active-low button reads pressed when the pin is low")
+    ok("(now && !bw_task1_prev)" in c, "rising edge of the logical level")
+    ok("bw_task1_prev = now;" in c,
+       "prev updates on EVERY pass -- a held button fires once, not every millisecond")
+    ok("bw_task1_state = 0;   /* ready for the next edge */" in c,
+       "and the task rearms rather than ending at 0xFFFF like a started script")
+
+    rel = emit(HEAD + "  PIN btn = P3.2 INPUT\n  PIN led = P1.0 OUTPUT\n"
+                      "  WHEN btn released:\n    turn off led\n")
+    ok("(!now && bw_task0_prev)" in rel, "released is the falling edge")
+    # A lone hat still needs the tick, so it must force the scheduler.
+    ok("bw_task0();" in rel and "for (;;)" in rel,
+       "a hat on its own still forces the cooperative scheduler -- it has to be polled")
+
+    rejects(HEAD + "  PIN led = P1.0 OUTPUT\n  WHEN nosuch pressed:\n    turn off led\n",
+            "unknown pin", "a hat on a pin that was never declared")
+    rejects(HEAD + "  PIN led = P1.0 OUTPUT\n  WHEN led pressed:\n    turn off led\n",
+            "only an INPUT pin", "a hat on an output")
+
+
 def main() -> int:
     test_polarity()
     test_setup()
@@ -232,6 +264,7 @@ def main() -> int:
     test_duty_arithmetic()
     test_tone()
     test_uart()
+    test_event_hat()
     test_compiles()
     print(f"\n{checks} checks, {failures} failures")
     return 1 if failures else 0
