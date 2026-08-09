@@ -8,6 +8,18 @@
 //   (cd docs && python3 -m http.server 8765 &)
 //   PW_CHANNEL=chrome node scripts/check-pages.js http://localhost:8765
 //
+// It also runs against the deployed site, which is the only way to prove the
+// page users actually load carries the current transpiler:
+//
+//   PW_CHANNEL=chrome node scripts/check-pages.js \
+//       https://crispstrobe.github.io/stc-compiler
+//
+// Installing playwright locally needs --prefix, unlike in CI: npm walks UP
+// for a package.json, and a clone under a directory that has one will
+// otherwise install into THAT tree rather than this one.
+//
+//   npm install --no-save --prefix "$PWD" playwright@1.60.0
+//
 const { chromium } = require('playwright');
 
 (async () => {
@@ -68,6 +80,40 @@ const { chromium } = require('playwright');
   ok('a bad pin is an error message, not a crash',
      (await page.getAttribute('#status', 'class')) === 'err'
      && (await page.textContent('#out')).includes('P0-P20'));
+
+  // A board fact, checked through the deployed transpiler rather than the
+  // local one. The Nano's A6/A7 reach the pad with no digital buffer, so
+  // digitalWrite to one is accepted by every layer and does nothing; the two
+  // boards must refuse the same pin name for their own different reasons,
+  // because one answer sends the reader to the package and the other to the
+  // schematic. Locking this in HERE is the point: the page carries its own
+  // copy of the transpiler, and a fix that never reached docs/ would pass
+  // every local test and still ship the old rule to users.
+  const refusal = async (device, decl) => {
+    await page.fill('#source',
+      `DEVICE ${device}:\n  PIN x = ${decl}\n  WHEN started:\n    wait 10 ms\n`);
+    await page.click('#go');
+    await page.waitForTimeout(300);
+    return (await page.getAttribute('#status', 'class')) === 'err'
+      ? await page.textContent('#out') : null;
+  };
+  const nanoDigital = await refusal('ARDUINO-NANO', 'A6 OUTPUT');
+  ok('the live page refuses a digital write to the Nano\'s A6',
+     /analog-IN only/.test(nanoDigital || ''), String(nanoDigital).slice(0, 72));
+  const unoAbsent = await refusal('ARDUINO-UNO', 'A6 ANALOG');
+  ok('...and refuses the Uno\'s A6 as absent instead',
+     /A0-A5/.test(unoAbsent || ''), String(unoAbsent).slice(0, 72));
+  ok('...with two different messages, not one shared "no such pin"',
+     nanoDigital !== unoAbsent && !!nanoDigital && !!unoAbsent);
+
+  await page.fill('#source',
+    'DEVICE ARDUINO-NANO:\n  PIN pot = A6 ANALOG\n  WHEN started:\n'
+    + '    FOREVER:\n      print pot\n      wait 10 ms\n');
+  await page.click('#go');
+  await page.waitForTimeout(300);
+  ok('...while the one thing A6 CAN do still transpiles',
+     (await page.getAttribute('#status', 'class')) === 'ok'
+     && (await page.textContent('#out')).includes('analogRead(A6)'));
 
   // Canonical pseudocode view.
   await page.selectOption('#example', names[0]);
