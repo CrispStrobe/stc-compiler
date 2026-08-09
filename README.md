@@ -742,6 +742,22 @@ Check before bumping:
 strings bin/sdas8051 | grep -oE 'GLIBC_2\.[0-9]+' | sort -V | tail -1
 ```
 
+**The consequence, which is easy to miss: this service does not produce the
+same firmware as a local build.** `stc12c5a60s2-lab` documents `brew install
+sdcc`, which is 4.5.0. This service is 4.0.0. Measured on `01-blink`, the same
+C sent to both, with this service's own flags (`-mmcs51 --std-c99 --iram-size
+256 --xram-size 1024 --code-size 61440 -DFOSC_HZ=11059200UL`):
+
+| built by | size |
+|---|---|
+| local SDCC 4.5.0 | 996 bytes |
+| this service, SDCC 4.0.0 | 888 bytes |
+
+Both work. But do not diff a remote `.hex` against a local one and conclude
+something is broken, and never pair a remote image with a locally produced
+symbol table — a symbol table is only valid for the image it was built with.
+The web page names the compiler beside the byte count for this reason.
+
 ---
 
 ## Deploying
@@ -756,6 +772,98 @@ config traces Python imports only and would silently omit them.
 
 Compiles take well under a second (~0.2 s for a small program), so the default
 function duration is not a consideration.
+
+---
+
+## Where this is going: the toolchain in the browser
+
+The page at <https://crispstrobe.github.io/stc-compiler/> already runs the
+transpiler client-side, in Pyodide. Exactly one thing still needs this service:
+**Compile to .hex**, because that needs SDCC. Remove that and there is no
+server — no deploy rate limit, no glibc pin, no skew between the page and the
+compiler, and it works offline.
+
+So: SDCC built for the mcs51 port as WebAssembly, served as static files.
+
+Nothing runs server-side in that design. GitHub Pages serves bytes and the
+compile happens on the visitor's CPU. It is not a "WASM server"; there is no
+server.
+
+### It is not speculative
+
+`chrismaltby/gbdk-emscripten` ships this shape on npm today, for the z80 ports:
+
+| artifact | size |
+|---|---|
+| `sdcc.wasm` | 0.88 MB |
+| `sdcpp.wasm` | 0.22 MB |
+| `as-gbz80.wasm` + `link-gbz80.wasm` | 0.14 MB |
+
+About **1.3 MB of WASM** for a complete single-port toolchain, against a page
+that already loads Pyodide — several times larger. What we need is the same
+build with mcs51 instead of z80.
+
+### Two constraints that decide the build
+
+**Single-threaded, no exceptions.** GitHub Pages cannot set response headers.
+`SharedArrayBuffer` and WASM threads require cross-origin isolation, which
+requires `Cross-Origin-Opener-Policy` and `Cross-Origin-Embedder-Policy` on the
+response. A threaded build would pass every test on the builder's machine and
+fail on the only host it is for. (There is a service-worker shim that fakes the
+headers; it reloads the page on first visit, which is a poor trade for
+something whose appeal is being a static file.)
+
+**Pin 4.5.0, not the 4.0.0 this service uses.** WASM has no glibc, so the
+constraint that pins the hosted build does not exist in the browser. Building
+4.5.0 does not merely replace this service — it ends the divergence documented
+above. If the WASM build comes out matching 4.0.0, that is a failure.
+
+The acceptance test is byte-identical `.hex` against native SDCC 4.5.0 for all
+nine `stc12c5a60s2-lab` examples, run in CI rather than by hand, because every
+measurement in that project was made with 4.5.0 and a subtly different compiler
+would silently invalidate them.
+
+### AVR is deliberately not part of this
+
+The same page compiles Arduino/AVR targets with `avr-gcc`, and that is a far
+bigger animal. Measured from the exact Debian packages `fetch-avr-gcc.sh`
+vendors:
+
+| binary | native x86-64 |
+|---|---|
+| `cc1plus` — Arduino sketches are C++ | 12.9 MB |
+| `cc1` — C only | 11.7 MB |
+| `lto1` | 10.9 MB |
+| `avr-as` / `avr-ld` / `avr-objcopy` | 1.0 / 1.3 / 0.9 MB |
+| full install | 99 MB |
+
+The minimum viable set is smaller than the install suggests. `lto1` goes (no
+LTO in a browser) and `cc1` goes too *if* the Arduino core is precompiled to
+`core.a` at build time — which is what the Arduino IDE already does — leaving
+only the user's C++ sketch to compile. That is **16.1 MB of native code**:
+`cc1plus` plus the three binutils tools, because `cc1plus` emits assembly text
+and something still has to assemble and link it. Data on top is cheap:
+`libc.a` 0.28 MB, `libm.a` 0.06 MB, headers 2.8 MB gzipped.
+
+Estimating the WASM step: roughly **16–25 MB of `.wasm`, 7–11 MB compressed** —
+about 8× the SDCC payload per visitor, plus GMP, MPFR and MPC to port, which
+SDCC does not need. For scale on how wrong this can go, Wokwi compiled GDB with
+Emscripten, got ~90 MB, and abandoned it for a Linux VM in the browser. That
+was an unoptimised build of a bigger, threaded program, so it is not a
+prediction — but no optimised `avr-gcc` WASM build exists publicly to measure,
+so the range above is an estimate and the native figures are the only measured
+part.
+
+Worth recording that one worry turned out to be unfounded: `cc1plus` links
+`libc, libdl, libgmp, libm, libmpc, libmpfr, libz` and **no libpthread**. A
+compiler is a single-threaded batch program; GDB needs threads for target
+control, which is GDB's problem. So AVR-in-the-browser is not blocked by the
+Pages header limitation — it is only expensive.
+
+**Deferred, not rejected.** 10 MB per visitor to serve people who already have
+a toolchain is a poor trade, and it is a lot of build engineering for the
+second-priority target. Revisit if anyone asks for it. Deferring it does not
+block the 8051 path going fully static.
 
 ---
 

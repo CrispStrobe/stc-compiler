@@ -43,6 +43,29 @@ So a `.hex` compiled by this service belongs to whoever wrote the C.
 triggered by *distribution*, not by use over a network — that is the AGPL,
 which SDCC is not under. Callers receive compiler *output*, never the compiler.
 
+**3b. That answer flips the moment the compiler runs in the browser.** The
+plan in the README's "toolchain in the browser" section ships SDCC compiled to
+WebAssembly as a static asset, so the visitor receives **the compiler itself**,
+not its output. That is distribution, plainly, and the reasoning in (3) stops
+applying to it — (1) and (2) are unaffected, since the wrapper still does not
+link SDCC and the linking exception still covers the `.hex`.
+
+What compliance requires there, and it is not onerous:
+
+- Publish the corresponding source for that exact build — the upstream tarball
+  URL and its SHA-256, not just "SDCC 4.5.0".
+- Publish **any patches** applied to make it build under Emscripten. Patches
+  are part of the corresponding source; applying them without publishing them
+  is the failure mode to avoid.
+- Record the toolchain that produced it (the `emcc` version), so the build can
+  be reproduced rather than merely inspected.
+- Carry the licence text and notices alongside the artifact, as this repository
+  already does for the vendored Linux binaries.
+
+None of this restricts what anyone does with the `.hex` they compile: the
+runtime-library linking exception in (2) is what governs the output, and it is
+unchanged.
+
 What **does** apply is that this repository redistributes GPL binaries, so it
 carries the license text, preserves the notices, and identifies the exact
 corresponding source. SDCC is unmodified upstream; the source for this precise
