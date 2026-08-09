@@ -262,6 +262,13 @@ def bw_transpile(source):
             "isp": target.isp_protocol,
             "compilable": target.toolchain in ("sdcc-mcs51", "avr-gcc"),
             "hint": target.compile_hint,
+            # The canonical device token and the clock, so the page can ask the
+            # hosted compiler to build the C IT ALREADY HAS rather than sending
+            # the pseudocode back to be transpiled a second time. `device` above
+            # is the display name and will not round-trip ("Arduino Uno" is not
+            # "arduino-uno").
+            "target": target.key,
+            "clock": program.clock,
             "filename": (program.name or "main") + "." + target.source_extension,
             "stem": program.name or "main",
         })
@@ -369,9 +376,27 @@ $('hex').onclick = async () => {
   setStatus('compiling on ' + API + ' …');
   $('hex').disabled = true;
   try {
+    // Send the C this page generated, not the pseudocode.
+    //
+    // Sending pseudocode made the server transpile it a second time, with its
+    // own copy of stc_pseudocode.py — so the image you flashed came from a
+    // different compiler than the C displayed above it, and the two only agree
+    // while the deployments are in step. On 2026-08-09 they were about fifty
+    // commits apart for a day, because the hosted side had hit a deploy rate
+    // limit while this page (GitHub Pages) kept updating. Measured then: the
+    // two transpilers still produced identical images for every example, so
+    // nothing was actually wrong — but "nothing was wrong this time" is not a
+    // property worth relying on, and there is no reason to run the front end
+    // twice when the answer is already on screen.
+    //
+    // It also leaves one job on the server, compiling, which is the job that
+    // goes away entirely when SDCC arrives as WebAssembly.
     const response = await fetch(API + '/compile', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({code: $('source').value, language: 'pseudocode'}),
+      body: JSON.stringify({
+        code: result.code, language: 'c',
+        target: result.target, fosc: result.clock,
+      }),
     });
     const data = await response.json();
     if (!data.success) {

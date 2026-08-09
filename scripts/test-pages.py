@@ -54,6 +54,19 @@ if index.exists():
           "bw_transpile" in page and "loadPyodide" in page)
     check("compiling is delegated, and says where",
           "/compile" in page and "stc-compiler.vercel.app" in page)
+    # Only the COMPILE is delegated. Transpiling happens here, once, and the
+    # image must be built from the C the page is showing — otherwise the server
+    # transpiles a second time with its own copy of the front end, and the two
+    # agree only for as long as the two deployments are in step. They were fifty
+    # commits apart for a day on 2026-08-09.
+    check("the image is built from the C on screen, not from the pseudocode again",
+          "language: 'c'" in page and "code: result.code" in page
+          and "language: 'pseudocode'" not in page)
+    # …which needs the canonical device token, not the display name: "Arduino
+    # Uno" is not "arduino-uno" and would be rejected.
+    check("the compile request carries the target key and the clock",
+          '"target": target.key' in page and '"clock": program.clock' in page
+          and "target: result.target" in page and "fosc: result.clock" in page)
     check("the flasher is wired in", "flash.js" in page and "id=flash" in page)
     check("all three flash paths reach the button",
           all(t in page for t in ("flashAvr", "flashMicroPython", "flashStc")))
