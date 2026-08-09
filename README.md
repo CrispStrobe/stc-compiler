@@ -125,6 +125,12 @@ curl -X POST https://stc-compiler.vercel.app/download \
 # -> main.hex
 ```
 
+For a target this service cannot build — a micro:bit, an Arduino sketch — the
+**source** is the file: `main.py` or `main.ino`, returned 200 with
+`X-Source-Only` naming the toolchain it would have needed. A genuine error (a
+bad pin, an unknown target) is still a 400 with the message. The difference is
+whether there is usable output, not whether a compiler ran.
+
 Response headers: `Content-Disposition: attachment; filename="main.hex"`,
 `X-Image-Bytes`, and `Access-Control-Expose-Headers` so a browser `fetch()` can
 read both. A compile failure returns **400** with the compiler output as plain
