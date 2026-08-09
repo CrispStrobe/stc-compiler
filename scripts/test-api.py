@@ -188,6 +188,26 @@ for allowed, why in [('#include <stc12.h>\nvoid main(void){ P1 = 0; for(;;); }',
           "outside the build directory" not in (result.get("error") or ""),
           (result.get("error") or "")[:56])
 
+print("\nevery endpoint bounds its input")
+# /compile and /translate-project always did. The parse-only endpoints did
+# not, on the reasoning that parsing is cheap -- which is true per byte and
+# not true per request, in a metered function with a memory ceiling.
+oversize = "x" * (1_000_001)
+for path, body in [("/disassemble", {"hex": oversize}),
+                   ("/decompile", {"code": oversize}),
+                   ("/transpile", {"code": oversize}),
+                   ("/translate", {"code": oversize})]:
+    request = urllib.request.Request(f"{BASE}{path}", json.dumps(body).encode(),
+                                     {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            data = json.load(response)
+        check(f"{path} refuses an oversize body",
+              data.get("success") is False and "too large" in (data.get("error") or ""),
+              (data.get("error") or "")[:48])
+    except urllib.error.HTTPError as exc:
+        check(f"{path} refuses an oversize body", exc.code in (413, 400), f"HTTP {exc.code}")
+
 print("\nno internal paths leak")
 result, _ = post({"code": "void main(void) { not C }"})
 check("workspace path stripped from errors", "/tmp/build-" not in result.get("error", ""),

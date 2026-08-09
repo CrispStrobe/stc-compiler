@@ -59,6 +59,23 @@ INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]*)"',
                         re.MULTILINE)
 
 
+def too_large(*texts) -> dict | None:
+    """Refuse input past MAX_SOURCE_BYTES.
+
+    /compile and /translate-project already did this; the endpoints that only
+    parse did not, on the reasoning that parsing is cheap. It is cheap per
+    byte, which is not the same thing: this runs in a metered function with a
+    memory ceiling, and an unbounded body is a way to spend someone else's
+    quota. The limit is generous -- a megabyte of pseudocode is not a program.
+    """
+    total = sum(len((t or "").encode("utf-8", "replace")) for t in texts)
+    if total > MAX_SOURCE_BYTES:
+        return {"success": False,
+                "error": f"input too large: {total} bytes, limit "
+                         f"{MAX_SOURCE_BYTES}"}
+    return None
+
+
 def reject_path_options(options) -> dict | None:
     """No caller-supplied option may contain a path separator.
 
@@ -644,6 +661,9 @@ async def disassemble_image(req: DisassembleReq):
     Handy for checking what actually landed in the image rather than trusting
     the compiler -- and for diffing two builds that should be identical.
     """
+    refusal = too_large(req.hex, req.base64)
+    if refusal:
+        return refusal
     text = req.hex
     if text is None and req.base64:
         try:
@@ -670,6 +690,9 @@ async def disassemble_image(req: DisassembleReq):
 @app.post("/translate")
 async def translate_keil(req: CompileReq):
     """Keil C51 in, SDCC-dialect C out. No compiler involved."""
+    refusal = too_large(req.code)
+    if refusal:
+        return refusal
     stage_toolchain()
     result = keil2sdcc.translate(req.code)
     return {"success": True, "c": result.text, "translated": result.changes,
@@ -861,6 +884,9 @@ async def decompile_pseudocode(req: CompileReq):
     `emit_pseudocode`: normalised layout, comments dropped, and a fixed point
     -- feeding the result back in returns it unchanged.
     """
+    refusal = too_large(req.code)
+    if refusal:
+        return refusal
     try:
         return {"success": True, "pseudocode": stc_pseudocode.decompile(req.code)}
     except stc_pseudocode.PseudocodeError as exc:
@@ -871,6 +897,9 @@ async def decompile_pseudocode(req: CompileReq):
 async def transpile_only(req: CompileReq):
     """Pseudocode in, C out. No compiler involved -- useful for seeing exactly
     what the front end produced before handing it to SDCC."""
+    refusal = too_large(req.code)
+    if refusal:
+        return refusal
     try:
         code, program = stc_pseudocode.transpile(req.code)
     except stc_pseudocode.PseudocodeError as exc:
