@@ -49,7 +49,10 @@ written = 0
 
 for name, source in roundtrip.PROGRAMS.items():
     program = sp.parse(source)
-    for suffix, text in (("c", sp.emit_c(program)),
+    # A MicroPython target's output is not C and must not be filed as if it
+    # were; the extension follows the target.
+    language = "py" if sp.source_language(program) == "python" else "c"
+    for suffix, text in ((language, sp.emit(program)),
                          ("bw", sp.emit_pseudocode(program))):
         path = GOLDEN / f"{name}.{suffix}"
         if UPDATE:

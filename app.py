@@ -358,10 +358,11 @@ def build(req: CompileReq) -> dict:
             return {"success": False, "stage": "compile",
                     "error": f"{chip.display} transpiles here, but building it "
                              f"needs {chip.toolchain}, which this service does "
-                             f"not host. Use /transpile to get the source, or "
-                             f"DEVICE ATMEGA328P: for the same board without "
-                             f"the Arduino core.",
-                    "c": generated_c, "toolchain": chip.toolchain}
+                             f"not host. Use /transpile to get the source."
+                             + (f" {chip.compile_hint}" if chip.compile_hint else ""),
+                    "c": generated_c,
+                    "toolchain": chip.toolchain,
+                    "language": stc_pseudocode.source_language(program)}
     elif req.language.lower() in ("keil", "c51"):
         stage_toolchain()      # SFR addresses come from the staged SDCC headers
         result = keil2sdcc.translate(req.code)
@@ -742,6 +743,10 @@ async def transpile_only(req: CompileReq):
     return {
         "success": True,
         "c": code,
+        # Not always C any more: a micro:bit transpiles to MicroPython. The
+        # field keeps its name so existing callers keep working, and this says
+        # what is actually in it.
+        "language": stc_pseudocode.source_language(program),
         "part": program.part,
         "clock": program.clock,
         # `where` is the target-neutral location token ("P1.0", "D13", "A0").

@@ -247,6 +247,11 @@ class Target:
     # `sdcc -mmcs51` and reporting whatever it makes of that.
     toolchain = "sdcc-mcs51"
 
+    # What to tell someone whose device transpiles here but cannot be built
+    # here. Target-specific, because "use the other device" is good advice for
+    # an Arduino and nonsense for a micro:bit.
+    compile_hint = ""
+
     # The C type a millisecond count lives in, and its signed counterpart for
     # the scheduler's wraparound-safe deadline compare. 16 bits is right for a
     # Timer-0 counter we increment ourselves; a target whose clock is the
@@ -300,6 +305,13 @@ class Target:
     def start_scheduler(self, task_names: list[str]) -> list[str]:
         """Start the timebase and run the cooperative tasks forever."""
         raise NotImplementedError
+
+    # A target whose language cannot express the shared lowering overrides
+    # this and emits the whole program itself. MicroPython is the case: no
+    # goto, so the Duff's-device state machines are unavailable and the
+    # cooperative tasks become generators instead. Targets that leave it None
+    # get the C back end below.
+    emit = None
 
     def main(self, program, setup_lines: list[str], body_lines: list[str],
              task_names: list[str]) -> list[str]:
@@ -538,6 +550,8 @@ class ArduinoTarget(Target):
 
     # Core C++ needs the Arduino build system; SDCC cannot touch it.
     toolchain = "arduino-cli"
+    compile_hint = ("DEVICE ATMEGA328P: is the same board without the Arduino "
+                    "core, and that one does compile here.")
 
     def __init__(self, key: str, display: str, digital_max: int, analog_max: int):
         self.key = key
@@ -1686,9 +1700,24 @@ def emit_c(program: Program) -> str:
 
 # ======================================================================= facade
 
+def emit(program: Program) -> str:
+    """Generated source for `program`, in whatever language its target uses.
+
+    `emit_c` remains the C back end and the only one most targets need;
+    a target that cannot use it supplies its own `emit`."""
+    custom = getattr(program.target, "emit", None)
+    return custom(program) if custom else emit_c(program)
+
+
+def source_language(program: Program) -> str:
+    """"c" or "python" -- what `emit` just produced, for callers that have to
+    label it (a filename, a syntax highlighter, an editor tab)."""
+    return "python" if getattr(program.target, "emit", None) else "c"
+
+
 def transpile(source: str) -> tuple[str, Program]:
     program = parse(source)
-    return emit_c(program), program
+    return emit(program), program
 
 
 def decompile(source: str) -> str:
@@ -1722,3 +1751,13 @@ EXAMPLE = """DEVICE STC12C5A60S2:
         wait 1 seconds
         set counter to 0
 """
+
+
+# Registered last, and imported here rather than above, because bw_microbit
+# subclasses Target and everything it needs is defined by this point. Keeping
+# it in its own module keeps a 300-line Python back end out of the file that
+# every other target shares.
+from bw_microbit import MicrobitTarget  # noqa: E402
+
+TARGETS["microbit"] = MicrobitTarget()
+TARGETS["micro-bit"] = TARGETS["microbit"]

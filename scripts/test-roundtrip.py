@@ -208,6 +208,40 @@ WHEN started:
       turn off fast
 """,
 
+    # A target off C entirely. MicroPython has no goto, so the cooperative
+    # scheduler is generators rather than a Duff's device -- the case the
+    # target interface was drawn to allow.
+    "microbit": """DEVICE MICROBIT:
+  CLOCK 16000000
+  PIN led = P0 OUTPUT
+  PIN spk = P1 OUTPUT ACTIVE LOW
+  PIN btn = BUTTON_A INPUT
+  PIN dial = P2 ANALOG
+  WHEN started:
+    FOREVER:
+      toggle led
+      wait dial ms
+  WHEN started:
+    set hits to 0
+    FOREVER:
+      wait until btn
+      change hits by 1
+      turn on spk
+      wait 50 ms
+      turn off spk
+""",
+
+    "microbit-once": """DEVICE MICROBIT:
+  CLOCK 16000000
+  PIN led = P0 OUTPUT
+  WHEN started:
+    REPEAT 3:
+      set led high
+      wait 100 ms
+      set led low
+      wait 100 ms
+""",
+
     "avr-scripts": """DEVICE ATMEGA328P:
   CLOCK 16000000
   PIN slow = D13 OUTPUT
@@ -269,7 +303,7 @@ def hop(text, kind):
 print("round-trip transparency\n")
 for name, source in PROGRAMS.items():
     original_ps = sp.emit_pseudocode(sp.parse(source))
-    original_c = sp.emit_c(sp.parse(source))
+    original_c = sp.emit(sp.parse(source))
     ok = True
 
     for order in ORDERS:
@@ -284,7 +318,7 @@ for name, source in PROGRAMS.items():
                         print(f"        want {want!r}\n         got {got!r}")
                         break
                 break
-            if not check(f"{label} preserves the C", sp.emit_c(sp.parse(text)) == original_c):
+            if not check(f"{label} preserves the C", sp.emit(sp.parse(text)) == original_c):
                 ok = False
                 break
         if not ok:

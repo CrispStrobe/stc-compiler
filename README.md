@@ -359,12 +359,50 @@ the toolchain it would need, and returns the generated source anyway.
 `DEVICE ATMEGA328P:` is the same board **without** the core, and that one does
 compile here — see below.
 
+### micro:bit
+
+`DEVICE MICROBIT:` emits **MicroPython**, not C — and that is the case the
+target interface exists for. Several `WHEN` blocks compile to cooperative
+tasks, which on the 8051 and AVR is a Duff's device: a `switch` whose `case`
+labels sit inside the loops, so a task resumes by jumping into the middle of
+its own control flow. MicroPython has no `goto`, so that shape cannot be
+expressed at all. It becomes generators instead:
+
+```python
+def bw_task0():
+    while True:
+        _level['led'] = 1 - _level['led']
+        pin0.write_digital(_level['led'])
+        _deadline = running_time() + (500)
+        while running_time() < _deadline:
+            yield
+        yield                      # loop back-edge
+```
+
+Same contract — yield at every wait and every loop back-edge, so no script
+starves another — with nothing in common in the code that implements it.
+
+Pins are `P0`–`P20`, `BUTTON_A`, `BUTTON_B`; analog is P0–P4 and P10 only, and
+asking for it elsewhere is a parse error. Declaring P3, P4, P6, P7, P9 or P10
+emits `display.off()` first, because those are wired to the 5×5 LED matrix and
+the display driver would fight anything else driving them.
+
+Nothing to compile: MicroPython is interpreted on the device, so `POST
+/compile` refuses and points at `/transpile`. Flash the result with `uflash`,
+or paste it into [python.microbit.org](https://python.microbit.org).
+
+Because there is no compiler to catch mistakes, CI **runs** the generated
+program against a stub `microbit` module and checks that the generators
+actually interleave, that a 100 ms wait lasts about 100 ms, and that
+`ACTIVE LOW` reaches the pin inverted.
+
 ### AVR: the same boards, compiled
 
 | `DEVICE` / `target` | Emits | Compiles here |
 |---|---|---|
 | `arduino-uno`, `arduino-nano` | Arduino core C++ | no — paste into the IDE |
 | `atmega328p`, `atmega168p` | bare AVR C | **yes**, via avr-gcc |
+| `microbit` | MicroPython | nothing to compile — see above |
 
 An ATmega328P *is* an Uno, and pins keep the board's labels (`D13`, `A0`; port
 names like `PB5` are accepted and canonicalised), so a program moves between

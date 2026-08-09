@@ -26,6 +26,12 @@ jobs:
         run: python3 ./scripts/test-roundtrip.py
       - name: Debug symbol table
         run: python3 ./scripts/test-symtab.py
+      # The micro:bit target has no compiler to hold it to account, so the
+      # generated MicroPython is EXECUTED against a stub instead: that the
+      # cooperative generators interleave, that a wait lasts about as long as
+      # it says, and that ACTIVE LOW reaches the pin inverted.
+      - name: micro:bit — run the generated MicroPython
+        run: python3 ./scripts/test-microbit.py
 
   # The real verification: build the vendored AVR toolchain from Debian and
   # prove it compiles, links and emits an image using ONLY those binaries.
