@@ -251,3 +251,127 @@ export async function flashStc() {
     'answers only after a cold power-on, so it needs its own prompt-and-wait ' +
     'flow. Use `stcgal -P stc12 -p /dev/cu.usbserial-XXXX main.hex` for now.');
 }
+
+// ---------------------------------------------------------------- micro:bit
+//
+// A micro:bit has no serial bootloader to talk STK500 to. What it has, once
+// MicroPython is on it, is a REPL over the DAPLink CDC port -- and MicroPython's
+// "raw REPL" is a perfectly good file-transfer channel. That is what microfs
+// and the official editors use, and it is far less machinery than splicing a
+// script into a 1.8 MB runtime hex and asking the user to drag it to a drive.
+//
+// The trade is explicit: this writes main.py to a board that ALREADY has
+// MicroPython. It does not install MicroPython. Flash that once from
+// python.microbit.org and this works from then on.
+
+const CTRL_A = 0x01, CTRL_B = 0x02, CTRL_C = 0x03, CTRL_D = 0x04;
+
+/** A Python bytes literal that survives the REPL: printable ASCII, escaped. */
+export function pythonBytes(chunk) {
+  let out = "b'";
+  for (const byte of chunk) {
+    if (byte === 0x5c) out += '\\\\';
+    else if (byte === 0x27) out += "\\'";
+    else if (byte === 0x0a) out += '\\n';
+    else if (byte === 0x0d) out += '\\r';
+    else if (byte === 0x09) out += '\\t';
+    else if (byte >= 0x20 && byte < 0x7f) out += String.fromCharCode(byte);
+    else out += '\\x' + byte.toString(16).padStart(2, '0');
+  }
+  return out + "'";
+}
+
+/** Read until `marker` appears, or time out saying what was seen instead. */
+async function readUntil(io, marker, { timeout = 5000 } = {}) {
+  const deadline = Date.now() + timeout;
+  let seen = '';
+  const decoder = new TextDecoder();
+  while (!seen.includes(marker)) {
+    if (Date.now() > deadline) {
+      throw new Error(`timed out waiting for ${JSON.stringify(marker)}; ` +
+                      `saw ${JSON.stringify(seen.slice(-60))}`);
+    }
+    try {
+      seen += decoder.decode(await io.read(1));
+    } catch {
+      throw new Error(`the board stopped responding; saw ` +
+                      `${JSON.stringify(seen.slice(-60))}`);
+    }
+  }
+  return seen;
+}
+
+export class RawRepl {
+  constructor(io) { this.io = io; this.encoder = new TextEncoder(); }
+
+  async send(text) { await this.io.write(this.encoder.encode(text)); }
+  async control(byte) { await this.io.write(Uint8Array.from([byte])); }
+
+  async enter() {
+    // Two interrupts: the first stops a running program, the second lands in
+    // the REPL even if the first arrived while it was already idle.
+    await this.control(CTRL_C);
+    await this.control(CTRL_C);
+    await this.io.drain?.();
+    await this.control(CTRL_A);
+    await readUntil(this.io, 'raw REPL');
+    await readUntil(this.io, '>');
+  }
+
+  /** Run one block and return its stdout. Raises on a Python traceback. */
+  async exec(code) {
+    await this.send(code);
+    await this.control(CTRL_D);
+    await readUntil(this.io, 'OK');
+    const body = await readUntil(this.io, '\x04');
+    const error = await readUntil(this.io, '\x04');
+    const failure = error.replace(/\x04/g, '').trim();
+    if (failure) throw new Error(failure.split('\n').pop());
+    await readUntil(this.io, '>');
+    return body.replace(/\x04/g, '');
+  }
+
+  async exit() { await this.control(CTRL_B); }
+}
+
+/**
+ * Write `source` to main.py on an attached micro:bit and restart it.
+ * `chunk` stays small because each write becomes one REPL line.
+ */
+export async function flashMicrobit(port, source, {
+  baud = 115200, chunk = 96, log = () => {}, name = 'main.py',
+} = {}) {
+  const bytes = new TextEncoder().encode(source);
+  await port.open({ baudRate: baud });
+  const io = serialTransport(port, { timeout: 6000 });
+  try {
+    log('interrupting whatever is running…');
+    const repl = new RawRepl(io);
+    await repl.enter();
+
+    log(`writing ${name} (${bytes.length} bytes)…`);
+    await repl.exec(`fd = open(${JSON.stringify(name)}, 'wb')\nf = fd.write`);
+    for (let at = 0; at < bytes.length; at += chunk) {
+      await repl.exec(`f(${pythonBytes(bytes.subarray(at, at + chunk))})`);
+    }
+    await repl.exec('fd.close()');
+
+    // Read it back. A REPL that swallowed a chunk looks exactly like one that
+    // did not, right up until the board runs the wrong program.
+    log('verifying…');
+    const size = (await repl.exec(
+      `import os\nprint(os.size(${JSON.stringify(name)}))`)).trim();
+    if (parseInt(size, 10) !== bytes.length) {
+      throw new Error(`wrote ${bytes.length} bytes but the board has ${size}`);
+    }
+
+    await repl.exit();
+    log('restarting…');
+    await repl.control(CTRL_D);
+    log(`done: ${name}, ${bytes.length} bytes`);
+    return { bytes: bytes.length };
+  } finally {
+    await io.close();
+    try { await port.close(); } catch {}
+  }
+}

@@ -13,7 +13,8 @@
 //
 //   node scripts/test-flash.mjs
 //
-import { parseIntelHex, Stk500, flashAvr, STK } from '../docs/flash.js';
+import { parseIntelHex, Stk500, flashAvr, flashMicrobit, pythonBytes, STK }
+  from '../docs/flash.js';
 
 let passed = 0, failed = 0;
 const ok = (name, cond, detail = '') => {
@@ -243,6 +244,123 @@ catch (e) { verifyError = e; }
 ok('verify catches a board that did not store what it was sent',
    verifyError && /verify failed/.test(verifyError.message),
    verifyError ? verifyError.message.slice(0, 58) : 'no error raised!');
+
+// --- micro:bit: MicroPython's raw REPL as a file channel ------------------
+console.log('');
+
+/** A MicroPython raw REPL that actually reconstructs the file it is sent. */
+class FakeMicroPython {
+  constructor({ dropChunk = -1 } = {}) {
+    this.out = [];
+    this.buffer = '';
+    this.raw = false;
+    this.files = {};
+    this.open = null;
+    this.chunks = 0;
+    this.dropChunk = dropChunk;
+    this.resets = 0;
+  }
+
+  say(text) { for (const ch of text) this.out.push(ch.charCodeAt(0)); }
+
+  feed(bytes) {
+    for (const byte of bytes) {
+      if (byte === 0x03) { this.buffer = ''; this.say('\r\n>>> '); continue; }
+      if (byte === 0x01) { this.raw = true; this.buffer = '';
+                           this.say('raw REPL; CTRL-B to exit\r\n>'); continue; }
+      if (byte === 0x02) { this.raw = false; this.say('\r\n>>> '); continue; }
+      if (byte === 0x04) {
+        if (!this.raw) { this.resets++; this.say('\r\nMicroPython\r\n>>> '); continue; }
+        this.run(this.buffer);
+        this.buffer = '';
+        continue;
+      }
+      this.buffer += String.fromCharCode(byte);
+    }
+  }
+
+  run(code) {
+    this.say('OK');
+    let stdout = '';
+    try {
+      const opening = code.match(/^fd = open\("([^"]+)", 'wb'\)/);
+      if (opening) { this.open = opening[1]; this.files[this.open] = []; }
+      const write = code.match(/^f\((b'.*')\)$/s);
+      if (write) {
+        this.chunks++;
+        if (this.chunks !== this.dropChunk) {
+          this.files[this.open].push(...decodeBytes(write[1]));
+        }
+      }
+      const size = code.match(/print\(os\.size\("([^"]+)"\)\)/);
+      if (size) stdout = String((this.files[size[1]] || []).length) + '\r\n';
+      if (/^fd\.close\(\)$/.test(code)) this.open = null;
+    } catch (err) {
+      this.say(stdout + '\x04' + 'Error: ' + err.message + '\x04>');
+      return;
+    }
+    this.say(stdout + '\x04' + '\x04>');
+  }
+}
+
+/** Decode the b'...' literal the flasher builds, so the test is independent. */
+function decodeBytes(literal) {
+  const body = literal.slice(2, -1);
+  const out = [];
+  for (let i = 0; i < body.length; i++) {
+    if (body[i] !== '\\') { out.push(body.charCodeAt(i)); continue; }
+    const next = body[++i];
+    if (next === 'n') out.push(10);
+    else if (next === 'r') out.push(13);
+    else if (next === 't') out.push(9);
+    else if (next === 'x') { out.push(parseInt(body.substr(i + 1, 2), 16)); i += 2; }
+    else out.push(next.charCodeAt(0));
+  }
+  return out;
+}
+
+function microbitPort(mp) {
+  return {
+    async open() {}, async close() {},
+    get writable() { return { getWriter: () => ({
+      async write(b) { mp.feed(b); }, releaseLock() {} }) }; },
+    get readable() { return { getReader: () => ({
+      async read() {
+        for (let i = 0; i < 400 && !mp.out.length; i++) {
+          await new Promise(r => setTimeout(r, 2));
+        }
+        if (!mp.out.length) return { done: true };
+        return { value: Uint8Array.from(mp.out.splice(0, mp.out.length)), done: false };
+      },
+      async cancel() {}, releaseLock() {} }) }; },
+  };
+}
+
+ok('a bytes literal survives quotes, backslashes and newlines',
+   pythonBytes(new TextEncoder().encode("a'b\\c\nd\x00")) === "b'a\\'b\\\\c\\nd\\x00'",
+   pythonBytes(new TextEncoder().encode("a'b\\c\nd\x00")));
+
+const SOURCE = 'from microbit import *\n\n' +
+  "# quotes ' and a backslash \\ and a tab\there\n" +
+  Array.from({ length: 12 }, (_, i) => `display.show(${i})`).join('\n') + '\n';
+
+const mp = new FakeMicroPython();
+const written = await flashMicrobit(microbitPort(mp), SOURCE, { log: () => {} });
+const landed = new TextDecoder().decode(Uint8Array.from(mp.files['main.py'] || []));
+ok('main.py lands byte for byte', landed === SOURCE,
+   landed === SOURCE ? `${written.bytes} bytes in ${mp.chunks} chunks`
+                     : `got ${JSON.stringify(landed.slice(0, 40))}`);
+ok('the board was restarted afterwards', mp.resets === 1, `${mp.resets} reset(s)`);
+
+// A swallowed chunk must not pass, which is the entire reason for reading the
+// size back rather than trusting the writes.
+const lossy = new FakeMicroPython({ dropChunk: 2 });
+let replError = null;
+try { await flashMicrobit(microbitPort(lossy), SOURCE, { log: () => {} }); }
+catch (e) { replError = e; }
+ok('a dropped chunk is caught by the size read-back',
+   replError && /but the board has/.test(replError.message),
+   replError ? replError.message.slice(0, 56) : 'no error raised!');
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

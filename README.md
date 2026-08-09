@@ -166,8 +166,17 @@ loads" and "CPython starts in it and emits MicroPython" are different claims.
 | board | how | in the page? |
 |---|---|---|
 | ATmega328P / Uno / Nano | Web Serial → STK500v1 (the Arduino bootloader) | **yes** — *Flash* |
+| micro:bit | Web Serial → MicroPython's raw REPL, writing `main.py` | **yes** — *Flash* |
 | STC12 / STC15 | STC ISP over serial | not yet — `stcgal` |
-| micro:bit | copy the `.py`, or DAPLink | see below |
+
+A micro:bit has no serial bootloader, but once MicroPython is on it the raw
+REPL is a perfectly good file channel — which is what `microfs` and the
+official editors use, and far less machinery than splicing a script into a
+1.8 MB runtime hex. The trade is explicit: this writes `main.py` to a board
+that **already has MicroPython**; flash that once from
+[python.microbit.org](https://python.microbit.org) and it works from then on.
+It also means a micro:bit needs no compile step at all — *Flash* is enabled
+straight after *Transpile*.
 
 *Flash* pulses DTR to reset the board into its bootloader, then programs and
 verifies it page by page. Web Serial is Chromium-only and needs a secure
@@ -179,11 +188,12 @@ bootloader answers **only after a cold power-on** — a reset pulse will not do 
 so it needs a prompt-and-wait flow of its own. `stcgal` remains the way in.
 
 Flashing is the one step whose output cannot be checked by compiling it, so
-`scripts/test-flash.mjs` puts a simulated STK500v1 bootloader on the far end of
-the wire and asks whether its flash matches the image byte for byte. That is
-what catches word-vs-byte addressing, an off-by-one page boundary, or a
-checksum read as data — mistakes that all look identical from outside, as a
-board that does nothing.
+`scripts/test-flash.mjs` puts simulated devices on the far end of the wire: an
+STK500v1 bootloader that is asked whether its flash matches the image byte for
+byte, and a MicroPython raw REPL that reconstructs the file it was sent. That
+is what catches word-vs-byte addressing, an off-by-one page boundary, a
+checksum read as data, or a REPL chunk swallowed in transit — mistakes that all
+look identical from outside, as a board running the wrong thing.
 
 **Not verified against real hardware.** The protocol is exercised end to end
 against a simulator; no ATmega has been programmed by it.

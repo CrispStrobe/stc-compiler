@@ -125,7 +125,7 @@
 
 <script src="https://cdn.jsdelivr.net/pyodide/v314.0.3/full/pyodide.js"></script>
 <script type=module>
-import { flashAvr } from './flash.js';
+import { flashAvr, flashMicrobit } from './flash.js';
 const API = "https://stc-compiler.vercel.app";
 const $ = id => document.getElementById(id);
 let py = null, result = null, image = null;
@@ -376,7 +376,12 @@ $('hex').onclick = async () => {
 const CAN_SERIAL = 'serial' in navigator;
 
 function flashable() {
-  return CAN_SERIAL && image && result && result.toolchain === 'avr-gcc';
+  if (!CAN_SERIAL || !result || !result.ok) return false;
+  // An AVR needs the compiled image; a micro:bit does not need a compiler at
+  // all -- MicroPython's REPL takes the source straight.
+  if (result.toolchain === 'avr-gcc') return !!image;
+  if (result.toolchain === 'uflash') return true;
+  return false;
 }
 
 function refreshFlash() {
@@ -387,6 +392,10 @@ function refreshFlash() {
   } else if (result && result.toolchain === 'sdcc-mcs51') {
     $('flash').title = 'The STC bootloader answers only after a COLD power-on, '
                      + 'so it needs its own flow; use stcgal for now.';
+  } else if (result && result.toolchain === 'uflash') {
+    $('flash').title = 'Writes main.py over the REPL. The board needs '
+                     + 'MicroPython on it already — flash that once from '
+                     + 'python.microbit.org.';
   } else if (!image) {
     $('flash').title = 'Compile to .hex first — there is nothing to write yet.';
   } else {
@@ -408,9 +417,14 @@ $('flash').onclick = async () => {
   const log = (text) => { lines.push(text); $('out').textContent = lines.join('\n'); };
   try {
     setStatus('flashing…');
-    const hexText = new TextDecoder().decode(image.bytes);
-    const done = await flashAvr(port, hexText, { log });
-    setStatus(`flashed ${done.bytes} bytes and verified`, 'ok');
+    let done;
+    if (result.toolchain === 'uflash') {
+      done = await flashMicrobit(port, result.code, { log });
+      setStatus(`wrote main.py, ${done.bytes} bytes, and restarted`, 'ok');
+    } else {
+      done = await flashAvr(port, new TextDecoder().decode(image.bytes), { log });
+      setStatus(`flashed ${done.bytes} bytes and verified`, 'ok');
+    }
   } catch (err) {
     log('');
     log('failed: ' + err.message);
