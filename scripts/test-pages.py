@@ -12,7 +12,10 @@ JavaScript reimplementation. A stale copy would quietly undo that.
 
 import hashlib
 import pathlib
+import re
+import subprocess
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs"
@@ -52,6 +55,42 @@ if index.exists():
           "cdn.jsdelivr.net/pyodide/v" in page and "/latest/" not in page)
     check("the transpiler runs in the page, not on a server",
           "bw_transpile" in page and "loadPyodide" in page)
+    # Does the page's script actually parse?
+    #
+    # The Python that runs in Pyodide is embedded in a JavaScript template
+    # literal, so a single backtick anywhere in it — in a comment, in a
+    # docstring, quoting an identifier out of habit — ends the string and takes
+    # the whole module with it. The page then loads, renders, and does nothing
+    # at all, because no script ran.
+    #
+    # CI did catch that, via the browser job, as a 180-second waitForFunction
+    # timeout whose message was "Timeout 180000ms exceeded" and named no cause.
+    # `node --check` says "SyntaxError: Unexpected identifier 'device'" in about
+    # forty milliseconds. Same defect, and one of the two messages tells you
+    # what to fix.
+    module = re.search(r"<script type=module>(.*?)</script>", page, re.S)
+    check("the page has a module script at all", bool(module))
+    if module:
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as fh:
+            fh.write(module.group(1))
+            probe = fh.name
+        result = subprocess.run([node_exe := "node", "--check", probe],
+                                capture_output=True, text=True)
+        detail = ""
+        if result.returncode:
+            detail = next((l for l in result.stderr.splitlines()
+                           if "Error" in l), result.stderr.strip()[:120])
+        check("the page's JavaScript parses", result.returncode == 0, detail)
+        pathlib.Path(probe).unlink(missing_ok=True)
+
+        # There was a second check here, scanning the embedded Python for stray
+        # backticks. It went, because it could never fire: a "balanced" pair
+        # inside the Python is not balanced at all — the first one ends the
+        # template literal and everything after it is parsed as JavaScript, so
+        # the syntax check above already fails, and with a better message.
+        # Tested by injecting a pair rather than assumed. A check that cannot
+        # fail still reads as coverage in the pass count.
+
     check("compiling is delegated, and says where",
           "/compile" in page and "stc-compiler.vercel.app" in page)
     # Only the COMPILE is delegated. Transpiling happens here, once, and the

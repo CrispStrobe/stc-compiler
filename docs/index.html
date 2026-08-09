@@ -264,9 +264,14 @@ def bw_transpile(source):
             "hint": target.compile_hint,
             # The canonical device token and the clock, so the page can ask the
             # hosted compiler to build the C IT ALREADY HAS rather than sending
-            # the pseudocode back to be transpiled a second time. `device` above
-            # is the display name and will not round-trip ("Arduino Uno" is not
-            # "arduino-uno").
+            # the pseudocode back to be transpiled a second time.
+            #
+            # NO BACKTICKS ANYWHERE IN THIS PYTHON: it lives inside a JavaScript
+            # template literal, so one backtick ends the string and takes the
+            # whole page's script with it. Quoting "device" cost a broken deploy.
+            #
+            # The "device" key above is the display name and will not round-trip
+            # -- "Arduino Uno" is not "arduino-uno".
             "target": target.key,
             "clock": program.clock,
             "filename": (program.name or "main") + "." + target.source_extension,
