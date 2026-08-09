@@ -397,6 +397,11 @@ class Target:
     # an Arduino and nonsense for a micro:bit.
     compile_hint = ""
 
+    # Extension for the generated source when it is handed back as a file.
+    # Not always "c": Arduino core source wants .ino so the IDE opens it as a
+    # sketch, and a micro:bit target emits Python.
+    source_extension = "c"
+
     # The C type a millisecond count lives in, and its signed counterpart for
     # the scheduler's wraparound-safe deadline compare. 16 bits is right for a
     # Timer-0 counter we increment ourselves; a target whose clock is the
@@ -986,6 +991,7 @@ class ArduinoTarget(Target):
     toolchain = "arduino-cli"
     compile_hint = ("DEVICE ATMEGA328P: is the same board without the Arduino "
                     "core, and that one does compile here.")
+    source_extension = "ino"
 
     def __init__(self, key: str, display: str, digital_max: int, analog_max: int):
         self.key = key

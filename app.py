@@ -362,7 +362,8 @@ def build(req: CompileReq) -> dict:
                              + (f" {chip.compile_hint}" if chip.compile_hint else ""),
                     "c": generated_c,
                     "toolchain": chip.toolchain,
-                    "language": stc_pseudocode.source_language(program)}
+                    "language": stc_pseudocode.source_language(program),
+                    "filename": f"main.{chip.source_extension}"}
     elif req.language.lower() in ("keil", "c51"):
         stage_toolchain()      # SFR addresses come from the staged SDCC headers
         result = keil2sdcc.translate(req.code)
@@ -771,6 +772,22 @@ async def download(req: CompileReq):
     """
     result = build(req)
     if not result["success"]:
+        # A target that transpiles but cannot be built here is not a failure
+        # to report as one: the generated source IS the deliverable, and a
+        # micro:bit .py or an Arduino .ino is exactly what the caller wanted.
+        # Anything else -- a syntax error, an unknown target -- is still 400.
+        if result.get("c") and result.get("toolchain"):
+            name = result.get("filename", "main.txt")
+            return Response(
+                content=result["c"].encode("utf-8"),
+                media_type="text/x-python" if name.endswith(".py") else "text/plain",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{name}"',
+                    "X-Source-Only": result["toolchain"],
+                    "Access-Control-Expose-Headers":
+                        "Content-Disposition, X-Source-Only",
+                },
+            )
         return PlainTextResponse(result["error"], status_code=400)
     return Response(
         content=base64.b64decode(result["base64"]),
@@ -1157,11 +1174,17 @@ PAGE = r"""<!doctype html>
   </label>
   <label>target
     <select id=target>
-      <option value=stc12c5a60s2>STC12C5A60S2</option>
-      <option value=stc12c5a16s2>STC12C5A16S2</option>
-      <option value=stc89c52rc>STC89C52RC</option>
-      <option value=stc15f2k60s2>STC15F2K60S2</option>
-      <option value=mcs51>generic 8051</option>
+      <optgroup label="8051 (SDCC)">
+        <option value=stc12c5a60s2>STC12C5A60S2</option>
+        <option value=stc12c5a16s2>STC12C5A16S2</option>
+        <option value=stc89c52rc>STC89C52RC</option>
+        <option value=stc15f2k60s2>STC15F2K60S2</option>
+        <option value=mcs51>generic 8051</option>
+      </optgroup>
+      <optgroup label="AVR (avr-gcc)">
+        <option value=atmega328p>ATmega328P &mdash; Uno / Nano</option>
+        <option value=atmega168p>ATmega168P</option>
+      </optgroup>
     </select>
   </label>
   <label>FOSC <input id=fosc value=11059200 size=9></label>

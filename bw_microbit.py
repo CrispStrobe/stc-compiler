@@ -70,6 +70,7 @@ class MicrobitTarget(sp.Target):
     # pins; both are 8051 shapes with no micro:bit equivalent, and `require()`
     # refuses them by name rather than emitting something that looks close.
     supports = frozenset({"pwm", "tone", "print", "table"})
+    source_extension = "py"
     compile_hint = ("MicroPython is interpreted on the device, so there is "
                     "nothing to compile: flash the .py with uflash, or paste "
                     "it into python.microbit.org.")
