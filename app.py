@@ -1218,7 +1218,7 @@ async def health():
         # Vercel injects the commit it built from. Useful on its own, and the
         # only way to tell a stale deployment from a current one when the
         # daily deploy cap has kept a fix from shipping.
-        "version": os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7] or None,
+        "version": os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7] or "unknown",
         "sdcc": version.strip().splitlines()[0] if version else "",
         "avr_gcc": avr_version.strip().splitlines()[0] if avr_version else None,
         "targets": {name: cfg["description"] for name, cfg in TARGETS.items()},
