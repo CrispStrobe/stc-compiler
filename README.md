@@ -440,6 +440,18 @@ does change is the width of it: `millis()` is 32-bit, so the deadlines and the
 wraparound compare widen with it, and that type comes from the target rather
 than from the AST walker.
 
+The two boards differ in exactly one place, and it is a trap rather than a
+detail: **the Nano has `A6` and `A7`, and they are analog inputs only.** The
+Nano carries the ATmega328P in a TQFP package, which brings those two ADC
+channels out to pads with no digital I/O buffer behind them — so
+`digitalWrite(A6, HIGH)` compiles, uploads, runs, and does nothing at all,
+silently. Declaring one as an `OUTPUT` or `INPUT` is therefore refused here,
+naming the package; `A6 ANALOG` is accepted, because that is the one thing
+the pin can do. On the Uno the same two names are refused for an unrelated
+reason — the DIP package does not bring them out at all — and the two
+messages are deliberately different, because one sends you to the package
+and the other to the schematic.
+
 **Core C++ transpiles here; it does not compile here.** SDCC cannot build it
 and `arduino-cli` plus the AVR core is ~250 MB against Vercel's 250 MB
 function limit. `POST /compile` with an Arduino `DEVICE` is refused, naming
