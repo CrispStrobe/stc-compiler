@@ -136,6 +136,12 @@ class SetPin(Stmt):
 
 
 @dataclass
+class SetPart(Stmt):
+    part: str
+    value: Expr
+
+
+@dataclass
 class SetPort(Stmt):
     port: str
     value: Expr
@@ -275,6 +281,35 @@ class Port:
     @property
     def sfr(self) -> str:
         return f"P{self.port}"
+
+
+@dataclass
+class ShiftPart:
+    """A 74HC595: eight outputs for three pins.
+
+    Modelled as a PORT that costs three pins instead of eight, so it takes the
+    same `set ... to ...` and the same polarity. A user who has run out of pins
+    should not have to learn a second vocabulary to say the same thing.
+
+    Admitted to the parts library because its correctness depends on the ORDER
+    of edges and not their duration -- the part is specified into the tens of
+    megahertz and has no minimum clock period an 8051 could violate. See
+    docs/PARTS-MODEL.md.
+    """
+    name: str
+    kind: str                   # "74hc595"
+    data: tuple                 # (port, bit)
+    clock: tuple
+    latch: tuple
+    active_low: bool = False
+
+    def sfr(self, which) -> str:
+        port, bit = getattr(self, which)
+        return f"P{port}_{bit}"
+
+    @property
+    def claimed(self) -> list:
+        return [self.data, self.clock, self.latch]
 
 
 @dataclass
@@ -425,6 +460,10 @@ class Stc8051Target(Target):
                           f"({other.direction.upper()}); one pin cannot be two things")
         # And the other way round: a PORT writes all eight bits at once, so a
         # PIN inside it would be clobbered by every port write.
+        for prev in program.parts.values():
+            if (port, bit) in prev.claimed:
+                raise PseudocodeError(
+                    line, f"P{port}.{bit} is claimed by the part {prev.name!r}")
         for whole in program.ports.values():
             if whole.port == port:
                 raise PseudocodeError(
@@ -572,6 +611,34 @@ class Stc8051Target(Target):
                 "    while (!(ADC_CONTR & 0x10)) ;                 /* wait for ADC_FLAG */",
                 "    ADC_CONTR &= ~0x10;                           /* clear it by hand */",
                 "    return ((unsigned int)ADC_RES << 2) | (ADC_RESL & 0x03);",
+                "}",
+                "",
+            ]
+        for part in program.parts.values():
+            out += [
+                f"/* {part.name}: a 74HC595, eight outputs for three pins.",
+                " *",
+                " * Admitted to the parts library because its correctness depends on the",
+                " * ORDER of the edges and not on their duration: the part is specified",
+                " * into the tens of megahertz and has no minimum clock period an 8051",
+                " * could violate, so there is no delay here to get wrong. Data is sampled",
+                " * on the rising edge of the shift clock, and the latch transfers on its",
+                " * own rising edge. docs/PARTS-MODEL.md.",
+                " *",
+                " * MSB first, so the byte reads left to right on the outputs. */",
+                f"static void bw_part_{part.name}(unsigned char value)",
+                "{",
+                "    unsigned char i;",
+                f"    {part.sfr('clock')} = 0;",
+                f"    {part.sfr('latch')} = 0;",
+                "    for (i = 0; i < 8; i++) {",
+                f"        {part.sfr('data')} = (value & 0x80) ? 1 : 0;",
+                "        value = (unsigned char)(value << 1);",
+                f"        {part.sfr('clock')} = 1;",
+                f"        {part.sfr('clock')} = 0;",
+                "    }",
+                f"    {part.sfr('latch')} = 1;      /* transfer to the outputs */",
+                f"    {part.sfr('latch')} = 0;",
                 "}",
                 "",
             ]
@@ -732,6 +799,9 @@ class Stc8051Target(Target):
         for port in program.ports.values():
             if port.direction == "output":
                 outputs[port.port] = outputs.get(port.port, 0) | 0xFF
+        for part in program.parts.values():
+            for where in part.claimed:
+                outputs[where[0]] = outputs.get(where[0], 0) | (1 << where[1])
         if self.port_modes:
             for port in sorted(outputs):
                 mask = outputs[port]
@@ -837,6 +907,7 @@ class Program:
     pins: dict = field(default_factory=dict)
     variables: list = field(default_factory=list)
     procedures: dict = field(default_factory=dict)
+    parts: dict = field(default_factory=dict)    # name -> ShiftPart
     tables: dict = field(default_factory=dict)   # name -> list[int], in flash
     ports: dict = field(default_factory=dict)    # name -> Port, whole-byte I/O
     # One entry per `WHEN started:` block. `body` mirrors whens[0] so older
@@ -1115,6 +1186,9 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
         return SetPin(output_pin(level.group(1)), high=(level.group(2) == "high"))
 
     into = re.match(r"set\s+(\w+)\s+to\s+(.+)$", text.strip(), re.I)
+    if into and into.group(1).lower() in program.parts:
+        return SetPart(into.group(1).lower(),
+                       expression(into.group(2), program, line))
     if into and into.group(1).lower() in program.ports:
         port = program.ports[into.group(1).lower()]
         if port.direction != "output":
@@ -1233,6 +1307,9 @@ DEFINE_RE = re.compile(r"define\s+(?:fast\s+)?([A-Za-z_]\w*)\s*(.*?):\s*$", re.I
 WHEN_RE = re.compile(r"when\s+(started|flag\s+clicked|powered\s+on)\s*:", re.I)
 PIN_RE = re.compile(r"pin\s+(\w+)\s*=\s*(\S+)\s+(output|input|analog|pwm|tone)"
                     r"(?:\s+active\s+(low|high))?", re.I)
+PART_RE = re.compile(r"part\s+(\w+)\s*=\s*74hc595\s+data\s+P([0-4])\.([0-7])\s+"
+                     r"clock\s+P([0-4])\.([0-7])\s+latch\s+P([0-4])\.([0-7])"
+                     r"(?:\s+active\s+(low|high))?", re.I)
 PORT_DECL_RE = re.compile(r"port\s+(\w+)\s*=\s*P([0-4])\s+(output|input)"
                           r"(?:\s+active\s+(low|high))?", re.I)
 TABLE_RE = re.compile(r"table\s+(\w+)\s*=\s*(.+)$", re.I)
@@ -1277,6 +1354,37 @@ def parse(source: str) -> Program:
         if clock and not started:
             value = int(clock.group(1).replace("_", ""))
             program.clock = value * 1_000_000 if clock.group(2) == "mhz" else value
+            index += 1
+            continue
+
+        part = PART_RE.fullmatch(lowered)
+        if part and not started:
+            (name, dp, db, cp, cb, lp, lb, active) = part.groups()
+            if name in program.parts or name in program.ports or name in program.pins:
+                raise PseudocodeError(line.number, f"{name!r} declared twice")
+            claims = [(int(dp), int(db)), (int(cp), int(cb)), (int(lp), int(lb))]
+            if len(set(claims)) != 3:
+                raise PseudocodeError(
+                    line.number, f"{name!r} names the same pin twice; data, clock and "
+                                 f"latch must be three different pins")
+            for where in claims:
+                for other in program.pins.values():
+                    if (getattr(other, "port", None), getattr(other, "bit", None)) == where:
+                        raise PseudocodeError(
+                            line.number, f"P{where[0]}.{where[1]} is already declared as "
+                                         f"{other.name!r}; a PART claims its pins")
+                for whole in program.ports.values():
+                    if whole.port == where[0]:
+                        raise PseudocodeError(
+                            line.number, f"P{where[0]}.{where[1]} is inside the whole port "
+                                         f"{whole.name!r}, which would clobber it")
+                for prev in program.parts.values():
+                    if where in prev.claimed:
+                        raise PseudocodeError(
+                            line.number, f"P{where[0]}.{where[1]} is already claimed by "
+                                         f"{prev.name!r}")
+            program.parts[name] = ShiftPart(name, "74hc595", claims[0], claims[1],
+                                            claims[2], active == "low")
             index += 1
             continue
 
@@ -1430,7 +1538,9 @@ def stmts_pseudo(body: list, depth: int, active_low: dict) -> list[str]:
     pad = "  " * depth
     out = []
     for node in body:
-        if isinstance(node, SetPort):
+        if isinstance(node, SetPart):
+            out.append(f"{pad}set {node.part} to {expr_pseudo(node.value)}")
+        elif isinstance(node, SetPort):
             out.append(f"{pad}set {node.port} to {expr_pseudo(node.value)}")
         elif isinstance(node, Print):
             out.append(f'{pad}print "{node.text}"' if node.value is None
@@ -1498,6 +1608,13 @@ def emit_pseudocode(program: Program) -> str:
         out.append("")
         for name, values in program.tables.items():
             out.append(f"  TABLE {name} = " + ", ".join(f"0x{v:02X}" for v in values))
+    if program.parts:
+        out.append("")
+        for part in program.parts.values():
+            polarity = " ACTIVE LOW" if part.active_low else ""
+            d, c, l = part.data, part.clock, part.latch
+            out.append(f"  PART {part.name} = 74HC595 DATA P{d[0]}.{d[1]} "
+                       f"CLOCK P{c[0]}.{c[1]} LATCH P{l[0]}.{l[1]}{polarity}")
     if program.ports:
         out.append("")
         for port in program.ports.values():
@@ -1598,6 +1715,13 @@ def stmts_c(body: list, depth: int, ctx: Emit) -> list[str]:
             rendered = Print(text=node.text,
                              value=None if node.value is None else expr_c(node.value, ctx))
             out.append(pad + ctx.target.write_print(rendered))
+        elif isinstance(node, SetPart):
+            part = ctx.program.parts[node.part]
+            value = expr_c(node.value, ctx)
+            if part.active_low:
+                out.append(f"{pad}bw_part_{part.name}((unsigned char)~({value}));")
+            else:
+                out.append(f"{pad}bw_part_{part.name}((unsigned char)({value}));")
         elif isinstance(node, SetPort):
             port = ctx.program.ports[node.port]
             value = expr_c(node.value, ctx)
@@ -1693,6 +1817,13 @@ def stmts_task(body: list, depth: int, ctx: Emit,
             rendered = Print(text=node.text,
                              value=None if node.value is None else expr_c(node.value, ctx))
             out.append(pad + ctx.target.write_print(rendered))
+        elif isinstance(node, SetPart):
+            part = ctx.program.parts[node.part]
+            value = expr_c(node.value, ctx)
+            if part.active_low:
+                out.append(f"{pad}bw_part_{part.name}((unsigned char)~({value}));")
+            else:
+                out.append(f"{pad}bw_part_{part.name}((unsigned char)({value}));")
         elif isinstance(node, SetPort):
             port = ctx.program.ports[node.port]
             value = expr_c(node.value, ctx)

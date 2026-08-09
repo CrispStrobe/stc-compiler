@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test-tables-ports — whole-port I/O and lookup tables.
+test-tables-ports — whole-port I/O, lookup tables, and the parts library.
 
 These are the two features `stc12c5a60s2-lab/docs/DIALECT-COVERAGE.md` measured
 as blocking five of sixteen demos in an outside corpus, and nothing else. The
@@ -119,6 +119,61 @@ def test_ports():
             "cannot be written", "writing an input port")
 
 
+def test_parts():
+    """A 74HC595 -- the one corpus part whose timing cannot be got wrong.
+
+    PARTS-MODEL.md admits a driver when correctness depends on the ORDER of
+    edges rather than their duration. This part is specified into the tens of
+    megahertz, so there is no delay to get wrong; the demo's NOP()s are
+    conservative padding, not a requirement. That is why it can be written
+    correctly without a bench, and why 1-Wire cannot.
+    """
+    print("74HC595: eight outputs for three pins")
+    src = (HEAD + "  TABLE font = 0x3F, 0x06, 0x5B\n"
+           "  PART display = 74HC595 DATA P3.4 CLOCK P3.6 LATCH P3.5 ACTIVE LOW\n"
+           "  WHEN started:\n    set d to 0\n    FOREVER:\n"
+           "      set display to font[d]\n      wait 500 ms\n")
+    prog = ps.parse(src)
+    c = ps.emit_c(prog)
+    ok("bw_part_display((unsigned char)~(bw_tab_font[bw_clamp(d, 2)]));" in c,
+       "a PART takes the same `set ... to ...` a PORT takes, polarity included")
+    ok("P3_4 = (value & 0x80) ? 1 : 0;" in c, "MSB first, so the byte reads left to right")
+    ok(c.index("P3_6 = 1;") < c.index("P3_5 = 1;"),
+       "all eight bits are shifted before the latch transfers them")
+    ok("P3M0 |=  0x70;" in c, "its three pins are outputs: P3.4, P3.5, P3.6")
+    # No delay anywhere in the driver: that is the admission criterion, not an
+    # oversight, so assert it rather than leaving it to be "fixed" later.
+    driver = c[c.index("bw_part_display(unsigned char"):]
+    driver = driver[:driver.index("\n}")]
+    ok("delay" not in driver and "NOP" not in driver and "_nop_" not in driver,
+       "and the driver contains NO delay -- order-dependent, not duration-dependent")
+
+    once = ps.emit_pseudocode(prog)
+    ok(ps.emit_pseudocode(ps.parse(once)) == once, "round trip is stable")
+    ok("PART display = 74HC595 DATA P3.4 CLOCK P3.6 LATCH P3.5 ACTIVE LOW" in once,
+       "the declaration comes back verbatim")
+
+    print("  and its pins are claimed")
+    rejects(HEAD + "  PART x = 74HC595 DATA P3.4 CLOCK P3.6 LATCH P3.5\n"
+                   "  PIN a = P3.4 OUTPUT\n  WHEN started:\n    set x to 1\n",
+            "claimed by the part", "a PIN on a pin the part claimed")
+    rejects(HEAD + "  PIN a = P3.4 OUTPUT\n"
+                   "  PART x = 74HC595 DATA P3.4 CLOCK P3.6 LATCH P3.5\n"
+                   "  WHEN started:\n    set x to 1\n",
+            "a PART claims its pins", "a PART over an already declared pin")
+    rejects(HEAD + "  PART x = 74HC595 DATA P3.4 CLOCK P3.4 LATCH P3.5\n"
+                   "  WHEN started:\n    set x to 1\n",
+            "same pin twice", "data and clock on one pin")
+    rejects(HEAD + "  PORT p = P3 OUTPUT\n"
+                   "  PART x = 74HC595 DATA P3.4 CLOCK P3.6 LATCH P3.5\n"
+                   "  WHEN started:\n    set x to 1\n",
+            "inside the whole port", "a PART inside a declared PORT")
+    rejects(HEAD + "  PART x = 74HC595 DATA P3.4 CLOCK P3.6 LATCH P3.5\n"
+                   "  PART y = 74HC595 DATA P3.4 CLOCK P3.7 LATCH P3.3\n"
+                   "  WHEN started:\n    set x to 1\n",
+            "already claimed", "two parts sharing a pin")
+
+
 def test_literals():
     print("number bases, because a font written in decimal is a font written wrong")
     prog = ps.parse(HEAD + "  TABLE t = 0b00111111, 0x3F, 63\n  WHEN started:\n    print 1\n")
@@ -158,6 +213,7 @@ def main() -> int:
     test_the_demo()
     test_indexing()
     test_ports()
+    test_parts()
     test_literals()
     test_compiles()
     print(f"\n{checks} checks, {failures} failures")
