@@ -378,6 +378,14 @@ class Target:
     # first time somebody wrote `set led to 50 percent` for an Arduino.
     supports: frozenset = frozenset()
 
+    # Whether the serial baud rate comes from somewhere OTHER than the timer a
+    # TONE pin needs. It is an 8051 contention: on the STC89 the baud rate is
+    # Timer 1 and so is the tone, in different modes, so a program cannot both
+    # print and sound a note. The STC12 has a dedicated baud-rate timer and is
+    # fine. Any target whose console and tone do not share one timer -- which
+    # is every non-8051 one -- leaves this True and the check passes.
+    baud_from_brt = True
+
     # Which compiler turns this target's output into an image. Transpiling is
     # free; compiling is not, and the hosted service vendors SDCC only. Saying
     # so here lets the caller refuse clearly instead of handing Arduino C++ to

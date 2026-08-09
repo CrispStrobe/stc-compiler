@@ -32,6 +32,10 @@ jobs:
       # it says, and that ACTIVE LOW reaches the pin inverted.
       - name: micro:bit — run the generated MicroPython
         run: python3 ./scripts/test-microbit.py
+      - name: Peripherals (PWM, tone, print)
+        run: python3 ./scripts/test-peripherals.py
+      - name: Tables and whole-port I/O
+        run: python3 ./scripts/test-tables-ports.py
 
   # The real verification: build the vendored AVR toolchain from Debian and
   # prove it compiles, links and emits an image using ONLY those binaries.

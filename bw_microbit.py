@@ -64,6 +64,12 @@ class MicrobitTarget(sp.Target):
     key = "microbit"
     display = "BBC micro:bit"
     toolchain = "uflash"
+
+    # PORT and PART are not here on purpose. A PORT is eight bits of one
+    # register written at once, and a PART is a 74HC595 wired to P0.0-style
+    # pins; both are 8051 shapes with no micro:bit equivalent, and `require()`
+    # refuses them by name rather than emitting something that looks close.
+    supports = frozenset({"pwm", "tone", "print", "table"})
     compile_hint = ("MicroPython is interpreted on the device, so there is "
                     "nothing to compile: flash the .py with uflash, or paste "
                     "it into python.microbit.org.")
@@ -89,6 +95,10 @@ class MicrobitTarget(sp.Target):
         if number > 20:
             raise sp.PseudocodeError(
                 line, f"the {self.display} has P0-P20, not P{number}")
+        # PWM and tone need no special pin here: write_analog works on any
+        # digital pin, and music.pitch takes the pin as an argument. That is a
+        # real difference from the STC12, where PWM exists only on the PCA
+        # pins and there is exactly one tone because there is one Timer 1.
         if direction == "analog" and number not in ANALOG_PINS:
             raise sp.PseudocodeError(
                 line, f"P{number} has no ADC on the {self.display}; "
@@ -117,6 +127,16 @@ class MicrobitTarget(sp.Target):
     def read_analog(self, pin):
         return f"{pin.obj}.read_analog()"
 
+    def write_pwm(self, pin, value: str) -> str:
+        # write_analog takes 0-1023 as the proportion of time the PIN is high,
+        # while the AST stores the percentage of time the LOAD is on. They are
+        # the same number only on an active-high pin.
+        # The outer parentheses are load-bearing: `100 - x * 1023 // 100`
+        # binds as `100 - ((x * 1023) // 100)`, which is a different and
+        # entirely plausible-looking brightness.
+        duty = f"(100 - ({value}))" if pin.active_low else f"({value})"
+        return f"{pin.obj}.write_analog({duty} * 1023 // 100)"
+
     def delay(self, ms):
         return f"sleep({ms})"
 
@@ -131,6 +151,7 @@ class MicrobitTarget(sp.Target):
         # so every function that touches them needs a `global`.
         globals_ = list(program.variables)
 
+        tone_pins = [p for p in program.pins.values() if p.direction == "tone"]
         out = [
             "# Generated from BrickWright pseudocode by stc-compiler.",
             "# Hand edits will be lost; change the pseudocode instead.",
@@ -138,8 +159,19 @@ class MicrobitTarget(sp.Target):
             "# MicroPython for the BBC micro:bit. Nothing to compile: flash it",
             "# with uflash, or paste it into python.microbit.org.",
             "from microbit import *",
-            "",
         ]
+        if tone_pins:
+            out.append("import music")
+        out.append("")
+
+        if program.tables:
+            out += ["# Lookup tables. Tuples rather than lists: they are",
+                    "# constant, and MicroPython keeps a tuple in flash rather",
+                    "# than building it in RAM at import time."]
+            for name, values in program.tables.items():
+                packed = ", ".join(f"0x{v:02X}" for v in values)
+                out.append(f"{name} = ({packed},)")
+            out.append("")
 
         toggled = sorted({node.pin for node in _walk(program)
                           if isinstance(node, sp.Toggle)})
@@ -237,6 +269,24 @@ class MicrobitTarget(sp.Target):
             elif isinstance(node, sp.Toggle):
                 out += [pad + line for line
                         in self.toggle_pin(pins[node.pin]).split("\n")]
+            elif isinstance(node, sp.SetPwm):
+                out.append(pad + self.write_pwm(pins[node.pin],
+                                                self._expr(node.value, pins)))
+            elif isinstance(node, sp.SetTone):
+                # music.pitch plays until stopped when duration is -1 and
+                # wait is False. 0 Hz means silence, and since the frequency
+                # is an expression the choice has to be made at run time.
+                obj = pins[node.pin].obj
+                out += [f"{pad}_hz = {self._expr(node.hz, pins)}",
+                        f"{pad}if _hz:",
+                        f"{pad}    music.pitch(_hz, -1, {obj}, False)",
+                        f"{pad}else:",
+                        f"{pad}    music.stop({obj})"]
+            elif isinstance(node, sp.Print):
+                if node.value is None:
+                    out.append(f"{pad}print({node.text!r})")
+                else:
+                    out.append(f"{pad}print({self._expr(node.value, pins)})")
             elif isinstance(node, sp.Wait):
                 ms = self._ms(node, pins)
                 if tasks:
@@ -315,6 +365,8 @@ class MicrobitTarget(sp.Target):
             pin = pins[node.name]
             return (self.read_analog(pin) if pin.direction == "analog"
                     else self.read_pin(pin))
+        if isinstance(node, sp.Index):
+            return f"{node.table}[{self._expr(node.where, pins)}]"
         if isinstance(node, sp.Unary):
             inner = self._expr(node.operand, pins, sp.UNARY_LEVEL)
             return f"not ({inner})" if node.op == "not" else f"-({inner})"

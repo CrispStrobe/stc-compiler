@@ -73,6 +73,9 @@ def make_microbit(budget=40000, button_after=200):
         def write_digital(self, value):
             log.append(("write", self.number, int(value), state["clock"]))
 
+        def write_analog(self, value):
+            log.append(("analog", self.number, int(value)))
+
         def read_digital(self):
             return 0
 
@@ -87,6 +90,12 @@ def make_microbit(budget=40000, button_after=200):
             # Not pressed at first, so `wait until` genuinely has to yield
             # before it can proceed.
             return state["clock"] > button_after
+
+    music = types.ModuleType("music")
+    music.pitch = lambda hz, duration=-1, pin=None, wait=True: log.append(
+        ("pitch", hz, getattr(pin, "number", None)))
+    music.stop = lambda pin=None: log.append(("silence", getattr(pin, "number", None)))
+    sys.modules["music"] = music
 
     module = types.ModuleType("microbit")
     for n in range(21):
@@ -110,6 +119,7 @@ def run(source, **kw):
         pass
     finally:
         sys.modules.pop("microbit", None)
+        sys.modules.pop("music", None)
     return log, state
 
 
@@ -218,6 +228,49 @@ log, _ = run(code)
 check("...and does it before driving the pin",
       log and log[0][0] == "display_off", str(log[:1]))
 
+# --- PWM, tone, print and tables -------------------------------------------
+print()
+PERIPHERALS = """DEVICE MICROBIT:
+  TABLE font = 0x00, 0x40, 0x64
+  PIN buzz = P0 TONE
+  PIN lamp = P1 PWM ACTIVE LOW
+  WHEN started:
+    print "ready"
+    set i to 2
+    set lamp to font[i] percent
+    set buzz to 440 hz
+    wait 10 ms
+    set buzz to 0 hz
+"""
+code = sp.emit(sp.parse(PERIPHERALS))
+try:
+    compile(code, "<generated>", "exec")
+    check("peripherals: parses as Python", True)
+except SyntaxError as exc:
+    check("peripherals: parses as Python", False, str(exc))
+
+import io
+import contextlib
+buffer = io.StringIO()
+with contextlib.redirect_stdout(buffer):
+    log, _ = run(code)
+printed = buffer.getvalue().split()
+
+check("print reaches the console", "ready" in printed, str(printed))
+
+analog = [entry for entry in log if entry[0] == "analog"]
+# font[2] is 0x64 = 100, on an ACTIVE LOW load: the pin is high 0% of the time.
+check("PWM duty inverts for an active-low load", analog == [("analog", 1, 0)],
+      str(analog))
+
+pitches = [entry for entry in log if entry[0] == "pitch"]
+silences = [entry for entry in log if entry[0] == "silence"]
+check("tone plays on its pin", pitches == [("pitch", 440, 0)], str(pitches))
+check("0 Hz silences rather than playing 0", silences == [("silence", 0)],
+      str(silences))
+check("a table is indexed, not inlined", "font[i]" in code)
+check("tables are tuples, not lists", "font = (0x00, 0x40, 0x64,)" in code)
+
 # --- errors the target must refuse -----------------------------------------
 print()
 for decl, why in [
@@ -225,6 +278,7 @@ for decl, why in [
     ("PIN x = P5 ANALOG", "P5 has no ADC"),
     ("PIN x = BUTTON_A OUTPUT", "a button cannot be an output"),
     ("PIN x = D13 OUTPUT", "Arduino spelling on a micro:bit"),
+    ("PORT d = P0 OUTPUT", "a whole-port PORT has no micro:bit equivalent"),
 ]:
     source = f"DEVICE MICROBIT:\n  {decl}\n  WHEN started:\n    wait 1 ms\n"
     try:
