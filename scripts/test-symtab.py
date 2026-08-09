@@ -234,6 +234,31 @@ def main() -> int:
             except stc_symtab.SymbolTableError as exc:
                 ok("disagrees with the case labels" in str(exc), f"refused: {label}")
 
+        print("variables: the user's own names, located by the linker")
+        # generateC emits `@bw var <c> "<original>"`; the C name is mangled and
+        # the original is the only one a front end should show. This repo's own
+        # emitter writes no such header, so the fixture supplies one -- what is
+        # under test is the join and the unlocated case, not the other emitter.
+        var_header = (
+            "/* @bw-begin\n"
+            ' * @bw var bw_ms "ticks"\n'
+            ' * @bw var nosuchsymbol "ghost"\n'
+            " * @bw-end */\n"
+        )
+        with_vars = stc_symtab.build_symbol_table(
+            cdb_text, c_text + var_header, fosc=11059200, device="stc12c5a60s2")
+        vars_out = {v["name"]: v for v in with_vars.get("variables", [])}
+        ok("ticks" in vars_out, "a declared variable appears under its ORIGINAL name")
+        if "ticks" in vars_out:
+            ok(vars_out["ticks"]["c"] == "bw_ms", "and keeps the C name it was found by")
+            ok(vars_out["ticks"]["space"] == "iram" and vars_out["ticks"]["size"] == 2,
+               f"located: {vars_out['ticks']}")
+        # A variable the linker dropped must be REPORTED, not silently omitted:
+        # a front end that just leaves it out has the user hunting for it.
+        ok("ghost" in vars_out and "unlocated" in vars_out.get("ghost", {}),
+           "a variable with no address says so rather than vanishing")
+        ok("variables" not in table, "and no section at all when the C declares none")
+
         print("the single-task case refuses rather than emitting an empty table")
         c2, cdb2, _ = build(SINGLE_TASK, workdir / "single" if False else workdir)
         try:

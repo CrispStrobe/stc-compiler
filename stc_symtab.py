@@ -91,6 +91,12 @@ CASE_RE = re.compile(r"^\s*case\s+(\d+)\s*:")
 # header lives in.
 YIELD_RE = re.compile(r"@bw\s+yield\s+(\w+)\s+(\d+)\s+(\S+)\s+(\S+)\s*$")
 
+# `@bw var <c name> "<original name>" [sprite "<sprite>"]`. The C name is
+# mangled and the original is what the user typed, so only the emitter can
+# relate them -- and the ORIGINAL is the only one a front end should ever show.
+VAR_RE = re.compile(r'@bw\s+var\s+(\w+)\s+"((?:[^"\\]|\\.)*)"'
+                    r'(?:\s+sprite\s+"((?:[^"\\]|\\.)*)")?')
+
 
 class SymbolTableError(Exception):
     pass
@@ -221,6 +227,30 @@ def scan_yield_map(source: str) -> dict[str, dict[int, str]]:
     return out
 
 
+def scan_variables(source: str) -> list[dict]:
+    """The project's own variables, out of the `@bw` header.
+
+    A debugger for this toolchain should be able to show `counter`, not
+    `_counter` and certainly not "the int at IRAM 0x0A". The C name is mangled
+    (`cName`) and not reversible, so the emitter states the pair and this
+    carries it through to whoever renders it.
+
+    Returns [] for C with no header, which is not an error.
+    """
+    header = re.search(r"@bw-begin(.*?)@bw-end", source, re.S)
+    if not header:
+        return []
+    out = []
+    for line in header.group(1).splitlines():
+        m = VAR_RE.search(line)
+        if m:
+            entry = {"c": m.group(1), "name": m.group(2)}
+            if m.group(3):
+                entry["sprite"] = m.group(3)
+            out.append(entry)
+    return out
+
+
 def _label_for(lines: list[str], lineno: int, task: str, state: int) -> str:
     """A human-readable name for a yield point. Advisory only.
 
@@ -328,7 +358,21 @@ def build_symbol_table(cdb_text: str, c_source: str, *, fosc: int,
             "yields": yields,
         })
 
-    return {
+    # Variables, when the C says which are the user's. Every one is a 16-bit
+    # int (generateC emits `static int`), so `size` is not guessed. A variable
+    # the linker optimised away is REPORTED as unlocated rather than dropped:
+    # a front end that simply omits it leaves the user wondering where their
+    # variable went.
+    variables = []
+    for entry in scan_variables(c_source):
+        try:
+            located = cdb.location(entry["c"], 2)
+        except SymbolTableError as exc:
+            variables.append({**entry, "unlocated": str(exc)})
+        else:
+            variables.append({**entry, **located})
+
+    table = {
         "fosc": fosc,
         "device": device,
         "scheduler": {
@@ -336,6 +380,9 @@ def build_symbol_table(cdb_text: str, c_source: str, *, fosc: int,
             "tasks": out_tasks,
         },
     }
+    if variables:
+        table["variables"] = variables
+    return table
 
 
 # ------------------------------------------------------------------------ CLI
