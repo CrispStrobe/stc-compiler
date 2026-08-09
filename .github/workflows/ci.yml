@@ -1,0 +1,137 @@
+name: ci
+
+# The AVR bundle is Linux x86_64. It is built on whatever machine a developer
+# happens to use -- often macOS, where the binaries cannot be executed at all --
+# so "the script ran and produced 45 MB" is not evidence that any of it works.
+# This is where that gets checked, on a runner that can actually run them.
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # No toolchain needed: the emitter and the front end are pure Python.
+  suites:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Golden files (what the emitter emits, byte for byte)
+        run: ./scripts/test-golden.py
+      - name: Round-trip transparency
+        run: ./scripts/test-roundtrip.py
+      - name: Debug symbol table
+        run: ./scripts/test-symtab.py
+
+  # The real verification: build the vendored AVR toolchain from Debian and
+  # prove it compiles, links and emits an image using ONLY those binaries.
+  avr-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the vendored bundle
+        run: ./scripts/fetch-avr-gcc.sh
+
+      - name: Verify it runs, compiles and links
+        run: ./scripts/verify-avr.sh
+
+      - name: Generated code builds with the vendored toolchain, warning-free
+        run: |
+          set -euo pipefail
+          AVR="$PWD/avr"
+          VERSION="$(cat "$AVR/GCC_VERSION")"
+          FLAGS="-B$AVR/lib/gcc/avr/$VERSION/ -B$AVR/lib/avr/lib/ -isystem$AVR/lib/avr/include"
+          fail=0
+          for f in scripts/golden/avr.c scripts/golden/avr-scripts.c; do
+            echo "== $f"
+            # -Werror is the point: generated code that needs a warning
+            # suppressed at the call site is generated code with a defect.
+            if "$AVR/bin/avr-gcc" -mmcu=atmega328p -Os -std=c99 \
+                 -Wall -Wextra -Werror -Wno-implicit-fallthrough \
+                 $FLAGS -o /tmp/g.elf "$f"; then
+              "$AVR/bin/avr-size" --mcu=atmega328p --format=avr /tmp/g.elf \
+                | grep -E "Program|Data" | sed 's/^/    /'
+            else
+              echo "    FAILED"; fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Bundle size and GLIBC floor
+        run: |
+          du -sh avr
+          echo "cc1 needs at most:"
+          strings "avr/lib/gcc/avr/$(cat avr/GCC_VERSION)/cc1" \
+            | grep -oE 'GLIBC_2\.[0-9]+' | sort -V | tail -1
+          # Vercel runs Amazon Linux 2023 (glibc 2.34). Anything above that
+          # will not start there, and this is the only place it gets caught.
+          need="$(strings "avr/lib/gcc/avr/$(cat avr/GCC_VERSION)/cc1" \
+                   | grep -oE 'GLIBC_2\.[0-9]+' | sort -V | tail -1 | cut -d_ -f2)"
+          if [ "$(printf '%s\n2.34\n' "$need" | sort -V | tail -1)" != "2.34" ]; then
+            echo "::error::cc1 needs GLIBC $need, above Vercel's 2.34"
+            exit 1
+          fi
+
+      # avr/ is gitignored, so this is how a verified bundle gets off the
+      # runner without 45 MB of binaries landing in git history.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: avr-toolchain
+          path: avr/
+          retention-days: 14
+
+  # The end-to-end path: pseudocode in, Intel HEX out, through the real
+  # endpoint rather than through the emitter alone.
+  service:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --quiet fastapi pydantic
+      - name: Install a system avr-gcc for the fallback path
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-avr avr-libc
+      - name: POST /compile for an ATmega part returns a real image
+        run: |
+          python - <<'PY'
+          import asyncio, base64, sys
+          import app
+
+          def run(**kw):
+              return asyncio.run(app.compile_source(app.CompileReq(**kw)))
+
+          fails = []
+
+          r = run(code=open("scripts/golden/avr.bw").read(), language="pseudocode")
+          if not r.get("success"):
+              fails.append(f"pseudocode->avr failed: {r.get('error')}")
+          else:
+              hexed = base64.b64decode(r["base64"]).decode()
+              if not hexed.startswith(":"):
+                  fails.append("output is not Intel HEX")
+              print(f"  ok  pseudocode -> {r['filename']} {r['bytes']} B mcu={r.get('mcu')}")
+
+          r = run(code="#include <avr/io.h>\nint main(void){DDRB|=_BV(PB5);for(;;);}\n",
+                  language="c", target="atmega328p", fosc=16000000)
+          if not r.get("success"):
+              fails.append(f"C->avr failed: {r.get('error')}")
+          else:
+              print(f"  ok  C -> {r['bytes']} B")
+
+          # Arduino core C++ must still be refused, and say what to use instead.
+          r = run(code=open("scripts/golden/arduino.bw").read(), language="pseudocode")
+          if r.get("success") or "arduino-cli" not in (r.get("error") or ""):
+              fails.append(f"arduino core should be refused: {r.get('error')}")
+          else:
+              print("  ok  arduino core refused, names the toolchain")
+
+          if fails:
+              print("\n".join("  FAIL " + f for f in fails)); sys.exit(1)
+          print("\nservice path ok")
+          PY
