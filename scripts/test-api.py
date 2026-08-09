@@ -498,5 +498,88 @@ check("timing lint flags busy-wait loops",
       any("busy-wait" in w for w in result.get("warnings") or []),
       str(result.get("warnings"))[:70])
 
+print("\narchitectures beyond the 8051")
+
+MICROBIT = """DEVICE MICROBIT:
+  PIN led = P0 OUTPUT
+  PIN btn = BUTTON_A INPUT
+  WHEN started:
+    FOREVER:
+      toggle led
+      wait 200 ms
+  WHEN started:
+    FOREVER:
+      wait until btn
+      wait 50 ms
+"""
+AVR = """DEVICE ATMEGA328P:
+  CLOCK 16000000
+  PIN led = D13 OUTPUT
+  WHEN started:
+    FOREVER:
+      toggle led
+      wait 500 ms
+"""
+
+result, _ = post({"code": AVR, "language": "pseudocode"})
+check("AVR: pseudocode compiles to an image", result.get("success") is True,
+      result.get("error", "")[:70])
+check("AVR: reports its toolchain and part",
+      result.get("toolchain") == "avr-gcc" and result.get("mcu") == "atmega328p")
+if result.get("success"):
+    image = base64.b64decode(result["base64"]).decode()
+    check("AVR: Intel HEX with an EOF record",
+          image.startswith(":") and image.strip().endswith(":00000001FF"))
+
+result, _ = post({"code": MICROBIT, "language": "pseudocode"})
+check("micro:bit: /compile refuses and says why",
+      result.get("success") is False and "uflash" in (result.get("error") or ""),
+      (result.get("error") or "")[:60])
+check("micro:bit: the source comes back anyway",
+      "from microbit import *" in (result.get("c") or ""))
+check("micro:bit: cooperative tasks are generators",
+      (result.get("c") or "").count("yield") >= 2)
+
+request = urllib.request.Request(
+    f"{BASE}/transpile", json.dumps({"code": MICROBIT}).encode(),
+    {"Content-Type": "application/json"})
+with urllib.request.urlopen(request, timeout=120) as response:
+    tr = json.load(response)
+check("micro:bit: /transpile labels the language", tr.get("language") == "python",
+      str(tr.get("language")))
+check("micro:bit: pins report a neutral location",
+      tr.get("pins", {}).get("btn", {}).get("where") == "BUTTON_A",
+      str(tr.get("pins", {}).get("btn")))
+
+# /download hands back the SOURCE for a target that cannot be built here --
+# a .py or a .ino is the deliverable, not a 400.
+for source, want_name, want_tool in ((MICROBIT, "main.py", "uflash"),
+                                     (EXAMPLE_ARDUINO := """DEVICE ARDUINO-UNO:
+  PIN led = D13 OUTPUT
+  WHEN started:
+    turn on led
+""", "main.ino", "arduino-cli")):
+    request = urllib.request.Request(
+        f"{BASE}/download", json.dumps({"code": source, "language": "pseudocode"}).encode(),
+        {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            disposition = response.headers.get("Content-Disposition", "")
+            tool = response.headers.get("X-Source-Only", "")
+            body = response.read()
+        check(f"/download returns {want_name}",
+              want_name in disposition and tool == want_tool and len(body) > 50,
+              f"{disposition} {tool} {len(body)}B")
+    except urllib.error.HTTPError as exc:
+        check(f"/download returns {want_name}", False, f"HTTP {exc.code}")
+
+check("the UI offers the AVR parts",
+      "atmega328p" in page and "optgroup" in page)
+# Without this branch the browser shows "failed" for a micro:bit or an Arduino
+# and leaves Download disabled, so the generated source is unreachable from
+# the page the service is served on.
+check("the UI treats source-only as a result, not a failure",
+      "source only, needs" in page and "data.c && data.toolchain" in page)
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

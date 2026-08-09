@@ -1,0 +1,11 @@
+DEVICE MICROBIT:
+  CLOCK 16000000
+
+  PIN led = P0 OUTPUT
+
+  WHEN started:
+    REPEAT 3:
+      set led high
+      wait 100 ms
+      set led low
+      wait 100 ms

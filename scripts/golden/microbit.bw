@@ -1,0 +1,21 @@
+DEVICE MICROBIT:
+  CLOCK 16000000
+
+  PIN led = P0 OUTPUT
+  PIN spk = P1 OUTPUT ACTIVE LOW
+  PIN btn = BUTTON_A INPUT
+  PIN dial = P2 ANALOG
+
+  WHEN started:
+    FOREVER:
+      toggle led
+      wait dial ms
+
+  WHEN started:
+    set hits to 0
+    FOREVER:
+      wait until btn
+      change hits by 1
+      turn on spk
+      wait 50 ms
+      turn off spk

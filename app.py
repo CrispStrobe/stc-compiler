@@ -358,10 +358,12 @@ def build(req: CompileReq) -> dict:
             return {"success": False, "stage": "compile",
                     "error": f"{chip.display} transpiles here, but building it "
                              f"needs {chip.toolchain}, which this service does "
-                             f"not host. Use /transpile to get the source, or "
-                             f"DEVICE ATMEGA328P: for the same board without "
-                             f"the Arduino core.",
-                    "c": generated_c, "toolchain": chip.toolchain}
+                             f"not host. Use /transpile to get the source."
+                             + (f" {chip.compile_hint}" if chip.compile_hint else ""),
+                    "c": generated_c,
+                    "toolchain": chip.toolchain,
+                    "language": stc_pseudocode.source_language(program),
+                    "filename": f"main.{chip.source_extension}"}
     elif req.language.lower() in ("keil", "c51"):
         stage_toolchain()      # SFR addresses come from the staged SDCC headers
         result = keil2sdcc.translate(req.code)
@@ -742,6 +744,10 @@ async def transpile_only(req: CompileReq):
     return {
         "success": True,
         "c": code,
+        # Not always C any more: a micro:bit transpiles to MicroPython. The
+        # field keeps its name so existing callers keep working, and this says
+        # what is actually in it.
+        "language": stc_pseudocode.source_language(program),
         "part": program.part,
         "clock": program.clock,
         # `where` is the target-neutral location token ("P1.0", "D13", "A0").
@@ -766,6 +772,22 @@ async def download(req: CompileReq):
     """
     result = build(req)
     if not result["success"]:
+        # A target that transpiles but cannot be built here is not a failure
+        # to report as one: the generated source IS the deliverable, and a
+        # micro:bit .py or an Arduino .ino is exactly what the caller wanted.
+        # Anything else -- a syntax error, an unknown target -- is still 400.
+        if result.get("c") and result.get("toolchain"):
+            name = result.get("filename", "main.txt")
+            return Response(
+                content=result["c"].encode("utf-8"),
+                media_type="text/x-python" if name.endswith(".py") else "text/plain",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{name}"',
+                    "X-Source-Only": result["toolchain"],
+                    "Access-Control-Expose-Headers":
+                        "Content-Disposition, X-Source-Only",
+                },
+            )
         return PlainTextResponse(result["error"], status_code=400)
     return Response(
         content=base64.b64decode(result["base64"]),
@@ -1152,11 +1174,17 @@ PAGE = r"""<!doctype html>
   </label>
   <label>target
     <select id=target>
-      <option value=stc12c5a60s2>STC12C5A60S2</option>
-      <option value=stc12c5a16s2>STC12C5A16S2</option>
-      <option value=stc89c52rc>STC89C52RC</option>
-      <option value=stc15f2k60s2>STC15F2K60S2</option>
-      <option value=mcs51>generic 8051</option>
+      <optgroup label="8051 (SDCC)">
+        <option value=stc12c5a60s2>STC12C5A60S2</option>
+        <option value=stc12c5a16s2>STC12C5A16S2</option>
+        <option value=stc89c52rc>STC89C52RC</option>
+        <option value=stc15f2k60s2>STC15F2K60S2</option>
+        <option value=mcs51>generic 8051</option>
+      </optgroup>
+      <optgroup label="AVR (avr-gcc)">
+        <option value=atmega328p>ATmega328P &mdash; Uno / Nano</option>
+        <option value=atmega168p>ATmega168P</option>
+      </optgroup>
     </select>
   </label>
   <label>FOSC <input id=fosc value=11059200 size=9></label>
@@ -1281,6 +1309,24 @@ $('go').onclick = async () => {
       $('log').textContent = data.log || '(no warnings)';
       $('dl').disabled = false;
       $('copy').disabled = (format === 'bin');
+    } else if (data.c && data.toolchain) {
+      // Transpiled fine; this service just cannot BUILD it -- a micro:bit is
+      // interpreted, an Arduino sketch needs the Arduino build system. The
+      // source is the result, so this is a success with a different artefact,
+      // not a failure. Download hands back main.py / main.ino.
+      image = {bytes: new TextEncoder().encode(data.c),
+               filename: data.filename || 'main.txt'};
+      $('status').className = 'ok';
+      $('status').textContent = image.filename + ' \u2014 source only, needs '
+                              + data.toolchain;
+      $('out').textContent = data.c;
+      $('cgen').textContent = data.c;
+      document.querySelector('#tabs button[data-pane=cgen]').hidden = false;
+      document.querySelector('#tabs button[data-pane=asm]').hidden = true;
+      $('mem').textContent = '(nothing was compiled)';
+      $('log').textContent = data.error || '';
+      $('dl').disabled = false;
+      $('copy').disabled = false;
     } else {
       $('status').className = 'err';
       $('status').textContent = 'failed';
