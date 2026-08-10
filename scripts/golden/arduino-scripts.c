@@ -1,5 +1,7 @@
 /* Generated from BrickWright pseudocode by stc-compiler.
- * Hand edits will be lost; change the pseudocode instead. */
+ * Regenerating overwrites this file. Edits are not stranded, though:
+ * BrickWright's C reader imports this back into blocks and names what
+ * it cannot represent. stc-compiler itself only goes forwards. */
 #include <Arduino.h>
 
 /* No clock constant here on purpose: millis() and delay() are

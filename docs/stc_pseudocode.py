@@ -3052,9 +3052,17 @@ def emit_c(program: Program) -> str:
     # scheduler even when it is the only script in the program.
     tasks = len(program.whens) > 1 or any(program.when_hats)
 
+    # This said "Hand edits will be lost; change the pseudocode instead." The
+    # first half is still true. The second stopped being true when BrickWright's
+    # C reader landed -- an edited file can be read back into blocks, so telling
+    # someone to go and redo the change in the pseudocode is now the long way
+    # round. The qualification matters though: that reader lives in sb3-creator,
+    # not here, so stc-compiler on its own genuinely is one-directional.
     out = [
         "/* Generated from BrickWright pseudocode by stc-compiler.",
-        " * Hand edits will be lost; change the pseudocode instead. */",
+        " * Regenerating overwrites this file. Edits are not stranded, though:",
+        " * BrickWright's C reader imports this back into blocks and names what",
+        " * it cannot represent. stc-compiler itself only goes forwards. */",
     ]
     out += target.prologue(program)
     out += target.runtime(program, tasks)
