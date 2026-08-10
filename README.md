@@ -860,10 +860,47 @@ compiler is a single-threaded batch program; GDB needs threads for target
 control, which is GDB's problem. So AVR-in-the-browser is not blocked by the
 Pages header limitation — it is only expensive.
 
-**Deferred, not rejected.** 10 MB per visitor to serve people who already have
-a toolchain is a poor trade, and it is a lot of build engineering for the
-second-priority target. Revisit if anyone asks for it. Deferring it does not
-block the 8051 path going fully static.
+### The decision, taken 2026-08-10
+
+Three options were on the table. **A** — drop browser AVR compiling, keep
+transpile-and-download. **B** — keep a small hosted service for AVR only.
+**C** — port `avr-gcc` to WASM as well.
+
+**Chosen: A now, B then C later.**
+
+The reasoning, so it does not have to be reconstructed:
+
+- **A now.** This is an 8051 project; AVR arrived as a bonus target. Spending
+  the single largest engineering item on the bonus, to serve the audience least
+  in need of it — Arduino users already have a toolchain — is the wrong
+  allocation. The page still emits the `.ino`; only in-browser compiling goes.
+- **B before C.** If losing the capability turns out to bite, a small hosted
+  service for one endpoint restores it immediately at almost no cost. It keeps
+  the thing we are escaping alive, but only for the less important half, and it
+  buys time to decide whether C is worth it.
+- **C last, and not never.** It is expensive, not impossible — the earlier claim
+  that Pages could not host it was wrong, since `cc1plus` links no `libpthread`.
+
+**What makes C cheaper than the estimate above.** `avr-gcc` needs GMP, MPFR and
+MPC, which SDCC does not, and that was costed as a substantial part of the work.
+It is already largely solved elsewhere in this ecosystem:
+`CrispStrobe/math-stack-ios-builder` carries `build_wasm_deps.sh`, which builds
+GMP 6.3.0, MPFR 4.2.2, MPC 1.3.1 (and FLINT) to WebAssembly with Emscripten, and
+its header records the two traps that cost the time — GMP needs
+`--host=none --disable-assembly` because the generic-C path is the only one that
+survives, and it needs `CC_FOR_BUILD` pointed at a native compiler because the
+toolchain clang lacks an SDK sysroot and fails GMP's build-system-compiler
+probe.
+
+Be precise about what that is worth: `WASM_BUILD_PLAN.md` in that repo says
+"validated plan, not yet executed". The scripts and the hard-won flags exist;
+finished artifacts do not, and the scripts target a macOS host rather than a CI
+runner. It is a substantial head start on the dependency layer, not a solved
+dependency layer — and it says nothing about GCC itself, which remains the
+larger half.
+
+Revisit C if someone actually asks for browser AVR compiling. Deferring it does
+not block the 8051 path going fully static.
 
 ---
 
