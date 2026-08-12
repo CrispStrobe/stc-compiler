@@ -29,13 +29,15 @@ POOL="https://deb.debian.org/debian/pool/main"
 GCC_ARM="gcc-arm-none-eabi_8-2019-q3-1+b1_amd64.deb"
 BINUTILS_ARM="binutils-arm-none-eabi_2.35.2-2+14+b2_amd64.deb"
 
-# Same runtime libraries as the AVR bundle: cc1 and the binutils need them
-# and Amazon Linux 2023 does not ship them.
+# Same runtime libraries as the AVR bundle PLUS libisl23: the ARM gcc 8.3.1
+# links against libisl which the AVR gcc 5.4.0 does not. Without it, cc1
+# dies with "error while loading shared libraries: libisl.so.23".
 RUNTIME_LIBS="
   g/gmp/libgmp10_6.2.1+dfsg-1+deb11u1_amd64.deb
   m/mpclib3/libmpc3_1.2.0-1_amd64.deb
   m/mpfr4/libmpfr6_4.1.0-3_amd64.deb
   z/zlib/zlib1g_1.2.11.dfsg-2+deb11u2_amd64.deb
+  i/isl/libisl23_0.23-1_amd64.deb
 "
 
 # The RP2040 is Cortex-M0+ = ARMv6-M, Thumb only, no FPU.
