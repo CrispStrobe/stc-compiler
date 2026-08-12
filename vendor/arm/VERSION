@@ -1,0 +1,9 @@
+gcc-arm-none-eabi  gcc-arm-none-eabi_8-2019-q3-1+b1_amd64.deb
+binutils-arm       binutils-arm-none-eabi_2.35.2-2+14+b2_amd64.deb
+
+from Debian bullseye, https://deb.debian.org/debian/pool/main
+corresponding source: apt-get source gcc-arm-none-eabi binutils-arm-none-eabi
+
+gcc-arm-none-eabi and binutils-arm-none-eabi are GPL-3.0-or-later. The GCC
+Runtime Library Exception covers libgcc, so images compiled with this bundle
+are unencumbered. No newlib (BSD/LGPL) is vendored or linked.
