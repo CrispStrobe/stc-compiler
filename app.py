@@ -334,11 +334,13 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
         cmd.append(f"-DF_CPU={int(f_cpu)}UL")
     if req.symbols:
         # DWARF is the AVR's .cdb: the line records avr_symtab joins the
-        # yield map against. Debug info changes nothing about the image
-        # bytes at -Os with gcc 5.4 (verified via avr-size), but the image
-        # and the table must still come from the SAME request, exactly as
-        # the 8051 path insists.
-        cmd.append("-g")
+        # yield map against. DWARF-2 SPECIFICALLY: gcc 5.4's default DWARF-4
+        # produces a .debug_line the bundled binutils 2.26 objdump decodes to
+        # NOTHING (section present, zero rows — found live, not guessed).
+        # Debug info changes nothing about the image bytes; the image and
+        # the table still come from the SAME request, as the 8051 path
+        # insists.
+        cmd.append("-gdwarf-2")
     for name, value in req.defines.items():
         if not name.replace("_", "").isalnum():
             shutil.rmtree(work, ignore_errors=True)
