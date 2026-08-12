@@ -414,9 +414,17 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
                      "--dwarf=decodedline", elf],
                     capture_output=True, text=True, timeout=15, env=env)
                 import avr_symtab
-                symbols = avr_symtab.build_symbol_table(
-                    nm.stdout or "", decoded.stdout or "", req.code,
-                    f_cpu=int(f_cpu or 16000000), mcu=spec["mcu"])
+                try:
+                    symbols = avr_symtab.build_symbol_table(
+                        nm.stdout or "", decoded.stdout or "", req.code,
+                        f_cpu=int(f_cpu or 16000000), mcu=spec["mcu"])
+                except Exception as inner:
+                    # Carry the evidence: the first lines of what the tools
+                    # actually said beats guessing at a distance.
+                    head = lambda t: " / ".join((t or "").splitlines()[:4])[:300]
+                    raise RuntimeError(
+                        f"{inner} [objdump-t: {head(nm.stdout) or head(nm.stderr) or 'EMPTY'}]"
+                        f" [decodedline: {head(decoded.stdout) or head(decoded.stderr) or 'EMPTY'}]")
             except Exception as exc:  # noqa: BLE001 - reported, never fatal
                 symbols_error = str(exc)
 
@@ -626,9 +634,17 @@ def build(req: CompileReq) -> dict:
                      "--dwarf=decodedline", elf],
                     capture_output=True, text=True, timeout=15, env=env)
                 import avr_symtab
-                symbols = avr_symtab.build_symbol_table(
-                    nm.stdout or "", decoded.stdout or "", req.code,
-                    f_cpu=int(f_cpu or 16000000), mcu=spec["mcu"])
+                try:
+                    symbols = avr_symtab.build_symbol_table(
+                        nm.stdout or "", decoded.stdout or "", req.code,
+                        f_cpu=int(f_cpu or 16000000), mcu=spec["mcu"])
+                except Exception as inner:
+                    # Carry the evidence: the first lines of what the tools
+                    # actually said beats guessing at a distance.
+                    head = lambda t: " / ".join((t or "").splitlines()[:4])[:300]
+                    raise RuntimeError(
+                        f"{inner} [objdump-t: {head(nm.stdout) or head(nm.stderr) or 'EMPTY'}]"
+                        f" [decodedline: {head(decoded.stdout) or head(decoded.stderr) or 'EMPTY'}]")
             except Exception as exc:  # noqa: BLE001 - reported, never fatal
                 symbols_error = str(exc)
 
@@ -917,9 +933,17 @@ async def translate_project_endpoint(req: ProjectReq):
                      "--dwarf=decodedline", elf],
                     capture_output=True, text=True, timeout=15, env=env)
                 import avr_symtab
-                symbols = avr_symtab.build_symbol_table(
-                    nm.stdout or "", decoded.stdout or "", req.code,
-                    f_cpu=int(f_cpu or 16000000), mcu=spec["mcu"])
+                try:
+                    symbols = avr_symtab.build_symbol_table(
+                        nm.stdout or "", decoded.stdout or "", req.code,
+                        f_cpu=int(f_cpu or 16000000), mcu=spec["mcu"])
+                except Exception as inner:
+                    # Carry the evidence: the first lines of what the tools
+                    # actually said beats guessing at a distance.
+                    head = lambda t: " / ".join((t or "").splitlines()[:4])[:300]
+                    raise RuntimeError(
+                        f"{inner} [objdump-t: {head(nm.stdout) or head(nm.stderr) or 'EMPTY'}]"
+                        f" [decodedline: {head(decoded.stdout) or head(decoded.stderr) or 'EMPTY'}]")
             except Exception as exc:  # noqa: BLE001 - reported, never fatal
                 symbols_error = str(exc)
 
