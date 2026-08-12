@@ -332,6 +332,13 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
     # a conflicting redefinition at worst.
     if f_cpu and "F_CPU" not in req.code:
         cmd.append(f"-DF_CPU={int(f_cpu)}UL")
+    if req.symbols:
+        # DWARF is the AVR's .cdb: the line records avr_symtab joins the
+        # yield map against. Debug info changes nothing about the image
+        # bytes at -Os with gcc 5.4 (verified via avr-size), but the image
+        # and the table must still come from the SAME request, exactly as
+        # the 8051 path insists.
+        cmd.append("-g")
     for name, value in req.defines.items():
         if not name.replace("_", "").isalnum():
             shutil.rmtree(work, ignore_errors=True)
@@ -393,6 +400,24 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
         except (OSError, subprocess.SubprocessError):
             mem = ""
 
+        symbols = None
+        symbols_error = None
+        if req.symbols:
+            try:
+                nm = subprocess.run(
+                    [os.path.join(bin_dir, "avr-nm"), "-S", elf],
+                    capture_output=True, text=True, timeout=10, env=env)
+                decoded = subprocess.run(
+                    [os.path.join(bin_dir, "avr-objdump"),
+                     "--dwarf=decodedline", elf],
+                    capture_output=True, text=True, timeout=15, env=env)
+                import avr_symtab
+                symbols = avr_symtab.build_symbol_table(
+                    nm.stdout or "", decoded.stdout or "", req.code,
+                    f_cpu=int(f_cpu or 16000000), mcu=spec["mcu"])
+            except Exception as exc:  # noqa: BLE001 - reported, never fatal
+                symbols_error = str(exc)
+
         listing = None
         if req.disassemble:
             try:
@@ -415,6 +440,8 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
             "bytes": len(blob),
             "log": log,
             "memory": mem,
+            "symbols": symbols,
+            "symbols_error": symbols_error,
             "toolchain": "avr-gcc",
             "mcu": spec["mcu"],
         }
@@ -583,6 +610,24 @@ def build(req: CompileReq) -> dict:
         with open(out, "rb") as handle:
             blob = handle.read()
 
+        symbols = None
+        symbols_error = None
+        if req.symbols:
+            try:
+                nm = subprocess.run(
+                    [os.path.join(bin_dir, "avr-nm"), "-S", elf],
+                    capture_output=True, text=True, timeout=10, env=env)
+                decoded = subprocess.run(
+                    [os.path.join(bin_dir, "avr-objdump"),
+                     "--dwarf=decodedline", elf],
+                    capture_output=True, text=True, timeout=15, env=env)
+                import avr_symtab
+                symbols = avr_symtab.build_symbol_table(
+                    nm.stdout or "", decoded.stdout or "", req.code,
+                    f_cpu=int(f_cpu or 16000000), mcu=spec["mcu"])
+            except Exception as exc:  # noqa: BLE001 - reported, never fatal
+                symbols_error = str(exc)
+
         listing = None
         if req.disassemble:
             try:
@@ -637,6 +682,8 @@ def build(req: CompileReq) -> dict:
             "bytes": len(blob),
             "log": log,
             "memory": mem,
+            "symbols": symbols,
+            "symbols_error": symbols_error,
         }
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -851,6 +898,24 @@ async def translate_project_endpoint(req: ProjectReq):
                            capture_output=True, timeout=10)
         with open(out, "rb") as handle:
             blob = handle.read()
+
+        symbols = None
+        symbols_error = None
+        if req.symbols:
+            try:
+                nm = subprocess.run(
+                    [os.path.join(bin_dir, "avr-nm"), "-S", elf],
+                    capture_output=True, text=True, timeout=10, env=env)
+                decoded = subprocess.run(
+                    [os.path.join(bin_dir, "avr-objdump"),
+                     "--dwarf=decodedline", elf],
+                    capture_output=True, text=True, timeout=15, env=env)
+                import avr_symtab
+                symbols = avr_symtab.build_symbol_table(
+                    nm.stdout or "", decoded.stdout or "", req.code,
+                    f_cpu=int(f_cpu or 16000000), mcu=spec["mcu"])
+            except Exception as exc:  # noqa: BLE001 - reported, never fatal
+                symbols_error = str(exc)
 
         listing = None
         if req.disassemble:
