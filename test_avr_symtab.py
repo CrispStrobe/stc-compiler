@@ -146,3 +146,13 @@ SYMBOL TABLE:
             self.OBJDUMP, Build._case_lines(Build()), C,
             f_cpu=16000000, mcu="atmega328p")
         self.assertEqual(table["scheduler"]["bw_ms"]["addr"], 0x100)
+
+
+class OptionalUntil(unittest.TestCase):
+    def test_task_without_until_is_not_a_refusal(self):
+        nm = NM.replace("00800106 00000002 b bw_task0_until\n", "")
+        table = avr_symtab.build_symbol_table(
+            nm, Build._case_lines(Build()), C, f_cpu=16000000, mcu="atmega328p")
+        t0 = table["scheduler"]["tasks"][0]
+        self.assertNotIn("until", t0, "gcc pruned it; the table says so by absence")
+        self.assertIn("until", table["scheduler"]["tasks"][1])

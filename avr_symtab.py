@@ -165,12 +165,18 @@ def build_symbol_table(nm_text: str, decodedline_text: str, c_source: str, *,
             if block is not None:
                 entry["block"] = block
             yields.append(entry)
-        out_tasks.append({
+        task_entry = {
             "name": name,
             "state": _loc(syms, f"{name}_state", 2),
-            "until": _loc(syms, f"{name}_until", 2),
             "yields": yields,
-        })
+        }
+        # A task that never waits never references its until variable, and
+        # gcc (unlike SDCC) eliminates the unreferenced static entirely.
+        # `until` is therefore OPTIONAL: absent key, not a refusal — the
+        # debug target already skips deadlines it cannot read.
+        if f"{name}_until" in syms:
+            task_entry["until"] = _loc(syms, f"{name}_until", 2)
+        out_tasks.append(task_entry)
 
     table = {
         "fosc": f_cpu,
