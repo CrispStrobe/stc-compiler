@@ -197,12 +197,16 @@ def build_symbol_table(nm_text: str, decodedline_text: str, c_source: str, *,
         "fosc": f_cpu,
         "device": mcu,
         "scheduler": {
-            # uint32_t on the AVR -- the 8051's is 2 bytes; consumers read
-            # the size field rather than assuming (bw-board's target does).
-            "bw_ms": _loc(syms, "bw_ms", 4),
             "tasks": out_tasks,
         },
     }
+    # bw_ms is OPTIONAL: the AVR keeps a millisecond counter in RAM (uint32_t
+    # -- the 8051's is 2 bytes; consumers read the size field rather than
+    # assuming), but the RP2040 flavor has NO bw_ms AT ALL -- its timebase is
+    # the hardware microsecond TIMER, read, not maintained. A debugger's
+    # bwMs() returns undefined without the symbol, which is the truth.
+    if "bw_ms" in syms:
+        table["scheduler"]["bw_ms"] = _loc(syms, "bw_ms", 4)
     if pruned:
         table["pruned"] = pruned
 

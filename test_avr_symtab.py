@@ -124,6 +124,16 @@ class Build(unittest.TestCase):
         self.assertEqual([t["name"] for t in table2["scheduler"]["tasks"]], ["bw_task0"])
         self.assertEqual(table2["pruned"], ["bw_task1"])
 
+    def test_bw_ms_is_optional_the_rp2040_has_none(self):
+        # The RP2040 flavor keeps NO millisecond counter in RAM — bw_now()
+        # reads the hardware TIMER. The symbol's absence is the truth, not
+        # an error; the table simply omits the key.
+        table = avr_symtab.build_symbol_table(
+            NM.replace("bw_ms", "unrelated_ms"), self._case_lines(), C,
+            f_cpu=125000000, mcu="rp2040")
+        self.assertNotIn("bw_ms", table["scheduler"])
+        self.assertEqual(len(table["scheduler"]["tasks"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

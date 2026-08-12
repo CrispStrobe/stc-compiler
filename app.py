@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import stat
+import sys
 import subprocess
 import tempfile
 import uuid
@@ -262,7 +263,10 @@ def stage_arm() -> str | None:
     copied into /tmp on Vercel (read-only deployment dir, executable bit
     stripped), and falls back to a system arm-none-eabi-gcc for local dev.
     """
-    if os.path.isdir(SRC_ARM):
+    # The vendored bundle is LINUX binaries (built for Vercel's runtime).
+    # On any other platform staging it yields tools that cannot exec
+    # (ENOEXEC on a dev Mac) — go straight to the system toolchain there.
+    if sys.platform.startswith("linux") and os.path.isdir(SRC_ARM):
         if not os.path.exists(os.path.join(ARM_STAGE_BIN, "arm-none-eabi-gcc")):
             os.makedirs(ARM_STAGE, exist_ok=True)
             for part in os.listdir(SRC_ARM):
