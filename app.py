@@ -171,6 +171,22 @@ AVR_TARGETS = {
     },
 }
 
+# ---- ARM (Cortex-M) toolchain, same pattern as AVR above ---------------------
+# The bundle is built by scripts/fetch-arm-gcc.sh from Debian bullseye
+# packages, trimmed to the v6-m multilib only (Cortex-M0/M0+). No newlib,
+# no C++, only libgcc's integer helpers (division, shifts).
+SRC_ARM = os.path.join(BASE_DIR, "arm")
+ARM_STAGE = "/tmp/arm"
+ARM_STAGE_BIN = os.path.join(ARM_STAGE, "bin")
+ARM_LINKER_SCRIPT = os.path.join(BASE_DIR, "pico-sram.ld")
+
+ARM_TARGETS = {
+    "rp2040": {
+        "mcu": "cortex-m0plus", "sram": 256 * 1024,
+        "description": "RP2040 — Raspberry Pi Pico, 264 KB SRAM, Cortex-M0+",
+    },
+}
+
 app = FastAPI(title="stc-compiler", docs_url="/docs")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
@@ -236,6 +252,40 @@ def stage_avr() -> str | None:
             return AVR_STAGE_BIN
 
     found = shutil.which("avr-gcc")
+    return os.path.dirname(found) if found else None
+
+
+def stage_arm() -> str | None:
+    """Directory holding arm-none-eabi-gcc, or None if unavailable.
+
+    Same cold-start staging as stage_avr — the bundle ships in git, gets
+    copied into /tmp on Vercel (read-only deployment dir, executable bit
+    stripped), and falls back to a system arm-none-eabi-gcc for local dev.
+    """
+    if os.path.isdir(SRC_ARM):
+        if not os.path.exists(os.path.join(ARM_STAGE_BIN, "arm-none-eabi-gcc")):
+            os.makedirs(ARM_STAGE, exist_ok=True)
+            for part in os.listdir(SRC_ARM):
+                source = os.path.join(SRC_ARM, part)
+                destination = os.path.join(ARM_STAGE, part)
+                if os.path.islink(source):
+                    if not os.path.exists(destination):
+                        linkto = os.readlink(source)
+                        os.symlink(linkto, destination)
+                elif os.path.isdir(source) and not os.path.isdir(destination):
+                    shutil.copytree(source, destination, symlinks=True)
+                elif os.path.isfile(source) and not os.path.exists(destination):
+                    shutil.copy2(source, destination)
+            for sub in ("bin",
+                        os.path.join("lib", "arm-none-eabi", "bin"),
+                        os.path.join("lib", "gcc")):
+                for root, _dirs, _files in os.walk(
+                        os.path.join(ARM_STAGE, sub)):
+                    _make_executable(root)
+        if os.path.exists(os.path.join(ARM_STAGE_BIN, "arm-none-eabi-gcc")):
+            return ARM_STAGE_BIN
+
+    found = shutil.which("arm-none-eabi-gcc")
     return os.path.dirname(found) if found else None
 
 
@@ -461,6 +511,202 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
         shutil.rmtree(work, ignore_errors=True)
 
 
+def build_arm(req: CompileReq, spec: dict, generated_c: str | None,
+              stem: str = "main") -> dict:
+    """Compile C for an RP2040 (Cortex-M0+) with arm-none-eabi-gcc.
+
+    Same response shape as build_avr: base64 image, filename, bytes, log,
+    memory, plus origin (the SRAM load address) and entry (the ELF entry
+    point, which must equal the origin for the emulator to work).
+
+    The image is a raw binary (objcopy -O binary), not Intel HEX — the
+    emulator loads it directly into SRAM at 0x20000000. bss is not in the
+    file; the emulator zero-fills SRAM before loading.
+    """
+    refusal = reject_path_options(req.options)
+    if refusal:
+        return refusal
+
+    bin_dir = stage_arm()
+    if bin_dir is None:
+        return {"success": False, "stage": "compile",
+                "error": "no ARM toolchain available; the arm/ bundle is not "
+                         "vendored in this deployment and no arm-none-eabi-gcc "
+                         "is on PATH",
+                "c": generated_c}
+
+    deps = os.path.join(os.path.dirname(bin_dir), "lib-deps")
+    env = dict(os.environ)
+    if os.path.isdir(deps):
+        env["LD_LIBRARY_PATH"] = deps + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+
+    work = os.path.join(tempfile.gettempdir(), f"build-{uuid.uuid4().hex}")
+    os.makedirs(work, exist_ok=True)
+    src = os.path.join(work, "main.c")
+    with open(src, "w", encoding="utf-8") as handle:
+        handle.write(req.code)
+
+    # The linker script lives in the repo root, but on Vercel the deployment
+    # dir is read-only. Copy it into the work dir so the linker can find it
+    # relative to cwd and without the source path leaking into diagnostics.
+    ld_script = os.path.join(work, "pico-sram.ld")
+    shutil.copy2(ARM_LINKER_SCRIPT, ld_script)
+
+    elf = os.path.join(work, "main.elf")
+    cmd = [os.path.join(bin_dir, "arm-none-eabi-gcc"),
+           f"-mcpu={spec['mcu']}", "-mthumb", "-Os", "-ffreestanding",
+           "-ffunction-sections", "-nostdlib",
+           # Duff's device scheduler: same intentional fallthroughs as AVR/8051
+           "-Wno-implicit-fallthrough",
+           f"-T{ld_script}",
+           ]
+    if req.symbols:
+        # Same DWARF-2 trap as AVR: gcc 8's default DWARF-4 produces line
+        # records the bundled binutils 2.35 objdump decodes to nothing.
+        cmd.append("-gdwarf-2")
+    for name, value in req.defines.items():
+        if not name.replace("_", "").isalnum():
+            shutil.rmtree(work, ignore_errors=True)
+            return {"success": False, "error": f"bad define name: {name!r}"}
+        cmd.append(f"-D{name}" if value is None else f"-D{name}={value}")
+    for index, opt in enumerate(req.options):
+        opt = str(opt)
+        if opt.startswith("-"):
+            cmd.append(opt)
+            continue
+        if index == 0 or not VALUE_RE.fullmatch(opt):
+            shutil.rmtree(work, ignore_errors=True)
+            return {"success": False,
+                    "error": f"options must be flags, or plain values following "
+                             f"a flag; rejected {opt!r}"}
+        cmd.append(opt)
+    # -lgcc is REQUIRED: the cooperative scheduler does 64-bit division
+    # (__aeabi_uldivmod) for bw_now, and the compiler may emit other
+    # runtime helpers for shifts and multiplies.
+    cmd += ["-o", elf, src, "-lgcc"]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=COMPILE_TIMEOUT, cwd=work, env=env)
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(work, ignore_errors=True)
+        return {"success": False, "error": f"compile timed out after {COMPILE_TIMEOUT}s"}
+
+    log = ((result.stdout or "") + (result.stderr or "")).replace(work + os.sep, "")
+    # The linker emits "LOAD segment with RWX permissions" for the SRAM
+    # image — harmless, expected, not worth suppressing because doing so
+    # would also hide real warnings.
+    if result.returncode != 0 or not os.path.exists(elf):
+        shutil.rmtree(work, ignore_errors=True)
+        return {"success": False, "error": log.strip() or "compilation failed",
+                "log": log, "c": generated_c, "stage": "compile"}
+
+    try:
+        objcopy = os.path.join(bin_dir, "arm-none-eabi-objcopy")
+        objdump = os.path.join(bin_dir, "arm-none-eabi-objdump")
+        origin = 0x20000000
+
+        # Check the ELF entry point: main must land at the origin for the
+        # emulator (which jumps to 0x20000000 on reset). Thumb bit (bit 0)
+        # is expected and stripped for the comparison.
+        try:
+            hdr = subprocess.run(
+                [objdump, "-f", elf], capture_output=True, text=True,
+                timeout=10, env=env)
+            m = re.search(r"start address\s+0x([0-9a-fA-F]+)", hdr.stdout or "")
+            entry = int(m.group(1), 16) if m else None
+            if entry is not None and (entry & ~1) != origin:
+                shutil.rmtree(work, ignore_errors=True)
+                return {"success": False, "stage": "link",
+                        "error": f"ELF entry 0x{entry:08x} is not at the SRAM "
+                                 f"origin 0x{origin:08x}. main must be the "
+                                 f"first function — check the linker script.",
+                        "log": log, "c": generated_c}
+        except (OSError, subprocess.SubprocessError):
+            entry = None
+
+        # Raw binary: text + rodata + data, contiguous. bss is NOT in the
+        # file — the emulator zero-fills SRAM.
+        out = os.path.join(work, "main.bin")
+        subprocess.run([objcopy, "-O", "binary", elf, out],
+                       capture_output=True, timeout=10, env=env)
+        if not os.path.exists(out):
+            return {"success": False, "error": "arm-none-eabi-objcopy produced no image",
+                    "log": log, "c": generated_c}
+        with open(out, "rb") as handle:
+            blob = handle.read()
+
+        # Size report
+        mem = ""
+        try:
+            sized = subprocess.run(
+                [os.path.join(bin_dir, "arm-none-eabi-size"), elf],
+                capture_output=True, text=True, timeout=10, env=env)
+            mem = sized.stdout or ""
+        except (OSError, subprocess.SubprocessError):
+            mem = ""
+
+        # Symbol extraction: same objdump -t + --dwarf=decodedline as AVR.
+        # ARM addresses are absolute — no 0x800000 strip (avr_symtab handles
+        # this via its DATA_VMA constant; for ARM we use arm_symtab which
+        # has DATA_VMA = 0).
+        symbols = None
+        symbols_error = None
+        if req.symbols:
+            try:
+                nm = subprocess.run(
+                    [objdump, "-t", elf],
+                    capture_output=True, text=True, timeout=10, env=env)
+                decoded = subprocess.run(
+                    [objdump, "--dwarf=decodedline", elf],
+                    capture_output=True, text=True, timeout=15, env=env)
+                import avr_symtab
+                try:
+                    symbols = avr_symtab.build_symbol_table(
+                        nm.stdout or "", decoded.stdout or "", req.code,
+                        f_cpu=125000000, mcu="rp2040",
+                        data_vma_override=0)
+                except Exception as inner:
+                    head = lambda t: " / ".join((t or "").splitlines()[3:14])[:600]
+                    raise RuntimeError(
+                        f"{inner} [objdump-t: {head(nm.stdout) or head(nm.stderr) or 'EMPTY'}]"
+                        f" [decodedline: {head(decoded.stdout) or head(decoded.stderr) or 'EMPTY'}]")
+            except Exception as exc:  # noqa: BLE001 - reported, never fatal
+                symbols_error = str(exc)
+
+        listing = None
+        if req.disassemble:
+            try:
+                dumped = subprocess.run(
+                    [objdump, "-d", "-S", elf],
+                    capture_output=True, text=True, timeout=15, env=env)
+                listing = dumped.stdout or f"(objdump failed: {dumped.stderr})"
+            except (OSError, subprocess.SubprocessError) as exc:
+                listing = f"(disassembly failed: {exc})"
+
+        return {
+            "success": True,
+            "c": generated_c,
+            "translated": None,
+            "unresolved": None,
+            "warnings": None,
+            "disassembly": listing,
+            "base64": base64.b64encode(blob).decode("ascii"),
+            "filename": f"{stem}.bin",
+            "bytes": len(blob),
+            "log": log,
+            "memory": mem,
+            "symbols": symbols,
+            "symbols_error": symbols_error,
+            "toolchain": "arm-none-eabi-gcc",
+            "mcu": "rp2040",
+            "origin": origin,
+            "entry": entry,
+        }
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def _fosc_from_source(code: str) -> int | None:
     """The clock, read back out of the source.
 
@@ -505,6 +751,8 @@ def build(req: CompileReq) -> dict:
         req = req.model_copy(update={"fosc": None})
         if chip.toolchain == "avr-gcc":
             return build_avr(req, AVR_TARGETS[chip.key], generated_c, None, stem)
+        if chip.toolchain == "arm-none-eabi-gcc":
+            return build_arm(req, ARM_TARGETS[chip.key], generated_c, stem)
         if chip.toolchain != "sdcc-mcs51":
             return {"success": False, "stage": "compile",
                     "error": f"{chip.display} transpiles here, but building it "
@@ -541,9 +789,17 @@ def build(req: CompileReq) -> dict:
                              f"compiled for {avr['mcu']}"}
         return build_avr(req, avr, generated_c, req.fosc)
 
+    arm = ARM_TARGETS.get(req.target.lower())
+    if arm is not None:
+        if keil_changes:
+            return {"success": False,
+                    "error": "the Keil C51 dialect is 8051-only; it cannot be "
+                             f"compiled for {arm['mcu']}"}
+        return build_arm(req, arm, generated_c)
+
     target = TARGETS.get(req.target.lower())
     if target is None:
-        known = sorted(list(TARGETS) + list(AVR_TARGETS))
+        known = sorted(list(TARGETS) + list(AVR_TARGETS) + list(ARM_TARGETS))
         return {"success": False,
                 "error": f"unknown target '{req.target}'; known: {', '.join(known)}"}
 
@@ -1310,17 +1566,51 @@ async def health():
                     env=health_env).stdout
         except Exception:  # noqa: BLE001 - absence is reported, not raised
             avr_version = ""
+
+    # ARM side — same pattern as AVR.
+    arm_bin = stage_arm()
+    arm_version = ""
+    if arm_bin:
+        try:
+            deps = os.path.join(os.path.dirname(arm_bin), "lib-deps")
+            health_env = dict(os.environ)
+            if os.path.isdir(deps):
+                health_env["LD_LIBRARY_PATH"] = (
+                    deps + os.pathsep + health_env.get("LD_LIBRARY_PATH", ""))
+            probe = subprocess.run(
+                [os.path.join(arm_bin, "arm-none-eabi-gcc"),
+                 "-print-prog-name=cc1"],
+                capture_output=True, text=True, timeout=10, env=health_env)
+            cc1 = (probe.stdout or "").strip()
+            if cc1 and os.path.exists(cc1):
+                started = subprocess.run([cc1, "--version"], capture_output=True,
+                                         text=True, timeout=10, env=health_env)
+                if started.returncode != 0:
+                    arm_version = f"BROKEN: {(started.stderr or '').strip()[:120]}"
+                else:
+                    arm_version = subprocess.run(
+                        [os.path.join(arm_bin, "arm-none-eabi-gcc"), "--version"],
+                        capture_output=True, text=True, timeout=10,
+                        env=health_env).stdout
+            else:
+                arm_version = subprocess.run(
+                    [os.path.join(arm_bin, "arm-none-eabi-gcc"), "--version"],
+                    capture_output=True, text=True, timeout=10,
+                    env=health_env).stdout
+        except Exception:  # noqa: BLE001 - absence is reported, not raised
+            arm_version = ""
+
     return {
         "ok": True,
-        # Vercel injects the commit it built from. Useful on its own, and the
-        # only way to tell a stale deployment from a current one when the
-        # daily deploy cap has kept a fix from shipping.
         "version": os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7] or "unknown",
         "sdcc": version.strip().splitlines()[0] if version else "",
         "avr_gcc": avr_version.strip().splitlines()[0] if avr_version else None,
+        "arm_gcc": arm_version.strip().splitlines()[0] if arm_version else None,
         "targets": {name: cfg["description"] for name, cfg in TARGETS.items()},
         "avr_targets": ({name: cfg["description"] for name, cfg in AVR_TARGETS.items()}
                         if avr_bin else {}),
+        "arm_targets": ({name: cfg["description"] for name, cfg in ARM_TARGETS.items()}
+                        if arm_bin else {}),
         "devices": sorted(stc_pseudocode.TARGETS),
     }
 

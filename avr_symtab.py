@@ -50,9 +50,15 @@ _OBJDUMP_RE = re.compile(
 _SECTION_KIND = {".bss": "b", ".data": "d", ".text": "t", ".noinit": "b"}
 
 
-def parse_nm(sym_text: str) -> dict[str, dict]:
+def parse_nm(sym_text: str, *, data_vma: int | None = None) -> dict[str, dict]:
     """name -> {addr, size, kind} from nm -S OR objdump -t output.
-    Data-space VMA offset already stripped."""
+    Data-space VMA offset already stripped.
+
+    *data_vma* overrides the module-level DATA_VMA constant: pass 0 for
+    targets where addresses are absolute (ARM/RP2040), or None (default)
+    to use the AVR's 0x800000.
+    """
+    vma = DATA_VMA if data_vma is None else data_vma
     out: dict[str, dict] = {}
     for line in sym_text.splitlines():
         m = _OBJDUMP_RE.match(line)
@@ -69,8 +75,8 @@ def parse_nm(sym_text: str) -> dict[str, dict]:
             size = int(m.group(2), 16) if m.group(2) else None
             kind = m.group(3)
             name = m.group(4)
-        if addr >= DATA_VMA:
-            addr -= DATA_VMA
+        if vma and addr >= vma:
+            addr -= vma
         out[name] = {"addr": addr, "size": size, "kind": kind}
     return out
 
@@ -113,7 +119,8 @@ def _loc(syms: dict, name: str, default_size: int) -> dict:
 
 def build_symbol_table(nm_text: str, decodedline_text: str, c_source: str, *,
                        f_cpu: int, mcu: str,
-                       source_name: str = "main.c") -> dict:
+                       source_name: str = "main.c",
+                       data_vma_override: int | None = None) -> dict:
     tasks = scan_tasks(c_source)
     yield_map = scan_yield_map(c_source)
 
@@ -124,7 +131,7 @@ def build_symbol_table(nm_text: str, decodedline_text: str, c_source: str, *,
             "state, so there is no Level 1 position to describe. Build with "
             "debug=true to force the scheduler form.")
 
-    syms = parse_nm(nm_text)
+    syms = parse_nm(nm_text, data_vma=data_vma_override)
     lines = parse_decodedline(decodedline_text)
     if not lines:
         raise SymbolTableError(
