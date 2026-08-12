@@ -110,12 +110,19 @@ class Build(unittest.TestCase):
             avr_symtab.build_symbol_table(
                 NM, self._case_lines(), drifted, f_cpu=16000000, mcu="atmega328p")
 
-    def test_missing_symbol_is_named(self):
-        with self.assertRaises(SymbolTableError) as ctx:
-            avr_symtab.build_symbol_table(
-                NM.replace("bw_task1_until", "unrelated"), self._case_lines(), C,
-                f_cpu=16000000, mcu="atmega328p")
-        self.assertIn("bw_task1_until", str(ctx.exception))
+    def test_missing_until_is_tolerated_missing_state_is_recorded(self):
+        # until: optional (gcc prunes unreferenced statics — see OptionalUntil).
+        table = avr_symtab.build_symbol_table(
+            NM.replace("bw_task1_until", "unrelated"), self._case_lines(), C,
+            f_cpu=16000000, mcu="atmega328p")
+        self.assertNotIn("until", table["scheduler"]["tasks"][1])
+        # state: a task without one is SKIPPED and named in `pruned` —
+        # dead-store elimination removes an empty task's state wholesale.
+        table2 = avr_symtab.build_symbol_table(
+            NM.replace("bw_task1_state", "unrelated"), self._case_lines(), C,
+            f_cpu=16000000, mcu="atmega328p")
+        self.assertEqual([t["name"] for t in table2["scheduler"]["tasks"]], ["bw_task0"])
+        self.assertEqual(table2["pruned"], ["bw_task1"])
 
 
 if __name__ == "__main__":

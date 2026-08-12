@@ -146,6 +146,7 @@ def build_symbol_table(nm_text: str, decodedline_text: str, c_source: str, *,
                 f"  in the source but not the header: {only_source}")
 
     out_tasks = []
+    pruned: list[str] = []
     for name in sorted(tasks, key=lambda n: int(n[len("bw_task"):])):
         yields = []
         for state, lineno, label in sorted(tasks[name]):
@@ -165,6 +166,13 @@ def build_symbol_table(nm_text: str, decodedline_text: str, c_source: str, *,
             if block is not None:
                 entry["block"] = block
             yields.append(entry)
+        # gcc's dead-store elimination goes further than the until case: an
+        # EMPTY task's state is write-only and vanishes wholesale. A task
+        # with no locatable state has no position and no yield to break on —
+        # skip it and SAY SO, so a front end can tell "pruned" from "lost".
+        if f"{name}_state" not in syms:
+            pruned.append(name)
+            continue
         task_entry = {
             "name": name,
             "state": _loc(syms, f"{name}_state", 2),
@@ -188,6 +196,8 @@ def build_symbol_table(nm_text: str, decodedline_text: str, c_source: str, *,
             "tasks": out_tasks,
         },
     }
+    if pruned:
+        table["pruned"] = pruned
 
     variables = []
     for name, entry in sorted(syms.items()):
