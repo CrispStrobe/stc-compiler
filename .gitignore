@@ -19,6 +19,7 @@ CLAUDE.md
 # from scratch on every push, so a hand-patched tree would be silently
 # replaced anyway.
 build-avr/
+build-arm/
 
 # Installed with --no-save for the browser check; never part of the repo.
 node_modules/
