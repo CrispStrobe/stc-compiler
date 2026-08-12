@@ -421,7 +421,7 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
                 except Exception as inner:
                     # Carry the evidence: the first lines of what the tools
                     # actually said beats guessing at a distance.
-                    head = lambda t: " / ".join((t or "").splitlines()[:4])[:300]
+                    head = lambda t: " / ".join((t or "").splitlines()[3:14])[:600]
                     raise RuntimeError(
                         f"{inner} [objdump-t: {head(nm.stdout) or head(nm.stderr) or 'EMPTY'}]"
                         f" [decodedline: {head(decoded.stdout) or head(decoded.stderr) or 'EMPTY'}]")
@@ -641,7 +641,7 @@ def build(req: CompileReq) -> dict:
                 except Exception as inner:
                     # Carry the evidence: the first lines of what the tools
                     # actually said beats guessing at a distance.
-                    head = lambda t: " / ".join((t or "").splitlines()[:4])[:300]
+                    head = lambda t: " / ".join((t or "").splitlines()[3:14])[:600]
                     raise RuntimeError(
                         f"{inner} [objdump-t: {head(nm.stdout) or head(nm.stderr) or 'EMPTY'}]"
                         f" [decodedline: {head(decoded.stdout) or head(decoded.stderr) or 'EMPTY'}]")
@@ -940,7 +940,7 @@ async def translate_project_endpoint(req: ProjectReq):
                 except Exception as inner:
                     # Carry the evidence: the first lines of what the tools
                     # actually said beats guessing at a distance.
-                    head = lambda t: " / ".join((t or "").splitlines()[:4])[:300]
+                    head = lambda t: " / ".join((t or "").splitlines()[3:14])[:600]
                     raise RuntimeError(
                         f"{inner} [objdump-t: {head(nm.stdout) or head(nm.stderr) or 'EMPTY'}]"
                         f" [decodedline: {head(decoded.stdout) or head(decoded.stderr) or 'EMPTY'}]")
