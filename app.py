@@ -404,8 +404,10 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
         symbols_error = None
         if req.symbols:
             try:
+                # objdump -t, not nm: the vendored bundle ships objdump
+                # only, and avr_symtab.parse_nm reads both spellings.
                 nm = subprocess.run(
-                    [os.path.join(bin_dir, "avr-nm"), "-S", elf],
+                    [os.path.join(bin_dir, "avr-objdump"), "-t", elf],
                     capture_output=True, text=True, timeout=10, env=env)
                 decoded = subprocess.run(
                     [os.path.join(bin_dir, "avr-objdump"),
@@ -614,8 +616,10 @@ def build(req: CompileReq) -> dict:
         symbols_error = None
         if req.symbols:
             try:
+                # objdump -t, not nm: the vendored bundle ships objdump
+                # only, and avr_symtab.parse_nm reads both spellings.
                 nm = subprocess.run(
-                    [os.path.join(bin_dir, "avr-nm"), "-S", elf],
+                    [os.path.join(bin_dir, "avr-objdump"), "-t", elf],
                     capture_output=True, text=True, timeout=10, env=env)
                 decoded = subprocess.run(
                     [os.path.join(bin_dir, "avr-objdump"),
@@ -903,8 +907,10 @@ async def translate_project_endpoint(req: ProjectReq):
         symbols_error = None
         if req.symbols:
             try:
+                # objdump -t, not nm: the vendored bundle ships objdump
+                # only, and avr_symtab.parse_nm reads both spellings.
                 nm = subprocess.run(
-                    [os.path.join(bin_dir, "avr-nm"), "-S", elf],
+                    [os.path.join(bin_dir, "avr-objdump"), "-t", elf],
                     capture_output=True, text=True, timeout=10, env=env)
                 decoded = subprocess.run(
                     [os.path.join(bin_dir, "avr-objdump"),

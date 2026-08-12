@@ -120,3 +120,29 @@ class Build(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ParseObjdump(unittest.TestCase):
+    OBJDUMP = """main.elf:     file format elf32-avr
+
+SYMBOL TABLE:
+00800104 l     O .bss\t00000002 bw_task0_state
+00800106 l     O .bss\t00000002 bw_task0_until
+00800108 l     O .bss\t00000002 bw_task1_state
+0080010a l     O .bss\t00000002 bw_task1_until
+00800100 l     O .bss\t00000004 bw_ms
+0080010c l     O .bss\t00000002 score
+00000000 g     F .text\t00000068 main
+"""
+
+    def test_objdump_t_parses_identically(self):
+        syms = avr_symtab.parse_nm(self.OBJDUMP)
+        self.assertEqual(syms["bw_task0_state"], {"addr": 0x104, "size": 2, "kind": "b"})
+        self.assertEqual(syms["bw_ms"]["size"], 4)
+        self.assertEqual(syms["main"]["kind"], "t")
+
+    def test_build_from_objdump_flavor(self):
+        table = avr_symtab.build_symbol_table(
+            self.OBJDUMP, Build._case_lines(Build()), C,
+            f_cpu=16000000, mcu="atmega328p")
+        self.assertEqual(table["scheduler"]["bw_ms"]["addr"], 0x100)

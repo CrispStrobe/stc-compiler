@@ -36,24 +36,39 @@ DATA_VMA = 0x800000  # avr-ld places the data segment at this virtual address
 
 # ------------------------------------------------------------------ parsers
 
-# `avr-nm -S` line:  00800104 00000002 b bw_task0_state
-# The size column is optional (absent for some symbols) and types we care
-# about are b/B (bss) and d/D (data): the scheduler's state lives there.
+# Two symbol-table spellings, one parser. The vendored bundle carries
+# avr-objdump but NOT avr-nm, so objdump -t is the production path; nm -S
+# stays supported because local dev boxes have it and fixtures exist.
+#
+#   nm -S:        00800104 00000002 b bw_task0_state
+#   objdump -t:   00800104 l     O .bss\t00000002 bw_task0_state
 _NM_RE = re.compile(
     r"^([0-9a-fA-F]{8})\s+(?:([0-9a-fA-F]{8})\s+)?([A-Za-z])\s+(\S+)\s*$")
+_OBJDUMP_RE = re.compile(
+    r"^([0-9a-fA-F]{8})\s+\S+(?:\s+\S+)*?\s+(\.\S+)\s+([0-9a-fA-F]{8})\s+(\S+)\s*$")
+
+_SECTION_KIND = {".bss": "b", ".data": "d", ".text": "t", ".noinit": "b"}
 
 
-def parse_nm(nm_text: str) -> dict[str, dict]:
-    """name -> {addr, size, kind}. Data-space VMA offset already stripped."""
+def parse_nm(sym_text: str) -> dict[str, dict]:
+    """name -> {addr, size, kind} from nm -S OR objdump -t output.
+    Data-space VMA offset already stripped."""
     out: dict[str, dict] = {}
-    for line in nm_text.splitlines():
-        m = _NM_RE.match(line)
-        if not m:
-            continue
-        addr = int(m.group(1), 16)
-        size = int(m.group(2), 16) if m.group(2) else None
-        kind = m.group(3)
-        name = m.group(4)
+    for line in sym_text.splitlines():
+        m = _OBJDUMP_RE.match(line)
+        if m:
+            addr = int(m.group(1), 16)
+            kind = _SECTION_KIND.get(m.group(2), "?")
+            size = int(m.group(3), 16) or None
+            name = m.group(4)
+        else:
+            m = _NM_RE.match(line)
+            if not m:
+                continue
+            addr = int(m.group(1), 16)
+            size = int(m.group(2), 16) if m.group(2) else None
+            kind = m.group(3)
+            name = m.group(4)
         if addr >= DATA_VMA:
             addr -= DATA_VMA
         out[name] = {"addr": addr, "size": size, "kind": kind}
