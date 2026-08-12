@@ -150,7 +150,15 @@ def build_symbol_table(nm_text: str, decodedline_text: str, c_source: str, *,
         yields = []
         for state, lineno, label in sorted(tasks[name]):
             entry: dict = {"state": state, "label": label}
-            addr = lines.get((source_name, lineno))
+            # A bare `case N:` label emits no instruction, so DWARF may have
+            # no record for ITS line; the state's code address is the first
+            # statement after it. Walk forward a few lines — the nearest
+            # following record is the breakpoint the label means.
+            addr = None
+            for probe in range(lineno, lineno + 6):
+                addr = lines.get((source_name, probe))
+                if addr is not None:
+                    break
             if addr is not None:
                 entry["addr"] = addr
             block = yield_map.get(name, {}).get(state)
