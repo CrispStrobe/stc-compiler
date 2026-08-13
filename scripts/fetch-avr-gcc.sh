@@ -63,12 +63,21 @@ RUNTIME_LIBS="
 # The ATmega328P and ATmega168P are both avr5. If a part outside that family
 # is ever added to AVR_TARGETS in app.py, its multilib has to be added here
 # too, or the link fails with a missing libgcc.
-MULTILIBS="avr5"
+#
+# avr6: ATmega2560 (256 KB flash, Arduino Mega)
+# avr25: ATtiny85/ATtiny84 (8 KB / 8 KB flash, teaching chips)
+MULTILIBS="avr5 avr6 avr25"
 
 # Device headers to keep, as globs. One entry per part family in app.py's
 # AVR_TARGETS; everything else in avr-libc's 267-header include/avr is
 # dropped. See the trim below for why.
-DEVICE_HEADERS="iom328*.h iom168*.h"
+DEVICE_HEADERS="iom328*.h iom168*.h iom2560*.h iotn85*.h iotn84*.h"
+
+# Per-device CRT and lib files to keep, as globs. Everything else in the
+# avr-libc multilib directories (crt*.o, lib<device>.a) is dropped — avr25
+# alone carries 49 files for devices we do not support. The common libraries
+# (libc.a, libm.a, libprintf_*.a, libscanf_*.a) are always kept.
+DEVICE_LIBS="*mega328p* *mega168p* *mega168pa* *mega168pb* *mega2560* *tiny85* *tiny84*"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
@@ -238,13 +247,40 @@ done | sort -u > "$keep"
 find "$INC" -maxdepth 1 -name 'io*.h' ! -name 'io.h' \
   | sort -u | comm -23 - "$keep" | xargs -r rm -f
 rm -f "$keep"
-test -f "$INC/iom328p.h" || { echo "device header trim removed iom328p.h" >&2; exit 1; }
+test -f "$INC/iom328p.h"  || { echo "device header trim removed iom328p.h" >&2; exit 1; }
+test -f "$INC/iom2560.h"  || { echo "device header trim removed iom2560.h" >&2; exit 1; }
+test -f "$INC/iotn85.h"   || { echo "device header trim removed iotn85.h" >&2; exit 1; }
+test -f "$INC/iotn84.h"   || { echo "device header trim removed iotn84.h" >&2; exit 1; }
 for m in $MULTILIBS; do
   test -d "$WORK/x/usr/lib/avr/lib/$m" \
     && cp -R "$WORK/x/usr/lib/avr/lib/$m" "$ROOT/avr/lib/avr/lib/$m"
 done
 find "$WORK/x/usr/lib/avr/lib" -maxdepth 1 -type f \
      -exec cp {} "$ROOT/avr/lib/avr/lib/" \;
+
+# Trim device-specific CRT and library files: keep only the devices in
+# DEVICE_LIBS. Common libraries (libc.a, libm.a, ...) are untouched.
+# This matters most for avr25, which carries 49 files for ~25 devices
+# we do not target.
+for m in $MULTILIBS; do
+  dir="$ROOT/avr/lib/avr/lib/$m"
+  test -d "$dir" || continue
+  devkeep="$(mktemp)"
+  for glob in $DEVICE_LIBS; do
+    ls "$dir"/$glob 2>/dev/null || true
+  done | sort -u > "$devkeep"
+  # Remove device CRT/lib files NOT in the keep list
+  for f in "$dir"/crt*.o "$dir"/lib*.a; do
+    test -f "$f" || continue
+    base="$(basename "$f")"
+    # Common libraries are never device-specific
+    case "$base" in libc.a|libm.a|libprintf_*.a|libscanf_*.a) continue ;; esac
+    if ! grep -qx "$f" "$devkeep"; then
+      rm -f "$f"
+    fi
+  done
+  rm -f "$devkeep"
+done
 
 # ld's own linker scripts (924 KB, all cores). They sit in a DIRECTORY beside
 # the multilibs, so copying "the files at depth 1 plus the multilibs we want"
@@ -301,6 +337,10 @@ echo "cc1 present:     $(test -x "$DST/cc1" && echo yes || echo NO)"
 echo "tooldir as:      $(test -x "$ROOT/avr/lib/avr/bin/as" && echo yes || echo NO)"
 echo "io.h present:    $(test -f "$ROOT/avr/lib/avr/include/avr/io.h" && echo yes || echo NO)"
 echo "avr5 crt:        $(ls "$ROOT/avr/lib/avr/lib/avr5"/crtatmega328p.o >/dev/null 2>&1 \
+                          && echo yes || echo NO)"
+echo "avr6 crt:        $(ls "$ROOT/avr/lib/avr/lib/avr6"/crtatmega2560.o >/dev/null 2>&1 \
+                          && echo yes || echo NO)"
+echo "avr25 crt:       $(ls "$ROOT/avr/lib/avr/lib/avr25"/crtattiny85.o >/dev/null 2>&1 \
                           && echo yes || echo NO)"
 echo "runtime libs:    $(ls "$ROOT/avr/lib-deps" 2>/dev/null | tr '\n' ' ')"
 echo
