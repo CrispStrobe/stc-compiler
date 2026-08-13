@@ -170,6 +170,14 @@ AVR_TARGETS = {
         "mcu": "atmega168p", "flash": 16384,
         "description": "ATmega168P — 16 KB flash",
     },
+    "atmega2560": {
+        "mcu": "atmega2560", "flash": 262144,
+        "description": "ATmega2560 — Arduino Mega, 256 KB flash",
+    },
+    "attiny85": {
+        "mcu": "attiny85", "flash": 8192,
+        "description": "ATtiny85 — 8 KB flash, no hardware UART",
+    },
 }
 
 # ---- ARM (Cortex-M) toolchain, same pattern as AVR above ---------------------
