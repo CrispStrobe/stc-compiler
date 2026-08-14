@@ -61,7 +61,7 @@ def _parse_gas_errors(text: str, src_basename: str) -> list[dict]:
 
 # ---- per-toolchain assemble functions ---------------------------------------
 
-def assemble_8051(source: str) -> dict:
+def assemble_8051(source: str, bin_dir: str | None = None) -> dict:
     """Assemble 8051 source with sdas8051 + sdld."""
     work = os.path.join(tempfile.gettempdir(), f"asm-{uuid.uuid4().hex}")
     os.makedirs(work, exist_ok=True)
@@ -73,8 +73,10 @@ def assemble_8051(source: str) -> dict:
         # Assemble: -p (paging) -l (listing) -o (object) -s (symbols) -g (debug) -ff (flat)
         rel = os.path.join(work, "main.rel")
         lst = os.path.join(work, "main.lst")
+        sdas = os.path.join(bin_dir, "sdas8051") if bin_dir else "sdas8051"
+        sdld = os.path.join(bin_dir, "sdld") if bin_dir else "sdld"
         result = subprocess.run(
-            ["sdas8051", "-plosgff", src],
+            [sdas, "-plosgff", src],
             capture_output=True, text=True, timeout=COMPILE_TIMEOUT, cwd=work)
         stderr = (result.stdout or "") + (result.stderr or "")
         stderr = stderr.replace(work + os.sep, "")
@@ -88,7 +90,7 @@ def assemble_8051(source: str) -> dict:
         # Link
         ihx = os.path.join(work, "main.ihx")
         link_result = subprocess.run(
-            ["sdld", "-n", "-i", ihx, rel],
+            [sdld, "-n", "-i", ihx, rel],
             capture_output=True, text=True, timeout=COMPILE_TIMEOUT, cwd=work)
         link_stderr = ((link_result.stdout or "") + (link_result.stderr or "")).replace(work + os.sep, "")
         stderr += link_stderr
@@ -121,6 +123,13 @@ def assemble_8051(source: str) -> dict:
 
 def assemble_6502(source: str, cfg_path: str) -> dict:
     """Assemble 6502 source with ca65 + ld65."""
+    if shutil.which("ca65") is None or shutil.which("ld65") is None:
+        # cc65 is not vendored on the hosted service (yet): answer cleanly
+        # instead of a 500 — the client shows this string to the user.
+        msg = ("6502 assembly is not available on the hosted service yet "
+               "(cc65 is not deployed); assemble locally with ca65/ld65")
+        return {"success": False, "error": msg,
+                "errors": [{"line": 0, "message": msg}]}
     work = os.path.join(tempfile.gettempdir(), f"asm-{uuid.uuid4().hex}")
     os.makedirs(work, exist_ok=True)
     src = os.path.join(work, "main.s")

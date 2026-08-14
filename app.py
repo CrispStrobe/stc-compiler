@@ -1076,7 +1076,8 @@ async def assemble_source(req: AssembleReq):
     chain = ASSEMBLE_TARGETS.get(target)
 
     if chain == "8051":
-        return asm_mod.assemble_8051(req.asm)
+        stage_toolchain()
+        return asm_mod.assemble_8051(req.asm, STAGE_BIN)
     elif chain == "6502":
         cfg = os.path.join(BASE_DIR, "eater.cfg")
         return asm_mod.assemble_6502(req.asm, cfg)
