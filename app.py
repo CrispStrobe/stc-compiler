@@ -203,10 +203,15 @@ app.add_middleware(
 
 
 def stage_toolchain():
-    """Copy the toolchain into /tmp on cold start. Cheap and idempotent."""
+    """Copy the toolchain into /tmp on cold start. Cheap and idempotent.
+    A PARTIAL stage (interrupted copy: bin/ exists, sdcc missing) used to
+    stick forever — the copy was skipped because the dir existed. Heal it
+    by wiping and recopying."""
     if os.path.isdir(STAGE_BIN) and os.path.exists(os.path.join(STAGE_BIN, "sdcc")):
         return
     os.makedirs(STAGE, exist_ok=True)
+    if os.path.isdir(STAGE_BIN) and not os.path.exists(os.path.join(STAGE_BIN, "sdcc")):
+        shutil.rmtree(STAGE_BIN, ignore_errors=True)
     if not os.path.isdir(STAGE_BIN):
         shutil.copytree(SRC_BIN, STAGE_BIN)
     if not os.path.isdir(STAGE_SHARE):
@@ -222,6 +227,38 @@ def _make_executable(directory: str):
         if os.path.isfile(path):
             os.chmod(path, os.stat(path).st_mode
                      | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+_EXEC_PROBE: dict = {}
+
+
+def _can_execute(path: str) -> bool:
+    """Whether a staged binary actually runs on THIS host. The vendored
+    bundles are linux-x86_64 for Vercel; on a mac dev machine they exist
+    but exec fails (Errno 8), and returning them anyway shadowed a
+    perfectly good Homebrew toolchain on PATH. Probed once, cached."""
+    if path in _EXEC_PROBE:
+        return _EXEC_PROBE[path]
+    try:
+        subprocess.run([path, "--version"], capture_output=True, timeout=10)
+        _EXEC_PROBE[path] = True
+    except OSError:
+        _EXEC_PROBE[path] = False
+    except Exception:
+        _EXEC_PROBE[path] = True   # ran but complained: still executable
+    return _EXEC_PROBE[path]
+
+
+def sdcc_bin_dir() -> str:
+    """Where the 8051 toolchain lives ON THIS HOST: the staged bundle in
+    production (linux-x86_64), the PATH sdcc on a dev machine where the
+    vendored binaries cannot exec. Mirrors stage_avr's dual resolution."""
+    stage_toolchain()
+    staged = os.path.join(STAGE_BIN, "sdcc")
+    if os.path.exists(staged) and _can_execute(staged):
+        return STAGE_BIN
+    found = shutil.which("sdcc")
+    return os.path.dirname(found) if found else STAGE_BIN
 
 
 def stage_avr() -> str | None:
@@ -257,7 +294,8 @@ def stage_avr() -> str | None:
                         os.path.join("lib", "gcc")):
                 for root, _dirs, _files in os.walk(os.path.join(AVR_STAGE, sub)):
                     _make_executable(root)
-        if os.path.exists(os.path.join(AVR_STAGE_BIN, "avr-gcc")):
+        staged = os.path.join(AVR_STAGE_BIN, "avr-gcc")
+        if os.path.exists(staged) and _can_execute(staged):
             return AVR_STAGE_BIN
 
     found = shutil.which("avr-gcc")
@@ -294,7 +332,8 @@ def stage_arm() -> str | None:
                 for root, _dirs, _files in os.walk(
                         os.path.join(ARM_STAGE, sub)):
                     _make_executable(root)
-        if os.path.exists(os.path.join(ARM_STAGE_BIN, "arm-none-eabi-gcc")):
+        staged_arm = os.path.join(ARM_STAGE_BIN, "arm-none-eabi-gcc")
+        if os.path.exists(staged_arm) and _can_execute(staged_arm):
             return ARM_STAGE_BIN
 
     found = shutil.which("arm-none-eabi-gcc")
@@ -825,7 +864,8 @@ def build(req: CompileReq) -> dict:
     with open(src, "w", encoding="utf-8") as handle:
         handle.write(req.code)
 
-    cmd = [os.path.join(STAGE_BIN, "sdcc"), "-mmcs51"]
+    sdcc_dir = sdcc_bin_dir()
+    cmd = [os.path.join(sdcc_dir, "sdcc"), "-mmcs51"]
     # Keil source predates C99 habits and leans on the older grammar; forcing
     # --std-c99 on it costs compiles for nothing.
     if not keil_changes:
@@ -859,7 +899,7 @@ def build(req: CompileReq) -> dict:
         cmd.append(opt)
     cmd += ["-o", work + os.sep, src]
 
-    env = dict(os.environ, PATH=STAGE_BIN + os.pathsep + os.environ.get("PATH", ""))
+    env = dict(os.environ, PATH=sdcc_dir + os.pathsep + os.environ.get("PATH", ""))
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True,
@@ -884,12 +924,12 @@ def build(req: CompileReq) -> dict:
         elif req.format == "hex":
             out, name = os.path.join(work, "main.hex"), f"{stem}.hex"
             with open(out, "w", encoding="utf-8") as handle:
-                packed = subprocess.run([os.path.join(STAGE_BIN, "packihx"), ihx],
+                packed = subprocess.run([os.path.join(sdcc_dir, "packihx"), ihx],
                                         capture_output=True, text=True, timeout=10)
                 handle.write(packed.stdout)
         else:
             out, name = os.path.join(work, "main.bin"), f"{stem}.bin"
-            subprocess.run([os.path.join(STAGE_BIN, "makebin"), "-p", ihx, out],
+            subprocess.run([os.path.join(sdcc_dir, "makebin"), "-p", ihx, out],
                            capture_output=True, timeout=10)
 
         with open(out, "rb") as handle:
@@ -1077,7 +1117,7 @@ async def assemble_source(req: AssembleReq):
 
     if chain == "8051":
         stage_toolchain()
-        return asm_mod.assemble_8051(req.asm, STAGE_BIN)
+        return asm_mod.assemble_8051(req.asm, sdcc_bin_dir())
     elif chain == "6502":
         cfg = os.path.join(BASE_DIR, "eater.cfg")
         return asm_mod.assemble_6502(req.asm, cfg)
@@ -1200,7 +1240,8 @@ async def translate_project_endpoint(req: ProjectReq):
         if not sources:
             return {"success": False, "error": "no .c files in project"}
 
-        base = [os.path.join(STAGE_BIN, "sdcc"), "-mmcs51"]
+        sdcc_dir = sdcc_bin_dir()
+        base = [os.path.join(sdcc_dir, "sdcc"), "-mmcs51"]
         base += result.model_flags       # Keil memory model, via the .uvproj
         base += keil2sdcc.shim_args()
         for directory in sorted(include_dirs):
@@ -1223,7 +1264,7 @@ async def translate_project_endpoint(req: ProjectReq):
             base.append(opt)
 
         env = dict(os.environ,
-                   PATH=STAGE_BIN + os.pathsep + os.environ.get("PATH", ""))
+                   PATH=sdcc_dir + os.pathsep + os.environ.get("PATH", ""))
         log = ""
         rels = []
         for _, source in sorted(sources):
@@ -1252,13 +1293,13 @@ async def translate_project_endpoint(req: ProjectReq):
             out, name = ihx, "project.ihx"
         elif req.format == "hex":
             out, name = os.path.join(work, "project.hex"), "project.hex"
-            packed = subprocess.run([os.path.join(STAGE_BIN, "packihx"), ihx],
+            packed = subprocess.run([os.path.join(sdcc_dir, "packihx"), ihx],
                                     capture_output=True, text=True, timeout=10)
             with open(out, "w", encoding="utf-8") as handle:
                 handle.write(packed.stdout)
         else:
             out, name = os.path.join(work, "project.bin"), "project.bin"
-            subprocess.run([os.path.join(STAGE_BIN, "makebin"), "-p", ihx, out],
+            subprocess.run([os.path.join(sdcc_dir, "makebin"), "-p", ihx, out],
                            capture_output=True, timeout=10)
         with open(out, "rb") as handle:
             blob = handle.read()
