@@ -394,7 +394,7 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
     # a conflicting redefinition at worst.
     if f_cpu and "F_CPU" not in req.code:
         cmd.append(f"-DF_CPU={int(f_cpu)}UL")
-    if req.symbols:
+    if req.symbols or req.disassemble:
         # DWARF is the AVR's .cdb: the line records avr_symtab joins the
         # yield map against. DWARF-2 SPECIFICALLY: gcc 5.4's default DWARF-4
         # produces a .debug_line the bundled binutils 2.26 objdump decodes to
@@ -493,14 +493,14 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
                 symbols_error = str(exc)
 
         listing = None
+        listing_artifact = None
         if req.disassemble:
-            try:
-                dumped = subprocess.run(
-                    [os.path.join(bin_dir, "avr-objdump"), "-d", "-S", elf],
-                    capture_output=True, text=True, timeout=15, env=env)
-                listing = dumped.stdout or f"(objdump failed: {dumped.stderr})"
-            except (OSError, subprocess.SubprocessError) as exc:
-                listing = f"(disassembly failed: {exc})"
+            import listing as listing_mod
+            listing_artifact = listing_mod.from_objdump(
+                bin_dir, "avr", elf, env, "avr-gcc")
+            listing = listing_artifact.get("asm")
+            if not listing:
+                listing = f"(disassembly failed: {listing_artifact.get('error', 'unknown')})"
 
         return {
             "success": True,
@@ -509,6 +509,7 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
             "unresolved": None,
             "warnings": None,
             "disassembly": listing,
+            "listing": listing_artifact,
             "base64": base64.b64encode(blob).decode("ascii"),
             "filename": name,
             "bytes": len(blob),
@@ -572,7 +573,7 @@ def build_arm(req: CompileReq, spec: dict, generated_c: str | None,
            "-Wno-implicit-fallthrough",
            f"-T{ld_script}",
            ]
-    if req.symbols:
+    if req.symbols or req.disassemble:
         # Same DWARF-2 trap as AVR: gcc 8's default DWARF-4 produces line
         # records the bundled binutils 2.35 objdump decodes to nothing.
         cmd.append("-gdwarf-2")
@@ -687,14 +688,14 @@ def build_arm(req: CompileReq, spec: dict, generated_c: str | None,
                 symbols_error = str(exc)
 
         listing = None
+        listing_artifact = None
         if req.disassemble:
-            try:
-                dumped = subprocess.run(
-                    [objdump, "-d", "-S", elf],
-                    capture_output=True, text=True, timeout=15, env=env)
-                listing = dumped.stdout or f"(objdump failed: {dumped.stderr})"
-            except (OSError, subprocess.SubprocessError) as exc:
-                listing = f"(disassembly failed: {exc})"
+            import listing as listing_mod
+            listing_artifact = listing_mod.from_objdump(
+                bin_dir, "arm-none-eabi", elf, env, "arm-gcc")
+            listing = listing_artifact.get("asm")
+            if not listing:
+                listing = f"(disassembly failed: {listing_artifact.get('error', 'unknown')})"
 
         return {
             "success": True,
@@ -703,6 +704,7 @@ def build_arm(req: CompileReq, spec: dict, generated_c: str | None,
             "unresolved": None,
             "warnings": None,
             "disassembly": listing,
+            "listing": listing_artifact,
             "base64": base64.b64encode(blob).decode("ascii"),
             "filename": f"{stem}.bin",
             "bytes": len(blob),
@@ -830,8 +832,11 @@ def build(req: CompileReq) -> dict:
         cmd.append("--std-c99")
     cmd += keil2sdcc.shim_args()
     cmd += target["flags"]
-    if req.symbols:
-        # The .cdb only carries addresses when the LINK step ran with --debug.
+    if req.symbols or req.disassemble:
+        # --debug is needed for: .cdb (symbol table addresses) AND .rst
+        # (source-interleaved listing). It changes the image slightly
+        # (SDCC stops tail-merging returns), but the listing artifact
+        # requires it.
         cmd.append("--debug")
     if req.fosc:
         cmd.append(f"-DFOSC_HZ={int(req.fosc)}UL")
@@ -919,12 +924,17 @@ def build(req: CompileReq) -> dict:
                 symbols_error = str(exc)
 
         listing = None
+        listing_artifact = None
         if req.disassemble:
             try:
                 with open(ihx, encoding="utf-8") as handle:
                     listing = stc_disasm.disassemble_hex(handle.read())
             except (ValueError, OSError) as exc:
                 listing = f"(disassembly failed: {exc})"
+            # Source-interleaved listing from .rst (SDCC's relocatable listing)
+            import listing as listing_mod
+            rst_path = os.path.join(work, "main.rst")
+            listing_artifact = listing_mod.from_sdcc_rst(rst_path)
 
         # SDCC's memory map. Useful enough to hand back that callers can warn
         # before an image silently outgrows the part.
@@ -965,6 +975,7 @@ def build(req: CompileReq) -> dict:
             "unresolved": keil_unresolved or None,
             "warnings": keil_warnings or None,
             "disassembly": listing,     # None unless disassemble was requested
+            "listing": listing_artifact,
             "symbols": symbols,         # None unless symbols was requested
             "symbols_error": symbols_error,
             "base64": base64.b64encode(blob).decode("ascii"),
