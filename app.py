@@ -1035,6 +1035,68 @@ async def disassemble_image(req: DisassembleReq):
     }
 
 
+class AssembleReq(BaseModel):
+    """Raw assembly source for one of the supported architectures."""
+    asm: str
+    # Target device — determines which assembler chain to use.
+    # 8051: sdas8051+sdld; 6502/eater6502: ca65+ld65; atmega*: avr-gcc
+    target: str = "stc12c5a60s2"
+
+
+ASSEMBLE_TARGETS = {
+    # 8051 family → sdas8051
+    "stc12c5a60s2": "8051", "stc12c5a16s2": "8051", "stc89c52rc": "8051",
+    "stc15f2k60s2": "8051", "stc89c52": "8051", "stc15w408as": "8051",
+    "mcs51": "8051",
+    # 6502 → ca65+ld65
+    "eater6502": "6502", "6502": "6502", "w65c02": "6502",
+    # AVR → avr-gcc
+    "atmega328p": "avr", "atmega168p": "avr", "atmega2560": "avr",
+    "attiny85": "avr",
+}
+
+AVR_MCU_FOR_TARGET = {
+    "atmega328p": "atmega328p", "atmega168p": "atmega168p",
+    "atmega2560": "atmega2560", "attiny85": "attiny85",
+}
+
+
+@app.post("/assemble")
+async def assemble_source(req: AssembleReq):
+    """Assemble raw assembly source and return the image.
+
+    Three toolchains: sdas8051+sdld (8051), ca65+ld65 (6502),
+    avr-gcc -x assembler-with-cpp (AVR).
+    """
+    if len(req.asm.encode("utf-8")) > MAX_SOURCE_BYTES:
+        return {"success": False, "error": "source too large"}
+
+    import assemble as asm_mod
+    target = req.target.lower()
+    chain = ASSEMBLE_TARGETS.get(target)
+
+    if chain == "8051":
+        return asm_mod.assemble_8051(req.asm)
+    elif chain == "6502":
+        cfg = os.path.join(BASE_DIR, "eater.cfg")
+        return asm_mod.assemble_6502(req.asm, cfg)
+    elif chain == "avr":
+        avr_bin = stage_avr()
+        if avr_bin is None:
+            return {"success": False, "error": "no AVR toolchain available"}
+        deps = os.path.join(os.path.dirname(avr_bin), "lib-deps")
+        env = dict(os.environ)
+        if os.path.isdir(deps):
+            env["LD_LIBRARY_PATH"] = deps + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+        mcu = AVR_MCU_FOR_TARGET.get(target, "atmega328p")
+        return asm_mod.assemble_avr(req.asm, mcu, avr_bin, env)
+    else:
+        known = sorted(ASSEMBLE_TARGETS.keys())
+        return {"success": False,
+                "error": f"unknown assemble target {req.target!r}; "
+                         f"known: {', '.join(known)}"}
+
+
 @app.post("/translate")
 async def translate_keil(req: CompileReq):
     """Keil C51 in, SDCC-dialect C out. No compiler involved."""
@@ -1635,6 +1697,7 @@ async def health():
         "arm_targets": ({name: cfg["description"] for name, cfg in ARM_TARGETS.items()}
                         if arm_bin else {}),
         "devices": sorted(stc_pseudocode.TARGETS),
+        "assemble_targets": sorted(ASSEMBLE_TARGETS.keys()),
     }
 
 
