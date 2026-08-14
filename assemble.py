@@ -1,4 +1,4 @@
-"""assemble.py — raw-assemble for three toolchains.
+"""assemble.py — raw-assemble for four toolchains.
 
 Request: {asm source, target/toolchain}
 Response mirrors compile: {success, base64, errors: [{line, message}],
@@ -8,6 +8,7 @@ Toolchains:
   8051:  sdas8051 + sdld → Intel HEX
   6502:  ca65 + ld65 (eater.cfg) → raw binary + ld65 -Ln labels
   AVR:   avr-gcc -x assembler-with-cpp → Intel HEX via objcopy
+  ARM:   arm-none-eabi-gcc -x assembler-with-cpp → Intel HEX via objcopy
 """
 import base64
 import os
@@ -266,5 +267,95 @@ def assemble_avr(source: str, mcu: str, bin_dir: str, env: dict) -> dict:
                 "listing": listing_artifact,
                 "log": stderr,
                 "toolchain": "avr-gcc"}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# ---- bare-metal rejection patterns -----------------------------------------
+
+_CODAL_SOFTDEVICE_RE = re.compile(
+    r"\b(?:MICROBIT_\w|codal_\w|MicroBit[A-Z]\w|DEVICE_COMPONENT_\w|"
+    r"nrf_sdh_\w|softdevice|NRF_SDH_\w|CODAL_\w)", re.I)
+
+
+def _reject_codal_softdevice(source: str) -> str | None:
+    """Return a human-readable reason if the source needs CODAL or SoftDevice."""
+    m = _CODAL_SOFTDEVICE_RE.search(source)
+    if m:
+        return (f"source references '{m.group(0)}' which requires "
+                f"CODAL or SoftDevice runtime; this endpoint is bare-metal "
+                f"only (no runtime linked, like the Pico contract)")
+    return None
+
+
+def assemble_arm(source: str, mcu: str, bin_dir: str, env: dict,
+                 ld_script: str) -> dict:
+    """Assemble ARM source with arm-none-eabi-gcc -x assembler-with-cpp.
+
+    Output is Intel HEX (objcopy -O ihex) — the format DAPLink MSD
+    drag-flash accepts on micro:bit V2.
+    """
+    reason = _reject_codal_softdevice(source)
+    if reason:
+        return {"success": False,
+                "errors": [{"line": 0, "message": reason}],
+                "toolchain": "arm-none-eabi-gcc"}
+
+    work = os.path.join(tempfile.gettempdir(), f"asm-{uuid.uuid4().hex}")
+    os.makedirs(work, exist_ok=True)
+    src = os.path.join(work, "main.s")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(source)
+
+    # Copy linker script into work dir so paths don't leak into diagnostics
+    local_ld = os.path.join(work, os.path.basename(ld_script))
+    shutil.copy2(ld_script, local_ld)
+
+    try:
+        elf = os.path.join(work, "main.elf")
+        gcc = os.path.join(bin_dir, "arm-none-eabi-gcc")
+        cmd = [gcc, f"-mcpu={mcu}", "-mthumb", "-nostdlib",
+               "-gdwarf-2",
+               "-x", "assembler-with-cpp",
+               f"-T{local_ld}", "-o", elf, src]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=COMPILE_TIMEOUT, cwd=work, env=env)
+        stderr = ((result.stdout or "") + (result.stderr or "")).replace(
+            work + os.sep, "")
+
+        if result.returncode != 0 or not os.path.exists(elf):
+            return {"success": False,
+                    "errors": _parse_gas_errors(stderr, "main.s") or
+                              [{"line": 0, "message": stderr.strip()
+                                or "assembly failed"}],
+                    "log": stderr}
+
+        # Extract Intel HEX (DAPLink drag-flash format)
+        ihx = os.path.join(work, "main.hex")
+        objcopy = os.path.join(bin_dir, "arm-none-eabi-objcopy")
+        subprocess.run([objcopy, "-O", "ihex", elf, ihx],
+                       capture_output=True, timeout=10, env=env)
+        if not os.path.exists(ihx):
+            return {"success": False,
+                    "errors": [{"line": 0,
+                                "message": "objcopy produced no image"}],
+                    "log": stderr}
+
+        with open(ihx, "rb") as f:
+            blob = f.read()
+
+        # Listing via objdump
+        listing_artifact = listing_mod.from_objdump(
+            bin_dir, "arm-none-eabi", elf, env, "arm-gcc")
+
+        return {"success": True,
+                "base64": base64.b64encode(blob).decode("ascii"),
+                "filename": "main.hex",
+                "bytes": len(blob),
+                "errors": _parse_gas_errors(stderr, "main.s"),
+                "listing": listing_artifact,
+                "log": stderr,
+                "toolchain": "arm-none-eabi-gcc"}
     finally:
         shutil.rmtree(work, ignore_errors=True)

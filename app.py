@@ -1079,7 +1079,8 @@ class AssembleReq(BaseModel):
     """Raw assembly source for one of the supported architectures."""
     asm: str
     # Target device — determines which assembler chain to use.
-    # 8051: sdas8051+sdld; 6502/eater6502: ca65+ld65; atmega*: avr-gcc
+    # 8051: sdas8051+sdld; 6502/eater6502: ca65+ld65; atmega*: avr-gcc;
+    # nrf52833: arm-none-eabi-gcc
     target: str = "stc12c5a60s2"
 
 
@@ -1093,6 +1094,16 @@ ASSEMBLE_TARGETS = {
     # AVR → avr-gcc
     "atmega328p": "avr", "atmega168p": "avr", "atmega2560": "avr",
     "attiny85": "avr",
+    # ARM → arm-none-eabi-gcc
+    "nrf52833": "arm",
+}
+
+ARM_MCU_FOR_TARGET = {
+    "nrf52833": "cortex-m4",
+}
+
+ARM_LD_FOR_TARGET = {
+    "nrf52833": os.path.join(BASE_DIR, "nrf52833.ld"),
 }
 
 AVR_MCU_FOR_TARGET = {
@@ -1105,8 +1116,8 @@ AVR_MCU_FOR_TARGET = {
 async def assemble_source(req: AssembleReq):
     """Assemble raw assembly source and return the image.
 
-    Three toolchains: sdas8051+sdld (8051), ca65+ld65 (6502),
-    avr-gcc -x assembler-with-cpp (AVR).
+    Four toolchains: sdas8051+sdld (8051), ca65+ld65 (6502),
+    avr-gcc (AVR), arm-none-eabi-gcc (ARM/nRF52833).
     """
     if len(req.asm.encode("utf-8")) > MAX_SOURCE_BYTES:
         return {"success": False, "error": "source too large"}
@@ -1131,6 +1142,21 @@ async def assemble_source(req: AssembleReq):
             env["LD_LIBRARY_PATH"] = deps + os.pathsep + env.get("LD_LIBRARY_PATH", "")
         mcu = AVR_MCU_FOR_TARGET.get(target, "atmega328p")
         return asm_mod.assemble_avr(req.asm, mcu, avr_bin, env)
+    elif chain == "arm":
+        arm_bin = stage_arm()
+        if arm_bin is None:
+            return {"success": False,
+                    "error": "no ARM toolchain available"}
+        deps = os.path.join(os.path.dirname(arm_bin), "lib-deps")
+        env = dict(os.environ)
+        if os.path.isdir(deps):
+            env["LD_LIBRARY_PATH"] = deps + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+        mcu = ARM_MCU_FOR_TARGET.get(target, "cortex-m4")
+        ld = ARM_LD_FOR_TARGET.get(target)
+        if not ld or not os.path.exists(ld):
+            return {"success": False,
+                    "error": f"no linker script for target {target!r}"}
+        return asm_mod.assemble_arm(req.asm, mcu, arm_bin, env, ld)
     else:
         known = sorted(ASSEMBLE_TARGETS.keys())
         return {"success": False,
