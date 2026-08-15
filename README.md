@@ -911,3 +911,4 @@ not block the 8051 path going fully static.
   linking exception, so binaries you compile with it are unencumbered.
 - Full detail, including why serving it over HTTP is not distribution:
   [`NOTICE.md`](NOTICE.md).
+
