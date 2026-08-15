@@ -178,6 +178,10 @@ AVR_TARGETS = {
         "mcu": "attiny85", "flash": 8192,
         "description": "ATtiny85 — 8 KB flash, no hardware UART",
     },
+    "attiny88": {
+        "mcu": "attiny88", "flash": 8192,
+        "description": "ATtiny88 — 8 KB flash, 28-pin DIP (Blinkenrocket)",
+    },
 }
 
 # ---- ARM (Cortex-M) toolchain, same pattern as AVR above ---------------------
@@ -1124,7 +1128,7 @@ ASSEMBLE_TARGETS = {
     "eater6502": "6502", "6502": "6502", "w65c02": "6502",
     # AVR → avr-gcc
     "atmega328p": "avr", "atmega168p": "avr", "atmega2560": "avr",
-    "attiny85": "avr",
+    "attiny85": "avr", "attiny88": "avr",
     # ARM → arm-none-eabi-gcc
     "nrf52833": "arm",
     # Z80 → sdasz80+sdldz80
@@ -1142,6 +1146,7 @@ ARM_LD_FOR_TARGET = {
 AVR_MCU_FOR_TARGET = {
     "atmega328p": "atmega328p", "atmega168p": "atmega168p",
     "atmega2560": "atmega2560", "attiny85": "attiny85",
+    "attiny88": "attiny88",
 }
 
 

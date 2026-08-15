@@ -71,7 +71,7 @@ MULTILIBS="avr5 avr6 avr25"
 # Device headers to keep, as globs. One entry per part family in app.py's
 # AVR_TARGETS; everything else in avr-libc's 267-header include/avr is
 # dropped. See the trim below for why.
-DEVICE_HEADERS="iom328*.h iom168*.h iom2560*.h iotn85*.h iotn84*.h"
+DEVICE_HEADERS="iom328*.h iom168*.h iom2560*.h iotn85*.h iotn84*.h iotn88*.h"
 
 # Per-device CRT and lib files to keep, as globs. Everything else in the
 # avr-libc multilib directories (crt*.o, lib<device>.a) is dropped — avr25

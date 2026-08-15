@@ -97,5 +97,49 @@ class TestTiny85(unittest.TestCase):
         self.assertEqual(self.SPEC["flash"], 8192)
 
 
+BLINK_TINY88 = r"""
+#include <avr/io.h>
+
+/* ATtiny88 Blinkenrocket pin test: PORTB = columns, PORTD = rows.
+ * Light one LED: column PB0 LOW (sink), row PD0 HIGH (source).
+ * 788AS matrix: col active-LOW, row active-HIGH. */
+int main(void) {
+    DDRB = 0xFF;      /* all columns output */
+    DDRD = 0xFF;      /* all rows output */
+    PORTB = 0xFE;     /* PB0 LOW (active), rest HIGH (off) */
+    PORTD = 0x01;     /* PD0 HIGH (active), rest LOW (off) */
+    for (;;) ;
+}
+"""
+
+
+class TestTiny88(unittest.TestCase):
+    SPEC = AVR_TARGETS["attiny88"]
+
+    def _build(self, **kw):
+        req = CompileReq(code=BLINK_TINY88, target="attiny88", **kw)
+        return build_avr(req, self.SPEC, None, None)
+
+    def test_compiles(self):
+        r = self._build()
+        self.assertTrue(r["success"], r.get("error"))
+
+    def test_hex_nonempty(self):
+        r = self._build()
+        raw = base64.b64decode(r["base64"])
+        self.assertGreater(len(raw), 10, "Intel HEX too short")
+
+    def test_toolchain_and_mcu(self):
+        r = self._build()
+        self.assertEqual(r["toolchain"], "avr-gcc")
+        self.assertEqual(r["mcu"], "attiny88")
+
+    def test_flash_in_spec(self):
+        self.assertEqual(self.SPEC["flash"], 8192)
+
+    def test_health_lists_target(self):
+        self.assertIn("attiny88", AVR_TARGETS)
+
+
 if __name__ == "__main__":
     unittest.main()
