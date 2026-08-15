@@ -1127,6 +1127,8 @@ ASSEMBLE_TARGETS = {
     "attiny85": "avr",
     # ARM → arm-none-eabi-gcc
     "nrf52833": "arm",
+    # Z80 → sdasz80+sdldz80
+    "z80": "z80",
 }
 
 ARM_MCU_FOR_TARGET = {
@@ -1160,6 +1162,9 @@ async def assemble_source(req: AssembleReq):
     if chain == "8051":
         stage_toolchain()
         return asm_mod.assemble_8051(req.asm, sdcc_bin_dir())
+    elif chain == "z80":
+        stage_toolchain()
+        return asm_mod.assemble_z80(req.asm, sdcc_bin_dir())
     elif chain == "6502":
         cc65_bin = stage_cc65()
         if cc65_bin is None:

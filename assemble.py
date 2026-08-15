@@ -122,6 +122,85 @@ def assemble_8051(source: str, bin_dir: str | None = None) -> dict:
         shutil.rmtree(work, ignore_errors=True)
 
 
+def assemble_z80(source: str, bin_dir: str | None = None) -> dict:
+    """Assemble Z80 source with sdasz80 + sdldz80.
+
+    Output is a raw binary (via makebin on the Intel HEX), suitable for
+    loading into the Z80 machine's ROM.
+    """
+    work = os.path.join(tempfile.gettempdir(), f"asm-{uuid.uuid4().hex}")
+    os.makedirs(work, exist_ok=True)
+    src = os.path.join(work, "main.asm")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(source)
+
+    try:
+        rel = os.path.join(work, "main.rel")
+        lst = os.path.join(work, "main.lst")
+        sdas = os.path.join(bin_dir, "sdasz80") if bin_dir else "sdasz80"
+        sdld = os.path.join(bin_dir, "sdldz80") if bin_dir else "sdldz80"
+        mkbin = os.path.join(bin_dir, "makebin") if bin_dir else "makebin"
+        result = subprocess.run(
+            [sdas, "-plosgff", src],
+            capture_output=True, text=True, timeout=COMPILE_TIMEOUT, cwd=work)
+        stderr = (result.stdout or "") + (result.stderr or "")
+        stderr = stderr.replace(work + os.sep, "")
+
+        if not os.path.exists(rel):
+            return {"success": False,
+                    "errors": _parse_sdas_errors(stderr, "main.asm") or
+                              [{"line": 0, "message": stderr.strip()
+                                or "assembly failed"}],
+                    "log": stderr}
+
+        # Link to Intel HEX
+        ihx = os.path.join(work, "main.ihx")
+        link_result = subprocess.run(
+            [sdld, "-n", "-i", ihx, rel],
+            capture_output=True, text=True, timeout=COMPILE_TIMEOUT, cwd=work)
+        link_stderr = ((link_result.stdout or "") +
+                       (link_result.stderr or "")).replace(work + os.sep, "")
+        stderr += link_stderr
+
+        if not os.path.exists(ihx):
+            return {"success": False,
+                    "errors": _parse_sdas_errors(stderr, "main.asm") or
+                              [{"line": 0, "message": link_stderr.strip()
+                                or "link failed"}],
+                    "log": stderr}
+
+        # Convert IHX → raw binary via makebin
+        out_bin = os.path.join(work, "main.bin")
+        mk_result = subprocess.run(
+            [mkbin, "-s", "32768", ihx],
+            capture_output=True, timeout=COMPILE_TIMEOUT, cwd=work)
+        if mk_result.returncode != 0:
+            return {"success": False,
+                    "errors": [{"line": 0,
+                                "message": "makebin failed"}],
+                    "log": stderr}
+        with open(out_bin, "wb") as f:
+            f.write(mk_result.stdout)
+
+        blob = mk_result.stdout
+
+        # Listing from .lst
+        listing_artifact = None
+        if os.path.exists(lst):
+            listing_artifact = listing_mod.from_sdcc_rst(lst)
+
+        return {"success": True,
+                "base64": base64.b64encode(blob).decode("ascii"),
+                "filename": "main.bin",
+                "bytes": len(blob),
+                "errors": _parse_sdas_errors(stderr, "main.asm"),
+                "listing": listing_artifact,
+                "log": stderr,
+                "toolchain": "sdasz80"}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def assemble_6502(source: str, cfg_path: str,
                    bin_dir: str | None = None) -> dict:
     """Assemble 6502 source with ca65 + ld65.

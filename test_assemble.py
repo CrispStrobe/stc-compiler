@@ -322,5 +322,85 @@ class TestArmAssemble(unittest.TestCase):
         self.assertEqual(ASSEMBLE_TARGETS["nrf52833"], "arm")
 
 
+# ---- Z80 (sdasz80 + sdldz80 + makebin) ------------------------------------
+
+# Minimal Z80: LD A, $55; HALT. Opcodes: 3E 55 76.
+HALT_Z80 = """\
+.module z80halt
+.area CODE (ABS)
+.org 0x0000
+    ld a, #0x55
+    halt
+"""
+
+# Searle-shape Z80: ROM at $0000. Write $42 to MC6850 data port at $80.
+# LD A, $42 = 3E 42; OUT ($80), A = D3 80; HALT = 76.
+ACIA_Z80 = """\
+.module z80acia
+.area CODE (ABS)
+.org 0x0000
+    ld a, #0x42         ; 'B'
+    out (0x80), a       ; write to MC6850 data port
+    halt
+"""
+
+BAD_Z80 = "bad instruction here"
+
+
+class TestZ80Assemble(unittest.TestCase):
+    def _z80(self):
+        from app import sdcc_bin_dir, stage_toolchain
+        stage_toolchain()
+        return sdcc_bin_dir()
+
+    def test_halt_assembles(self):
+        r = assemble.assemble_z80(HALT_Z80, self._z80())
+        self.assertTrue(r["success"], r.get("log") or r.get("errors"))
+
+    def test_halt_bytes_hand_computed(self):
+        """LD A,$55; HALT → bytes 3E 55 76 at address 0."""
+        import base64 as b64
+        r = assemble.assemble_z80(HALT_Z80, self._z80())
+        raw = b64.b64decode(r["base64"])
+        self.assertEqual(raw[0], 0x3E, "LD A,n opcode")
+        self.assertEqual(raw[1], 0x55, "immediate $55")
+        self.assertEqual(raw[2], 0x76, "HALT opcode")
+
+    def test_binary_is_32k(self):
+        """makebin pads to 32768 bytes (the ROM size)."""
+        import base64 as b64
+        r = assemble.assemble_z80(HALT_Z80, self._z80())
+        raw = b64.b64decode(r["base64"])
+        self.assertEqual(len(raw), 32768)
+
+    def test_acia_out_instruction(self):
+        """OUT ($80),A → opcode D3 80."""
+        import base64 as b64
+        r = assemble.assemble_z80(ACIA_Z80, self._z80())
+        raw = b64.b64decode(r["base64"])
+        # LD A,$42 at 0, OUT ($80),A at 2, HALT at 4
+        self.assertEqual(raw[2], 0xD3, "OUT (n),A opcode")
+        self.assertEqual(raw[3], 0x80, "port $80")
+
+    def test_listing_present(self):
+        r = assemble.assemble_z80(HALT_Z80, self._z80())
+        self.assertIsNotNone(r.get("listing"))
+        self.assertEqual(r["listing"]["v"], 1)
+
+    def test_toolchain_field(self):
+        r = assemble.assemble_z80(HALT_Z80, self._z80())
+        self.assertEqual(r["toolchain"], "sdasz80")
+
+    def test_syntax_error(self):
+        r = assemble.assemble_z80(BAD_Z80, self._z80())
+        self.assertFalse(r["success"])
+        self.assertGreater(len(r["errors"]), 0)
+
+    def test_health_lists_z80(self):
+        from app import ASSEMBLE_TARGETS
+        self.assertIn("z80", ASSEMBLE_TARGETS)
+        self.assertEqual(ASSEMBLE_TARGETS["z80"], "z80")
+
+
 if __name__ == "__main__":
     unittest.main()
