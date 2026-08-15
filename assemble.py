@@ -122,15 +122,16 @@ def assemble_8051(source: str, bin_dir: str | None = None) -> dict:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def assemble_6502(source: str, cfg_path: str) -> dict:
-    """Assemble 6502 source with ca65 + ld65."""
-    if shutil.which("ca65") is None or shutil.which("ld65") is None:
-        # cc65 is not vendored on the hosted service (yet): answer cleanly
-        # instead of a 500 — the client shows this string to the user.
-        msg = ("6502 assembly is not available on the hosted service yet "
-               "(cc65 is not deployed); assemble locally with ca65/ld65")
-        return {"success": False, "error": msg,
-                "errors": [{"line": 0, "message": msg}]}
+def assemble_6502(source: str, cfg_path: str,
+                   bin_dir: str | None = None) -> dict:
+    """Assemble 6502 source with ca65 + ld65.
+
+    bin_dir: directory holding the cc65 binaries (ca65, ld65).
+    Falls back to system PATH when None.
+    """
+    ca65_bin = os.path.join(bin_dir, "ca65") if bin_dir else "ca65"
+    ld65_bin = os.path.join(bin_dir, "ld65") if bin_dir else "ld65"
+
     work = os.path.join(tempfile.gettempdir(), f"asm-{uuid.uuid4().hex}")
     os.makedirs(work, exist_ok=True)
     src = os.path.join(work, "main.s")
@@ -142,7 +143,7 @@ def assemble_6502(source: str, cfg_path: str) -> dict:
         obj = os.path.join(work, "main.o")
         lst = os.path.join(work, "main.lst")
         result = subprocess.run(
-            ["ca65", "-l", lst, "-o", obj, src],
+            [ca65_bin, "--cpu", "65C02", "-l", lst, "-o", obj, src],
             capture_output=True, text=True, timeout=COMPILE_TIMEOUT, cwd=work)
         stderr = (result.stderr or "").replace(work + os.sep, "")
 
@@ -159,7 +160,7 @@ def assemble_6502(source: str, cfg_path: str) -> dict:
         local_cfg = os.path.join(work, "eater.cfg")
         shutil.copy2(cfg_path, local_cfg)
         link_result = subprocess.run(
-            ["ld65", "-C", local_cfg, "-Ln", labels, "-o", out_bin, obj],
+            [ld65_bin, "-C", local_cfg, "-Ln", labels, "-o", out_bin, obj],
             capture_output=True, text=True, timeout=COMPILE_TIMEOUT, cwd=work)
         link_stderr = (link_result.stderr or "").replace(work + os.sep, "")
         stderr += link_stderr

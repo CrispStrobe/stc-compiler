@@ -196,6 +196,11 @@ ARM_TARGETS = {
     },
 }
 
+# ---- cc65 toolchain (6502 assembler/linker) ---------------------------------
+SRC_CC65 = os.path.join(BASE_DIR, "cc65")
+CC65_STAGE = "/tmp/cc65"
+CC65_STAGE_BIN = os.path.join(CC65_STAGE, "bin")
+
 app = FastAPI(title="stc-compiler", docs_url="/docs")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
@@ -337,6 +342,32 @@ def stage_arm() -> str | None:
             return ARM_STAGE_BIN
 
     found = shutil.which("arm-none-eabi-gcc")
+    return os.path.dirname(found) if found else None
+
+
+def stage_cc65() -> str | None:
+    """Directory holding ca65/ld65, or None if unavailable.
+
+    Same pattern as stage_arm: Linux-only staging from a vendored bundle,
+    falling back to system ca65 for local dev on macOS/Homebrew.
+    """
+    if sys.platform.startswith("linux") and os.path.isdir(SRC_CC65):
+        if not os.path.exists(os.path.join(CC65_STAGE_BIN, "ca65")):
+            os.makedirs(CC65_STAGE, exist_ok=True)
+            for part in os.listdir(SRC_CC65):
+                source = os.path.join(SRC_CC65, part)
+                destination = os.path.join(CC65_STAGE, part)
+                if os.path.isdir(source) and not os.path.isdir(destination):
+                    shutil.copytree(source, destination, symlinks=True)
+                elif os.path.isfile(source) and not os.path.exists(destination):
+                    shutil.copy2(source, destination)
+            for root, _dirs, _files in os.walk(CC65_STAGE_BIN):
+                _make_executable(root)
+        staged = os.path.join(CC65_STAGE_BIN, "ca65")
+        if os.path.exists(staged) and _can_execute(staged):
+            return CC65_STAGE_BIN
+
+    found = shutil.which("ca65")
     return os.path.dirname(found) if found else None
 
 
@@ -1130,8 +1161,12 @@ async def assemble_source(req: AssembleReq):
         stage_toolchain()
         return asm_mod.assemble_8051(req.asm, sdcc_bin_dir())
     elif chain == "6502":
+        cc65_bin = stage_cc65()
+        if cc65_bin is None:
+            return {"success": False,
+                    "error": "no cc65 toolchain available"}
         cfg = os.path.join(BASE_DIR, "eater.cfg")
-        return asm_mod.assemble_6502(req.asm, cfg)
+        return asm_mod.assemble_6502(req.asm, cfg, bin_dir=cc65_bin)
     elif chain == "avr":
         avr_bin = stage_avr()
         if avr_bin is None:
@@ -1753,12 +1788,24 @@ async def health():
         except Exception:  # noqa: BLE001 - absence is reported, not raised
             arm_version = ""
 
+    # cc65 side — simpler than gcc, just check ca65 --version.
+    cc65_bin = stage_cc65()
+    cc65_version = ""
+    if cc65_bin:
+        try:
+            cc65_version = subprocess.run(
+                [os.path.join(cc65_bin, "ca65"), "--version"],
+                capture_output=True, text=True, timeout=10).stderr or ""
+        except Exception:  # noqa: BLE001
+            cc65_version = ""
+
     return {
         "ok": True,
         "version": os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7] or "unknown",
         "sdcc": version.strip().splitlines()[0] if version else "",
         "avr_gcc": avr_version.strip().splitlines()[0] if avr_version else None,
         "arm_gcc": arm_version.strip().splitlines()[0] if arm_version else None,
+        "cc65": cc65_version.strip().splitlines()[0] if cc65_version else None,
         "targets": {name: cfg["description"] for name, cfg in TARGETS.items()},
         "avr_targets": ({name: cfg["description"] for name, cfg in AVR_TARGETS.items()}
                         if avr_bin else {}),
