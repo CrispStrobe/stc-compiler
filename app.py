@@ -1199,6 +1199,41 @@ async def assemble_source(req: AssembleReq):
                          f"known: {', '.join(known)}"}
 
 
+class UF2Req(BaseModel):
+    """Request body for /uf2: convert a raw binary to UF2 container."""
+    base64: str  # raw binary image, base64-encoded
+    origin: int = 0x10000000  # target address (default: RP2040 flash)
+
+
+@app.post("/uf2")
+async def convert_to_uf2(req: UF2Req):
+    """Convert a raw binary to a UF2 container for BOOTSEL drag-flash.
+
+    Takes the base64-encoded binary and an origin address, returns a UF2
+    file (also base64-encoded) ready for the browser to offer as a download.
+    """
+    import uf2 as uf2_mod
+    try:
+        raw = base64.b64decode(req.base64)
+    except Exception:
+        return {"success": False, "error": "invalid base64 input"}
+    if len(raw) > 2 * 1024 * 1024:
+        return {"success": False, "error": "binary too large (max 2 MB)"}
+    if len(raw) == 0:
+        return {"success": False, "error": "empty binary"}
+
+    container = uf2_mod.binary_to_uf2(raw, req.origin)
+    return {
+        "success": True,
+        "base64": base64.b64encode(container).decode("ascii"),
+        "filename": "firmware.uf2",
+        "bytes": len(container),
+        "blocks": len(container) // 512,
+        "origin": req.origin,
+        "family_id": uf2_mod.RP2040_FAMILY_ID,
+    }
+
+
 @app.post("/translate")
 async def translate_keil(req: CompileReq):
     """Keil C51 in, SDCC-dialect C out. No compiler involved."""
