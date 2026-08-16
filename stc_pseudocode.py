@@ -1386,7 +1386,7 @@ AVR_328P_PINS = {
 }
 AVR_328P_BY_PORT = {location: label for label, location in AVR_328P_PINS.items()}
 
-AVR_PIN_RE = re.compile(r"^(?:([da])(\d{1,2})|p([b-d])(\d))$", re.I)
+AVR_PIN_RE = re.compile(r"^(?:([da])(\d{1,2})|p([a-l])(\d))$", re.I)
 
 # Timer 0 prescalers, smallest first, with their CS02:CS00 bits. The tick wants
 # an EXACT millisecond, so the emitter picks the first prescaler that divides
@@ -1846,6 +1846,42 @@ class AvrTarget(Target):
 
 def _stc(key, display, header, port_modes, aux_1t_bit, adc, pwm=False):
     return Stc8051Target(key, display, header, port_modes, aux_1t_bit, adc, pwm)
+
+
+class PortBitAvrTarget(AvrTarget):
+    """AVR or 6502 parts that use port-letter+bit pin naming (PA0, PB7).
+
+    Unlike AvrTarget (which maps D0-D13/A0-A5 to the ATmega328P pinout),
+    this target accepts any port letter A-L with any bit 0-7 directly.
+    Used for ATtiny88, ATtiny85, eater6502.
+    """
+
+    def __init__(self, key: str, display: str, mcu: str, flash: int,
+                 ports: str = "ABCD", default_clock: int = 8000000):
+        super().__init__(key, display, mcu, flash)
+        self._ports = frozenset(ports.upper())
+        self.default_clock = default_clock
+
+    def resolve_pin(self, program, name, where, direction, active_low, line):
+        match = AVR_PIN_RE.match(where)
+        if not match:
+            raise PseudocodeError(
+                line, f"{where.upper()} is not a pin on the {self.display}; "
+                      f"use P{'/P'.join(sorted(self._ports))}0-7")
+        kind, number, port, bit = match.groups()
+        if kind:
+            raise PseudocodeError(
+                line, f"{self.display} uses port names (PB0, PD7), "
+                      f"not Arduino numbers ({where.upper()})")
+        port = port.upper()
+        bit = int(bit)
+        if port not in self._ports:
+            raise PseudocodeError(
+                line, f"Port {port} does not exist on the {self.display}; "
+                      f"known ports: {', '.join(sorted(self._ports))}")
+        label = f"P{port}{bit}"
+        channel = None
+        return AvrPin(name, label, direction, active_low, port, bit, channel)
 
 
 TARGETS = {
@@ -2339,7 +2375,7 @@ def parse(source: str) -> Program:
     program = Program()
     index = 0
 
-    device = re.fullmatch(r"device\s+([\w-]+)\s*:", lines[0].text, re.I)
+    device = re.fullmatch(r"device\s+([\w-]+)\s*:?", lines[0].text, re.I)
     if device:
         program.part = device.group(1).lower()
         if program.part in TARGETS:
@@ -3221,3 +3257,22 @@ TARGETS["microbit"] = MicrobitTarget()
 TARGETS["micro-bit"] = TARGETS["microbit"]
 TARGETS["pico"] = PicoTarget()
 TARGETS["rp2040"] = TARGETS["pico"]
+
+# Arduino Mega 2560: 54 digital + 16 analog, same core as Uno.
+TARGETS["arduino-mega"] = ArduinoTarget("arduino-mega", "Arduino Mega", 53, 15)
+
+# ATtiny family: bare AVR (no Arduino core), port/bit pin names.
+TARGETS["attiny88"] = PortBitAvrTarget(
+    "attiny88", "ATtiny88", "attiny88", 8192, ports="ABCD", default_clock=8000000)
+TARGETS["attiny85"] = PortBitAvrTarget(
+    "attiny85", "ATtiny85", "attiny85", 8192, ports="AB", default_clock=8000000)
+
+# STC15W408AS: same register layout as STC15F2K, but no Timer 1.
+TARGETS["stc15w408as"] = _stc(
+    "stc15w408as", "STC15W408AS", "stc12.h", True, True, True, True)
+
+# EATER6502: the pseudocode parser accepts the device. The compile
+# service routes it to cc65 (a different backend than SDCC). Pin names
+# are PA0-PA7 / PB0-PB6 (the VIA ports).
+TARGETS["eater6502"] = PortBitAvrTarget(
+    "eater6502", "Eater 6502", "eater6502", 32768, ports="AB", default_clock=1000000)
