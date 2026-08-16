@@ -58,7 +58,7 @@ def _c_string(text: str) -> str:
             out.append(char)
     return "".join(out)
 
-PORT_RE = re.compile(r"^P([0-4])\.([0-7])$", re.I)
+PORT_RE = re.compile(r"^P([0-5])\.([0-7])$", re.I)
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -612,7 +612,8 @@ class Stc8051Target(Target):
     """
 
     def __init__(self, key: str, display: str, header: str,
-                 port_modes: bool, aux_1t_bit: bool, adc: bool, pwm: bool = False):
+                 port_modes: bool, aux_1t_bit: bool, adc: bool, pwm: bool = False,
+                 p5: bool = False):
         self.key = key
         self.display = display
         self.header = header        # the SDCC header with this family's registers
@@ -620,6 +621,7 @@ class Stc8051Target(Target):
         self.aux_1t_bit = aux_1t_bit  # AUXR.7 selects T0 1T mode and must be cleared
         self.adc = adc                # 10-bit ADC on P1 (STC12 only)
         self.pwm = pwm                # PCA capture/compare modules with PWM mode
+        self.p5 = p5                  # port 5 exists (STC15; P5.4/P5.5 on DIP-40)
         # Where UART1's baud rate comes from. The STC12 has a dedicated
         # baud-rate timer; the STC89 has to spend Timer 1 on it, which is the
         # same Timer 1 a TONE pin wants -- so on that family the two features
@@ -656,6 +658,20 @@ class Stc8051Target(Target):
                 line, f"{where.upper()} is not a pin on the {self.display}; "
                       "use P0.0 to P4.7")
         port, bit = int(match.group(1)), int(match.group(2))
+
+        # P5 is an STC15 port (STC15-PERIPHERAL-MODEL.md par.3). On parts
+        # without it the pin does not exist; on the STC15 DIP-40 only
+        # P5.4 (RST-shared) and P5.5 are bonded -- the RBS15667 console's
+        # buzzer is P5.5, which is why this stopped being hypothetical.
+        if port == 5:
+            if not getattr(self, "p5", False):
+                raise PseudocodeError(
+                    line, f"P5.{bit} does not exist on the {self.display}; "
+                          "port 5 is an STC15 feature (STC15-PERIPHERAL-MODEL.md)")
+            if bit not in (4, 5):
+                raise PseudocodeError(
+                    line, f"P5.{bit} is not bonded on the DIP-40; "
+                          "only P5.4 and P5.5 reach pins")
 
         # Two names for one physical pin is always a mistake, and nothing
         # downstream would notice: program.pins is keyed by name, so both
@@ -749,9 +765,39 @@ class Stc8051Target(Target):
 
     # ---- the shell ------------------------------------------------------
     def prologue(self, program):
+        supplement = []
+        if self.p5:
+            # The STC15 supplement -- everything the STC15 has that SDCC's
+            # stc12.h does not declare, emitted for EVERY STC15 program so
+            # the header story is complete, never patched per feature.
+            # Deduped against the shipped stc12.h (SDCC 4.5.0): it already
+            # carries P5/P5M0/P5M1 at the STC15's addresses but stops the
+            # sbits at P5_3. Addresses: STC15-PERIPHERAL-MODEL.md par.3.
+            # sb3-creator emits the identical block; this file is the
+            # reference implementation, so the two must not drift.
+            supplement = [
+                "/* STC15 supplement -- registers stc12.h lacks (STC15-PERIPHERAL-MODEL.md) */",
+                "__sbit __at (0xCC) P5_4;      /* DIP-40 pin 17, RST-shared */",
+                "__sbit __at (0xCD) P5_5;      /* DIP-40 pin 19 */",
+                "__sbit __at (0xCE) P5_6;      /* not bonded on DIP-40 */",
+                "__sbit __at (0xCF) P5_7;      /* not bonded on DIP-40 */",
+                "__sfr  __at (0xD6) T2H;       /* Timer 2 -- the UART1 baud source */",
+                "__sfr  __at (0xD7) T2L;",
+                "__sfr  __at (0xBA) P_SW2;     /* peripheral pin switch 2 */",
+                "__sfr  __at (0xAA) WKTCL;     /* wake-up timer */",
+                "__sfr  __at (0xAB) WKTCH;",
+                "__sfr  __at (0xDC) CCAPM2;    /* third PCA/CCP channel */",
+                "__sfr  __at (0xEC) CCAP2L;",
+                "__sfr  __at (0xFC) CCAP2H;",
+                "__sfr  __at (0xF4) PCA_PWM2;",
+                "#define P_SW1    AUXR1        /* STC15 name for 0xA2 */",
+                "#define INT_CLKO WAKE_CLKO    /* STC15 name for 0x8F */",
+                "",
+            ]
         return [
             f"#include <{self.header}>",
             "",
+            *supplement,
             f"#define FOSC_HZ {program.clock}UL",
             "",
             "/* Timer 0, mode 1, clocked at FOSC/12 -- accuracy depends only on",
@@ -1844,8 +1890,8 @@ class AvrTarget(Target):
         return out + ["}", ""]
 
 
-def _stc(key, display, header, port_modes, aux_1t_bit, adc, pwm=False):
-    return Stc8051Target(key, display, header, port_modes, aux_1t_bit, adc, pwm)
+def _stc(key, display, header, port_modes, aux_1t_bit, adc, pwm=False, p5=False):
+    return Stc8051Target(key, display, header, port_modes, aux_1t_bit, adc, pwm, p5)
 
 
 class PortBitAvrTarget(AvrTarget):
@@ -1895,7 +1941,7 @@ TARGETS = {
     # at 0xD6/0xD7, S3CON...) are registers this generator never writes.
     # Keil TRANSLATION of arbitrary STC15 code is a different problem with
     # its own family shim.
-    "stc15f2k60s2": _stc("stc15f2k60s2", "STC15F2K60S2", "stc12.h", True, True, True, True),
+    "stc15f2k60s2": _stc("stc15f2k60s2", "STC15F2K60S2", "stc12.h", True, True, True, True, p5=True),
 
     # Both are ATmega328P boards and differ here only in how many analog pins
     # the package brings out: the Uno's header stops at A5, the Nano carries
@@ -2062,6 +2108,21 @@ class ExprParser:
             return Unary("-", self.atom())
         if token.lower() == "not":
             return Unary("not", self.atom())
+        if token.lower() == "read":
+            # sb3-creator's dialect spells a pin read as `read <pin>`; ours
+            # is the bare pin name. The oracle accepts what the other
+            # implementation emits, or parity is a fiction: `read x` is
+            # exactly PinRef(x) (polarity applied like any pin read).
+            nxt = self.peek()
+            if nxt is not None and nxt.lower() in self.program.pins:
+                self.take()
+                return PinRef(nxt.lower())
+            # `read` not followed by a pin falls through to being a
+            # variable name, as before.
+            if NAME_RE.match(token):
+                if token not in self.program.locals_ and token not in self.program.variables:
+                    self.program.variables.append(token)
+                return Var(token)
         if re.fullmatch(r"0[xX][0-9A-Fa-f]+", token):
             return Num(float(int(token, 16)))
         if re.fullmatch(r"0[bB][01]+", token):
@@ -3269,7 +3330,7 @@ TARGETS["attiny85"] = PortBitAvrTarget(
 
 # STC15W408AS: same register layout as STC15F2K, but no Timer 1.
 TARGETS["stc15w408as"] = _stc(
-    "stc15w408as", "STC15W408AS", "stc12.h", True, True, True, True)
+    "stc15w408as", "STC15W408AS", "stc12.h", True, True, True, True, p5=True)
 
 # EATER6502: the pseudocode parser accepts the device. The compile
 # service routes it to cc65 (a different backend than SDCC). Pin names
