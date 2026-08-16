@@ -12,6 +12,7 @@ their own upstream licenses.
 |---|---|---|
 | `bin/sdcc`, `bin/sdcpp`, `bin/sdas8051`, `bin/sdld`, `bin/packihx`, `bin/makebin` | [SDCC — Small Device C Compiler](https://sdcc.sourceforge.net/) | **GPL-2.0-or-later** |
 | `share/sdcc/include/**`, `share/sdcc/lib/**` | SDCC runtime headers and libraries | **GPL-2.0-or-later with a linking exception** (see below) |
+| `arduino-core/cores/tiny/**`, `arduino-core/variants/**` | [ATTinyCore](https://github.com/SpenceKonde/ATTinyCore) by Spence Konde | **LGPL-2.1** (see below) |
 
 Binaries were taken unmodified from Debian's `sdcc` and `sdcc-libraries`
 packages, version `4.0.0+dfsg-2`. `scripts/fetch-sdcc.sh` reproduces the
@@ -74,6 +75,38 @@ build is `apt-get source sdcc=4.0.0+dfsg-2`, and upstream releases are at
 repository.
 
 *None of the above is legal advice.*
+
+## ATTinyCore — LGPL-2.1 posture
+
+The `arduino-core/` directory vendors a minimal subset of
+[ATTinyCore](https://github.com/SpenceKonde/ATTinyCore) (© 2015–2022 Spence
+Konde, © 2005–2006 David A. Mellis), covering only the files needed to compile
+Arduino-API sketches for ATtiny85 and ATtiny88: `wiring.c`, `wiring_digital.c`,
+the core headers, and two variant pin maps.
+
+ATTinyCore is licensed under **LGPL-2.1-or-later**. The LGPL's linking
+obligation means that anyone who receives a binary linked against LGPL code must
+be able to relink it with a modified version of the library. Here that
+obligation is satisfied naturally:
+
+1. **The core source is public and unmodified.** It is checked into this
+   repository exactly as published upstream. Anyone can inspect, modify, and
+   rebuild it.
+2. **The compiled .hex is produced server-side.** The user receives only the
+   compiled output (an Intel HEX image), never the LGPL object code as a
+   library. The core is compiled alongside the user's sketch in one avr-gcc
+   invocation, not pre-linked as a static library — but even if it were, the
+   full unmodified source is right here in the repo.
+3. **No core source is shipped to the browser or to downstream app repos.**
+   The ATTinyCore files live only on the server. The returned .hex is the
+   user's program; the LGPL does not claim it (LGPL §6: "a work that uses the
+   Library" is not a derivative work of it).
+
+This is standard Arduino-ecosystem practice: the Arduino IDE itself compiles
+LGPL core libraries alongside user sketches and ships the resulting .hex to the
+board. This service does the same thing, just over HTTP.
+
+The full LGPL-2.1 license text is at `arduino-core/LICENSE.md`.
 
 ## Related
 

@@ -670,5 +670,99 @@ check("a path traversal in NAME is refused",
 check("the UI treats source-only as a result, not a failure",
       "source only, needs" in page and "data.c && data.toolchain" in page)
 
+# ---- Arduino (ATTinyCore) language route -------------------------------------
+print("\n--- Arduino (ATTinyCore) language route ---")
+
+ARDUINO_BLINK = """\
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+}
+void loop() {
+  digitalWrite(LED_BUILTIN, HIGH);
+  delay(500);
+  digitalWrite(LED_BUILTIN, LOW);
+  delay(500);
+}
+"""
+
+# ATtiny88 blink
+result, _ = post({"code": ARDUINO_BLINK, "language": "arduino",
+                   "target": "attiny88", "fosc": 8000000})
+check("arduino attiny88 blink compiles",
+      result.get("success") is True,
+      str(result.get("error", ""))[:100] if not result.get("success") else "")
+if result.get("success"):
+    check("arduino attiny88 toolchain is avr-gcc+ATTinyCore",
+          result.get("toolchain") == "avr-gcc+ATTinyCore",
+          result.get("toolchain"))
+    check("arduino attiny88 echoes mcu",
+          result.get("mcu") == "attiny88", result.get("mcu"))
+    check("arduino attiny88 echoes f_cpu",
+          result.get("f_cpu") == 8000000, str(result.get("f_cpu")))
+    hex_text = base64.b64decode(result["base64"]).decode()
+    check("arduino attiny88 hex is valid Intel HEX",
+          hex_text.startswith(":") and hex_text.strip().endswith(":00000001FF"))
+    image, errs = code_bytes(hex_text)
+    check("arduino attiny88 hex checksums pass",
+          len(errs) == 0, f"{len(errs)} errors" if errs else "")
+    check("arduino attiny88 image is reasonably sized",
+          200 < len(image) < 4096,
+          f"{len(image)} bytes")
+    check("arduino attiny88 memory report present",
+          "attiny88" in (result.get("memory") or "").lower(),
+          (result.get("memory") or "")[:80])
+
+# ATtiny85 blink
+result, _ = post({"code": ARDUINO_BLINK, "language": "arduino",
+                   "target": "attiny85", "fosc": 8000000})
+check("arduino attiny85 blink compiles",
+      result.get("success") is True,
+      str(result.get("error", ""))[:100] if not result.get("success") else "")
+if result.get("success"):
+    check("arduino attiny85 echoes mcu",
+          result.get("mcu") == "attiny85", result.get("mcu"))
+    check("arduino attiny85 echoes f_cpu",
+          result.get("f_cpu") == 8000000, str(result.get("f_cpu")))
+    hex85 = base64.b64decode(result["base64"]).decode()
+    img85, errs85 = code_bytes(hex85)
+    check("arduino attiny85 hex checksums pass",
+          len(errs85) == 0, f"{len(errs85)} errors" if errs85 else "")
+
+# Wrong target: arduino + atmega328p should fail with a clear message
+result, _ = post({"code": ARDUINO_BLINK, "language": "arduino",
+                   "target": "atmega328p"})
+check("arduino rejects non-ATtiny target",
+      result.get("success") is False and "ATtiny" in (result.get("error") or ""),
+      (result.get("error") or "")[:80])
+
+# Arduino with explicit #include
+ARDUINO_EXPLICIT = '#include <Arduino.h>\n' + ARDUINO_BLINK
+result, _ = post({"code": ARDUINO_EXPLICIT, "language": "arduino",
+                   "target": "attiny88"})
+check("arduino with explicit #include compiles",
+      result.get("success") is True,
+      str(result.get("error", ""))[:100] if not result.get("success") else "")
+
+# Custom F_CPU via fosc parameter (1 MHz internal — valid for all ATtinys)
+result, _ = post({"code": ARDUINO_BLINK, "language": "arduino",
+                   "target": "attiny85", "fosc": 1000000})
+check("arduino custom f_cpu echoed",
+      result.get("success") is True and result.get("f_cpu") == 1000000,
+      str(result.get("f_cpu")))
+
+# Health check reports arduino_targets
+try:
+    with urllib.request.urlopen(f"{BASE}/health", timeout=30) as response:
+        health = json.load(response)
+    check("health reports arduino_targets",
+          "attiny85" in health.get("arduino_targets", {}),
+          str(list(health.get("arduino_targets", {}).keys())))
+except Exception as exc:
+    check("health reports arduino_targets", False, str(exc))
+
+# UI offers Arduino language option
+check("the UI offers Arduino language",
+      "arduino" in page.lower() and "ATtiny" in page)
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
