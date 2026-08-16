@@ -172,6 +172,11 @@ class TestZ80Stages(unittest.TestCase):
         stage_toolchain()
         return assemble.assemble_z80(HALT_Z80, sdcc_bin_dir(), **kw)
 
+    def test_no_stages_without_debug(self):
+        r = self._assemble(debug=False)
+        self.assertTrue(r["success"])
+        self.assertNotIn("stages", r)
+
     def test_stages_present_with_debug(self):
         r = self._assemble(debug=True)
         self.assertTrue(r["success"])
@@ -182,6 +187,12 @@ class TestZ80Stages(unittest.TestCase):
         tokens = r["stages"]["tokens"]
         labels = [t for t in tokens if t["type"] == "label"]
         self.assertTrue(any(t["text"] == "start" for t in labels))
+
+    def test_stages_has_listing(self):
+        r = self._assemble(debug=True)
+        listing = r["stages"]["listing"]
+        self.assertIsInstance(listing, str)
+        self.assertGreater(len(listing), 0)
 
 
 # ---- AVR / avr-gcc stages ----
@@ -209,6 +220,11 @@ class TestAvrStages(unittest.TestCase):
             env["LD_LIBRARY_PATH"] = deps + os.pathsep + env.get("LD_LIBRARY_PATH", "")
         return assemble.assemble_avr(BLINK_AVR, "atmega328p", bin_dir, env, **kw)
 
+    def test_no_stages_without_debug(self):
+        r = self._assemble(debug=False)
+        self.assertTrue(r["success"])
+        self.assertNotIn("stages", r)
+
     def test_stages_present_with_debug(self):
         r = self._assemble(debug=True)
         self.assertTrue(r["success"])
@@ -219,6 +235,9 @@ class TestAvrStages(unittest.TestCase):
         tokens = r["stages"]["tokens"]
         labels = [t for t in tokens if t["type"] == "label"]
         self.assertTrue(any(t["text"] == "loop" for t in labels))
+        # main should be in identifiers (.global main)
+        idents = [t for t in tokens if t["type"] == "identifier"]
+        self.assertTrue(any(t["text"] == "main" for t in idents))
 
     def test_stages_has_symbols(self):
         r = self._assemble(debug=True)
@@ -227,6 +246,14 @@ class TestAvrStages(unittest.TestCase):
         symbols = passes[0]["symbols"]
         self.assertIn("main", symbols)
         self.assertTrue(symbols["main"]["resolved"])
+        # main address should be 0 (start of code)
+        self.assertEqual(symbols["main"]["value"], 0)
+
+    def test_stages_has_listing(self):
+        r = self._assemble(debug=True)
+        listing = r["stages"]["listing"]
+        self.assertIsInstance(listing, str)
+        self.assertGreater(len(listing), 0)
 
 
 # ---- ARM / arm-none-eabi-gcc stages ----
@@ -261,6 +288,11 @@ class TestArmStages(unittest.TestCase):
         return assemble.assemble_arm(VECTOR_LOOP_ARM, "cortex-m4",
                                      bin_dir, env, ld, **kw)
 
+    def test_no_stages_without_debug(self):
+        r = self._assemble(debug=False)
+        self.assertTrue(r["success"])
+        self.assertNotIn("stages", r)
+
     def test_stages_present_with_debug(self):
         r = self._assemble(debug=True)
         self.assertTrue(r["success"])
@@ -271,6 +303,8 @@ class TestArmStages(unittest.TestCase):
         tokens = r["stages"]["tokens"]
         labels = [t for t in tokens if t["type"] == "label"]
         self.assertTrue(any(t["text"] == "Reset_Handler" for t in labels))
+        directives = [t for t in tokens if t["type"] == "directive"]
+        self.assertTrue(any(t["text"] == ".syntax" for t in directives))
 
     def test_stages_has_symbols(self):
         r = self._assemble(debug=True)
@@ -278,6 +312,13 @@ class TestArmStages(unittest.TestCase):
         self.assertGreater(len(passes), 0)
         symbols = passes[0]["symbols"]
         self.assertIn("Reset_Handler", symbols)
+        self.assertTrue(symbols["Reset_Handler"]["resolved"])
+
+    def test_stages_has_listing(self):
+        r = self._assemble(debug=True)
+        listing = r["stages"]["listing"]
+        self.assertIsInstance(listing, str)
+        self.assertGreater(len(listing), 0)
 
 
 if __name__ == "__main__":
