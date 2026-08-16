@@ -1376,7 +1376,7 @@ async def assemble_source(req: AssembleReq):
         if os.path.isdir(deps):
             env["LD_LIBRARY_PATH"] = deps + os.pathsep + env.get("LD_LIBRARY_PATH", "")
         mcu = AVR_MCU_FOR_TARGET.get(target, "atmega328p")
-        return asm_mod.assemble_avr(req.asm, mcu, avr_bin, env)
+        return asm_mod.assemble_avr(req.asm, mcu, avr_bin, env, debug=req.debug)
     elif chain == "arm":
         arm_bin = stage_arm()
         if arm_bin is None:
@@ -1391,7 +1391,7 @@ async def assemble_source(req: AssembleReq):
         if not ld or not os.path.exists(ld):
             return {"success": False,
                     "error": f"no linker script for target {target!r}"}
-        return asm_mod.assemble_arm(req.asm, mcu, arm_bin, env, ld)
+        return asm_mod.assemble_arm(req.asm, mcu, arm_bin, env, ld, debug=req.debug)
     else:
         known = sorted(ASSEMBLE_TARGETS.keys())
         return {"success": False,

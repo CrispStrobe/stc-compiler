@@ -348,7 +348,8 @@ def _listing_from_ca65(lst_path: str) -> dict:
     return {"asm": text, "lineMap": line_map, "format": "ca65", "v": listing_mod.VERSION}
 
 
-def assemble_avr(source: str, mcu: str, bin_dir: str, env: dict) -> dict:
+def assemble_avr(source: str, mcu: str, bin_dir: str, env: dict,
+                  debug: bool = False) -> dict:
     """Assemble AVR source with avr-gcc -x assembler-with-cpp."""
     work = os.path.join(tempfile.gettempdir(), f"asm-{uuid.uuid4().hex}")
     os.makedirs(work, exist_ok=True)
@@ -389,6 +390,25 @@ def assemble_avr(source: str, mcu: str, bin_dir: str, env: dict) -> dict:
         listing_artifact = listing_mod.from_objdump(
             bin_dir, "avr", elf, env, "avr-gcc")
 
+        # Stages payload (debug mode)
+        stages_payload = None
+        if debug:
+            import stages as stages_mod
+            nm = os.path.join(bin_dir, "avr-nm")
+            if not os.path.exists(nm):
+                nm = shutil.which("avr-nm")
+            nm_text = ""
+            if nm:
+                try:
+                    nm_result = subprocess.run(
+                        [nm, "-S", elf], capture_output=True, text=True,
+                        timeout=10, env=env)
+                    nm_text = (nm_result.stdout or "")
+                except Exception:
+                    pass
+            stages_payload = stages_mod.stages_gcc(
+                source, nm_text, listing_artifact)
+
         return {"success": True,
                 "base64": base64.b64encode(blob).decode("ascii"),
                 "filename": "main.hex",
@@ -396,7 +416,8 @@ def assemble_avr(source: str, mcu: str, bin_dir: str, env: dict) -> dict:
                 "errors": _parse_gas_errors(stderr, "main.S"),
                 "listing": listing_artifact,
                 "log": stderr,
-                "toolchain": "avr-gcc"}
+                "toolchain": "avr-gcc",
+                **({"stages": stages_payload} if stages_payload else {})}
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -419,7 +440,7 @@ def _reject_codal_softdevice(source: str) -> str | None:
 
 
 def assemble_arm(source: str, mcu: str, bin_dir: str, env: dict,
-                 ld_script: str) -> dict:
+                 ld_script: str, debug: bool = False) -> dict:
     """Assemble ARM source with arm-none-eabi-gcc -x assembler-with-cpp.
 
     Output is Intel HEX (objcopy -O ihex) — the format DAPLink MSD
@@ -479,6 +500,25 @@ def assemble_arm(source: str, mcu: str, bin_dir: str, env: dict,
         listing_artifact = listing_mod.from_objdump(
             bin_dir, "arm-none-eabi", elf, env, "arm-gcc")
 
+        # Stages payload (debug mode)
+        stages_payload = None
+        if debug:
+            import stages as stages_mod
+            nm = os.path.join(bin_dir, "arm-none-eabi-nm")
+            if not os.path.exists(nm):
+                nm = shutil.which("arm-none-eabi-nm")
+            nm_text = ""
+            if nm:
+                try:
+                    nm_result = subprocess.run(
+                        [nm, "-S", elf], capture_output=True, text=True,
+                        timeout=10, env=env)
+                    nm_text = (nm_result.stdout or "")
+                except Exception:
+                    pass
+            stages_payload = stages_mod.stages_gcc(
+                source, nm_text, listing_artifact)
+
         return {"success": True,
                 "base64": base64.b64encode(blob).decode("ascii"),
                 "filename": "main.hex",
@@ -486,6 +526,7 @@ def assemble_arm(source: str, mcu: str, bin_dir: str, env: dict,
                 "errors": _parse_gas_errors(stderr, "main.s"),
                 "listing": listing_artifact,
                 "log": stderr,
-                "toolchain": "arm-none-eabi-gcc"}
+                "toolchain": "arm-none-eabi-gcc",
+                **({"stages": stages_payload} if stages_payload else {})}
     finally:
         shutil.rmtree(work, ignore_errors=True)

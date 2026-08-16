@@ -184,5 +184,101 @@ class TestZ80Stages(unittest.TestCase):
         self.assertTrue(any(t["text"] == "start" for t in labels))
 
 
+# ---- AVR / avr-gcc stages ----
+
+BLINK_AVR = """\
+.global main
+main:
+    sbi 0x04, 5
+    sbi 0x05, 5
+loop:
+    rjmp loop
+"""
+
+
+class TestAvrStages(unittest.TestCase):
+    def _assemble(self, **kw):
+        from app import stage_avr
+        import os
+        bin_dir = stage_avr()
+        if bin_dir is None:
+            self.skipTest("no AVR toolchain")
+        env = dict(os.environ)
+        deps = os.path.join(os.path.dirname(bin_dir), "lib-deps")
+        if os.path.isdir(deps):
+            env["LD_LIBRARY_PATH"] = deps + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+        return assemble.assemble_avr(BLINK_AVR, "atmega328p", bin_dir, env, **kw)
+
+    def test_stages_present_with_debug(self):
+        r = self._assemble(debug=True)
+        self.assertTrue(r["success"])
+        self.assertIn("stages", r)
+
+    def test_stages_has_tokens(self):
+        r = self._assemble(debug=True)
+        tokens = r["stages"]["tokens"]
+        labels = [t for t in tokens if t["type"] == "label"]
+        self.assertTrue(any(t["text"] == "loop" for t in labels))
+
+    def test_stages_has_symbols(self):
+        r = self._assemble(debug=True)
+        passes = r["stages"]["passes"]
+        self.assertGreater(len(passes), 0)
+        symbols = passes[0]["symbols"]
+        self.assertIn("main", symbols)
+        self.assertTrue(symbols["main"]["resolved"])
+
+
+# ---- ARM / arm-none-eabi-gcc stages ----
+
+VECTOR_LOOP_ARM = """\
+.syntax unified
+.cpu cortex-m4
+.thumb
+.section .vectors, "a"
+.word 0x20020000
+.word Reset_Handler
+.text
+.global Reset_Handler
+.type Reset_Handler, %function
+Reset_Handler:
+    b .
+"""
+
+
+class TestArmStages(unittest.TestCase):
+    def _assemble(self, **kw):
+        from app import stage_arm
+        import os
+        bin_dir = stage_arm()
+        if bin_dir is None:
+            self.skipTest("no ARM toolchain")
+        env = dict(os.environ)
+        deps = os.path.join(os.path.dirname(bin_dir), "lib-deps")
+        if os.path.isdir(deps):
+            env["LD_LIBRARY_PATH"] = deps + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+        ld = os.path.join(os.path.dirname(__file__), "nrf52833.ld")
+        return assemble.assemble_arm(VECTOR_LOOP_ARM, "cortex-m4",
+                                     bin_dir, env, ld, **kw)
+
+    def test_stages_present_with_debug(self):
+        r = self._assemble(debug=True)
+        self.assertTrue(r["success"])
+        self.assertIn("stages", r)
+
+    def test_stages_has_tokens(self):
+        r = self._assemble(debug=True)
+        tokens = r["stages"]["tokens"]
+        labels = [t for t in tokens if t["type"] == "label"]
+        self.assertTrue(any(t["text"] == "Reset_Handler" for t in labels))
+
+    def test_stages_has_symbols(self):
+        r = self._assemble(debug=True)
+        passes = r["stages"]["passes"]
+        self.assertGreater(len(passes), 0)
+        symbols = passes[0]["symbols"]
+        self.assertIn("Reset_Handler", symbols)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -230,3 +230,57 @@ def stages_z80(source: str, listing_text: str) -> dict:
     """Build the stages payload for a Z80/sdasz80 assembly.
     Same listing format as 8051 (both are SDCC sdas family)."""
     return stages_8051(source, listing_text)
+
+
+# ---- gcc family (AVR, ARM) ----
+
+def parse_nm_symbols(nm_text: str) -> dict:
+    """Parse nm -S output into a symbol table.
+
+    nm format: addr [size] type name
+    Example: 00000080 00000004 T main
+    """
+    symbols = {}
+    for line in nm_text.splitlines():
+        parts = line.strip().split()
+        if len(parts) < 3:
+            continue
+        # With -S: addr size type name
+        # Without -S: addr type name
+        if len(parts) >= 4 and len(parts[0]) >= 4:
+            addr_str, _size, sym_type, name = parts[0], parts[1], parts[2], parts[3]
+        elif len(parts) == 3:
+            addr_str, sym_type, name = parts
+        else:
+            continue
+        try:
+            value = int(addr_str, 16)
+        except ValueError:
+            continue
+        # Skip internal/compiler symbols
+        if name.startswith("__") or name.startswith("."):
+            continue
+        symbols[name] = {
+            "value": value,
+            "resolved": True,
+            "type": sym_type,
+        }
+    return symbols
+
+
+def stages_gcc(source: str, nm_text: str,
+               listing_artifact: dict | None) -> dict:
+    """Build the stages payload for a gcc-family assembly (AVR, ARM).
+
+    Tokens from the source; symbols from nm; listing from the existing
+    objdump-based listing artifact.
+    """
+    symbols = parse_nm_symbols(nm_text)
+    listing_text = ""
+    if listing_artifact and isinstance(listing_artifact, dict):
+        listing_text = listing_artifact.get("asm", "")
+    return {
+        "tokens": tokenize_asm(source),
+        "passes": [{"symbols": symbols}] if symbols else [],
+        "listing": listing_text,
+    }
