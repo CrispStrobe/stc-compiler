@@ -200,6 +200,16 @@ ARM_TARGETS = {
     },
 }
 
+# 6502 compile target: the composable EATER6502 machine. The assemble path
+# (ca65+ld65) landed first; build_6502 completes the C story using the
+# same staged bundle, now carrying the cc65 compiler binary and include/.
+EATER_TARGETS = {
+    "eater6502": {
+        "cpu": "65C02", "rom": 32768,
+        "description": "EATER6502 — composable 6502 machine, 32 KB ROM at $8000",
+    },
+}
+
 # ---- cc65 toolchain (6502 assembler/linker) ---------------------------------
 SRC_CC65 = os.path.join(BASE_DIR, "cc65")
 CC65_STAGE = "/tmp/cc65"
@@ -795,6 +805,174 @@ def build_arm(req: CompileReq, spec: dict, generated_c: str | None,
         shutil.rmtree(work, ignore_errors=True)
 
 
+def cc65_env(bin_dir: str) -> dict:
+    """Subprocess env for the cc65 tools: CC65_HOME points at the bundle
+    root so cc65 finds include/, ca65 asminc/ and ld65 lib/ — the flat
+    layout the vendored cc65/ directory (and its /tmp stage) uses. A
+    system cc65 (local dev) keeps its own defaults when no bundle root
+    exists next to its bin dir."""
+    env = dict(os.environ)
+    root = os.path.dirname(bin_dir)
+    # none.lib specifically, not just any lib/ — Homebrew's bin dir sits
+    # under a prefix whose lib/ is the GENERAL one, and claiming it as
+    # CC65_HOME would send ld65 looking for none.lib where it never is.
+    if os.path.exists(os.path.join(root, "lib", "none.lib")):
+        env["CC65_HOME"] = root
+    return env
+
+
+def _ihex_from_bin(blob: bytes, origin: int) -> str:
+    """Intel HEX for a flat binary at a 16-bit origin — 16-byte records
+    plus EOF, so /flash-style consumers can stay format-agnostic."""
+    lines = []
+    for offset in range(0, len(blob), 16):
+        chunk = blob[offset:offset + 16]
+        addr = origin + offset
+        rec = bytes([len(chunk), (addr >> 8) & 0xff, addr & 0xff, 0x00]) + chunk
+        checksum = (-sum(rec)) & 0xff
+        lines.append(":" + rec.hex().upper() + f"{checksum:02X}")
+    lines.append(":00000001FF")
+    return "\n".join(lines) + "\n"
+
+
+def build_6502(req: CompileReq, generated_c: str | None,
+               stem: str = "main") -> dict:
+    """Compile C for the EATER6502 machine with cc65 and return the ROM.
+
+    The pipeline is sb3-creator's reference/6502-target, verbatim:
+        cc65 -t none --cpu 65C02 -O  ->  ca65 x2  ->  ld65 -C eater.cfg
+    yielding a raw 32 KB ROM image loaded at $8000, vectors included.
+    Same response shape as every other path — base64 image, filename,
+    bytes, log — so clients learn nothing new.
+    """
+    refusal = reject_path_options(req.options)
+    if refusal:
+        return refusal
+
+    bin_dir = stage_cc65()
+    if bin_dir is None or not (
+            os.path.exists(os.path.join(bin_dir, "cc65"))
+            or shutil.which("cc65")):
+        return {"success": False, "stage": "compile",
+                "error": "no cc65 C compiler available; the cc65/ bundle in "
+                         "this deployment lacks the cc65 binary and none is "
+                         "on PATH",
+                "c": generated_c}
+    env = cc65_env(bin_dir)
+
+    def tool(name):
+        p = os.path.join(bin_dir, name)
+        return p if os.path.exists(p) else name
+
+    work = os.path.join(tempfile.gettempdir(), f"build-{uuid.uuid4().hex}")
+    os.makedirs(work, exist_ok=True)
+    src = os.path.join(work, "main.c")
+    with open(src, "w", encoding="utf-8") as handle:
+        handle.write(req.code)
+    for name in req.defines:
+        if not name.replace("_", "").isalnum():
+            shutil.rmtree(work, ignore_errors=True)
+            return {"success": False, "error": f"bad define name: {name!r}"}
+
+    def run(cmd):
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=COMPILE_TIMEOUT, cwd=work, env=env)
+
+    import assemble as asm_mod
+    try:
+        # C -> assembly. -O is the reference flag set; the volatile-read
+        # pitfall it creates is handled in the EMITTER (the static
+        # volatile sink), not by weakening optimization here.
+        asm = os.path.join(work, "main.s")
+        cc_cmd = [tool("cc65"), "-t", "none", "--cpu", "65C02", "-O",
+                  "-o", asm]
+        for name, value in req.defines.items():
+            cc_cmd.append(f"-D{name}" if value is None else f"-D{name}={value}")
+        result = run(cc_cmd + [src])
+        log = ((result.stdout or "") + (result.stderr or "")).replace(work + os.sep, "")
+        if result.returncode != 0 or not os.path.exists(asm):
+            return {"success": False, "stage": "compile",
+                    "errors": asm_mod._parse_ca65_errors(log, "main.c") or
+                              [{"line": 0, "message": log.strip() or "cc65 failed"}],
+                    "error": log.strip() or "cc65 failed",
+                    "log": log, "c": generated_c}
+
+        obj = os.path.join(work, "main.o")
+        result = run([tool("ca65"), "--cpu", "65C02", "-o", obj, asm])
+        log += ((result.stdout or "") + (result.stderr or "")).replace(work + os.sep, "")
+        if result.returncode != 0:
+            return {"success": False, "stage": "assemble",
+                    "error": log.strip() or "ca65 failed", "log": log,
+                    "c": generated_c}
+        crt_obj = os.path.join(work, "crt0.o")
+        result = run([tool("ca65"), "--cpu", "65C02", "-o", crt_obj,
+                      os.path.join(BASE_DIR, "crt0.s")])
+        log += ((result.stdout or "") + (result.stderr or "")).replace(work + os.sep, "")
+        if result.returncode != 0:
+            return {"success": False, "stage": "assemble",
+                    "error": log.strip() or "ca65 (crt0) failed", "log": log,
+                    "c": generated_c}
+
+        # Link: crt0 first (STARTUP order), none.lib for the runtime
+        # helpers — absolute path from the bundle root (or the system
+        # share for a PATH toolchain), no search ambiguity.
+        root = env.get("CC65_HOME")
+        if root:
+            none_lib = os.path.join(root, "lib", "none.lib")
+        else:
+            cc_path = shutil.which("cc65") or tool("cc65")
+            none_lib = os.path.normpath(os.path.join(
+                os.path.dirname(cc_path), "..", "share", "cc65", "lib", "none.lib"))
+        rom = os.path.join(work, "main.rom")
+        labels = os.path.join(work, "main.lbl")
+        result = run([tool("ld65"), "-C", os.path.join(BASE_DIR, "eater.cfg"),
+                      "-Ln", labels, "-o", rom, crt_obj, obj, none_lib])
+        log += ((result.stdout or "") + (result.stderr or "")).replace(work + os.sep, "")
+        if result.returncode != 0 or not os.path.exists(rom):
+            return {"success": False, "stage": "link",
+                    "error": log.strip() or "ld65 failed", "log": log,
+                    "c": generated_c}
+
+        with open(rom, "rb") as handle:
+            blob = handle.read()
+        symbols = None
+        if req.symbols and os.path.exists(labels):
+            # ld65 -Ln: "al 00XXXX .name" — the 6502's plain-text symbol
+            # side-channel, enough for the debugger's label view.
+            symbols = {}
+            with open(labels, encoding="utf-8") as handle:
+                for line in handle:
+                    parts = line.split()
+                    if len(parts) == 3 and parts[0] == "al":
+                        symbols[parts[2].lstrip(".")] = int(parts[1], 16)
+
+        if req.format == "bin":
+            payload, name = blob, f"{stem}.rom"
+            body = {"base64": base64.b64encode(payload).decode("ascii")}
+        else:
+            text = _ihex_from_bin(blob, 0x8000)
+            payload, name = text.encode(), f"{stem}.hex"
+            body = {"hex": text,
+                    "base64": base64.b64encode(payload).decode("ascii")}
+
+        return {
+            "success": True,
+            "c": generated_c,
+            **body,
+            "filename": name,
+            "bytes": len(blob),
+            "origin": 0x8000,
+            "log": log,
+            "symbols": symbols,
+            "toolchain": "cc65",
+            "mcu": "eater6502",
+        }
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": f"compile timed out after {COMPILE_TIMEOUT}s"}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def _fosc_from_source(code: str) -> int | None:
     """The clock, read back out of the source.
 
@@ -885,9 +1063,18 @@ def build(req: CompileReq) -> dict:
                              f"compiled for {arm['mcu']}"}
         return build_arm(req, arm, generated_c)
 
+    eater = EATER_TARGETS.get(req.target.lower())
+    if eater is not None:
+        if keil_changes:
+            return {"success": False,
+                    "error": "the Keil C51 dialect is 8051-only; it cannot be "
+                             "compiled for the 6502"}
+        return build_6502(req, generated_c, stem)
+
     target = TARGETS.get(req.target.lower())
     if target is None:
-        known = sorted(list(TARGETS) + list(AVR_TARGETS) + list(ARM_TARGETS))
+        known = sorted(list(TARGETS) + list(AVR_TARGETS) + list(ARM_TARGETS)
+                       + list(EATER_TARGETS))
         return {"success": False,
                 "error": f"unknown target '{req.target}'; known: {', '.join(known)}"}
 
