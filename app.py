@@ -1304,6 +1304,9 @@ class AssembleReq(BaseModel):
     # 8051: sdas8051+sdld; 6502/eater6502: ca65+ld65; atmega*: avr-gcc;
     # nrf52833: arm-none-eabi-gcc
     target: str = "stc12c5a60s2"
+    # debug: if True, response gains a `stages` payload with tokens,
+    # symbol passes, and the raw assembler listing.
+    debug: bool = False
 
 
 ASSEMBLE_TARGETS = {
@@ -1353,17 +1356,17 @@ async def assemble_source(req: AssembleReq):
 
     if chain == "8051":
         stage_toolchain()
-        return asm_mod.assemble_8051(req.asm, sdcc_bin_dir())
+        return asm_mod.assemble_8051(req.asm, sdcc_bin_dir(), debug=req.debug)
     elif chain == "z80":
         stage_toolchain()
-        return asm_mod.assemble_z80(req.asm, sdcc_bin_dir())
+        return asm_mod.assemble_z80(req.asm, sdcc_bin_dir(), debug=req.debug)
     elif chain == "6502":
         cc65_bin = stage_cc65()
         if cc65_bin is None:
             return {"success": False,
                     "error": "no cc65 toolchain available"}
         cfg = os.path.join(BASE_DIR, "eater.cfg")
-        return asm_mod.assemble_6502(req.asm, cfg, bin_dir=cc65_bin)
+        return asm_mod.assemble_6502(req.asm, cfg, bin_dir=cc65_bin, debug=req.debug)
     elif chain == "avr":
         avr_bin = stage_avr()
         if avr_bin is None:

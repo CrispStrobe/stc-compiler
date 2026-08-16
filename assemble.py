@@ -62,7 +62,8 @@ def _parse_gas_errors(text: str, src_basename: str) -> list[dict]:
 
 # ---- per-toolchain assemble functions ---------------------------------------
 
-def assemble_8051(source: str, bin_dir: str | None = None) -> dict:
+def assemble_8051(source: str, bin_dir: str | None = None,
+                   debug: bool = False) -> dict:
     """Assemble 8051 source with sdas8051 + sdld."""
     work = os.path.join(tempfile.gettempdir(), f"asm-{uuid.uuid4().hex}")
     os.makedirs(work, exist_ok=True)
@@ -110,6 +111,16 @@ def assemble_8051(source: str, bin_dir: str | None = None) -> dict:
         if os.path.exists(lst):
             listing_artifact = listing_mod.from_sdcc_rst(lst)
 
+        # Stages payload (debug mode)
+        stages_payload = None
+        if debug:
+            import stages as stages_mod
+            lst_text = ""
+            if os.path.exists(lst):
+                with open(lst, encoding="utf-8", errors="replace") as f:
+                    lst_text = f.read()
+            stages_payload = stages_mod.stages_8051(source, lst_text)
+
         return {"success": True,
                 "base64": base64.b64encode(blob).decode("ascii"),
                 "filename": "main.ihx",
@@ -117,12 +128,14 @@ def assemble_8051(source: str, bin_dir: str | None = None) -> dict:
                 "errors": _parse_sdas_errors(stderr, "main.asm"),
                 "listing": listing_artifact,
                 "log": stderr,
-                "toolchain": "sdas8051"}
+                "toolchain": "sdas8051",
+                **({"stages": stages_payload} if stages_payload else {})}
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def assemble_z80(source: str, bin_dir: str | None = None) -> dict:
+def assemble_z80(source: str, bin_dir: str | None = None,
+                  debug: bool = False) -> dict:
     """Assemble Z80 source with sdasz80 + sdldz80.
 
     Output is a raw binary (via makebin on the Intel HEX), suitable for
@@ -189,6 +202,16 @@ def assemble_z80(source: str, bin_dir: str | None = None) -> dict:
         if os.path.exists(lst):
             listing_artifact = listing_mod.from_sdcc_rst(lst)
 
+        # Stages payload (debug mode)
+        stages_payload = None
+        if debug:
+            import stages as stages_mod
+            lst_text = ""
+            if os.path.exists(lst):
+                with open(lst, encoding="utf-8", errors="replace") as f:
+                    lst_text = f.read()
+            stages_payload = stages_mod.stages_z80(source, lst_text)
+
         return {"success": True,
                 "base64": base64.b64encode(blob).decode("ascii"),
                 "filename": "main.bin",
@@ -196,17 +219,20 @@ def assemble_z80(source: str, bin_dir: str | None = None) -> dict:
                 "errors": _parse_sdas_errors(stderr, "main.asm"),
                 "listing": listing_artifact,
                 "log": stderr,
-                "toolchain": "sdasz80"}
+                "toolchain": "sdasz80",
+                **({"stages": stages_payload} if stages_payload else {})}
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
 def assemble_6502(source: str, cfg_path: str,
-                   bin_dir: str | None = None) -> dict:
+                   bin_dir: str | None = None,
+                   debug: bool = False) -> dict:
     """Assemble 6502 source with ca65 + ld65.
 
     bin_dir: directory holding the cc65 binaries (ca65, ld65).
     Falls back to system PATH when None.
+    debug: if True, add stages payload (tokens, symbols, listing).
     """
     ca65_bin = os.path.join(bin_dir, "ca65") if bin_dir else "ca65"
     ld65_bin = os.path.join(bin_dir, "ld65") if bin_dir else "ld65"
@@ -221,8 +247,12 @@ def assemble_6502(source: str, cfg_path: str,
         # Assemble
         obj = os.path.join(work, "main.o")
         lst = os.path.join(work, "main.lst")
+        ca65_cmd = [ca65_bin, "--cpu", "65C02", "-l", lst, "-o", obj]
+        if debug:
+            ca65_cmd.append("-g")
+        ca65_cmd.append(src)
         result = subprocess.run(
-            [ca65_bin, "--cpu", "65C02", "-l", lst, "-o", obj, src],
+            ca65_cmd,
             capture_output=True, text=True, timeout=COMPILE_TIMEOUT, cwd=work)
         stderr = (result.stderr or "").replace(work + os.sep, "")
 
@@ -238,8 +268,13 @@ def assemble_6502(source: str, cfg_path: str,
         # Copy the config into work so paths don't leak
         local_cfg = os.path.join(work, "eater.cfg")
         shutil.copy2(cfg_path, local_cfg)
+        ld65_cmd = [ld65_bin, "-C", local_cfg, "-Ln", labels, "-o", out_bin]
+        dbg_file = os.path.join(work, "main.dbg")
+        if debug:
+            ld65_cmd.extend(["--dbgfile", dbg_file])
+        ld65_cmd.append(obj)
         link_result = subprocess.run(
-            [ld65_bin, "-C", local_cfg, "-Ln", labels, "-o", out_bin, obj],
+            ld65_cmd,
             capture_output=True, text=True, timeout=COMPILE_TIMEOUT, cwd=work)
         link_stderr = (link_result.stderr or "").replace(work + os.sep, "")
         stderr += link_stderr
@@ -264,6 +299,20 @@ def assemble_6502(source: str, cfg_path: str,
         if os.path.exists(lst):
             listing_artifact = _listing_from_ca65(lst)
 
+        # Stages payload (debug mode)
+        stages_payload = None
+        if debug:
+            import stages as stages_mod
+            lst_text = ""
+            if os.path.exists(lst):
+                with open(lst, encoding="utf-8", errors="replace") as f:
+                    lst_text = f.read()
+            dbg_text = None
+            if os.path.exists(dbg_file):
+                with open(dbg_file, encoding="utf-8", errors="replace") as f:
+                    dbg_text = f.read()
+            stages_payload = stages_mod.stages_6502(source, lst_text, dbg_text)
+
         return {"success": True,
                 "base64": base64.b64encode(blob).decode("ascii"),
                 "filename": "main.bin",
@@ -272,7 +321,8 @@ def assemble_6502(source: str, cfg_path: str,
                 "listing": listing_artifact,
                 "labels": labels_text,
                 "log": stderr,
-                "toolchain": "ca65"}
+                "toolchain": "ca65",
+                **({"stages": stages_payload} if stages_payload else {})}
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
