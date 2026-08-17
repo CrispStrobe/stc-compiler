@@ -26,3 +26,13 @@ each verb needs grammar, AST, and lowering in stmts_c/stmts_task plus
 compiled by sb3-creator (`bw transpile` / the app); this service still
 builds the C that sb3-creator EMITS (its /compile endpoints are
 dialect-agnostic C/ASM toolchains).
+
+## Divergence in the OTHER direction (2026-08-17, evening)
+
+**`PART <name> = KEYPAD4X4 ROWS <4 pins> COLS <4 pins>`** now exists
+HERE first: a read-only part (the scanned key 0..15, -1 for none) whose
+emitted scanner is the one verified on Prechin A2 silicon the same
+evening (stc12c5a60s2-lab 06-matrix89/09-keyshow89). 8051 family only —
+push-pull targets need row tri-stating before they may opt in.
+sb3-creator's generateC does NOT have it yet; until it does, keypad
+programs compile through this service only (`compile-remote.sh -p`).

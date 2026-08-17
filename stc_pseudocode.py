@@ -112,6 +112,12 @@ class PinRef(Expr):
 
 
 @dataclass
+class KeypadRef(Expr):
+    """Reading a KEYPAD4X4 PART: the scanned key 0..15, or -1 for none."""
+    part: str
+
+
+@dataclass
 class Unary(Expr):
     op: str            # "not" | "-"
     operand: Expr
@@ -366,6 +372,41 @@ class ShiftPart:
 
 
 @dataclass
+class KeypadPart:
+    """A 4x4 matrix keypad: sixteen keys for eight pins.
+
+    Modelled as a read-only value — the scanned key 0..15 (row-major from
+    the top-left), or -1 while nothing is pressed — because that is what a
+    program wants to know. The scan drives one row low at a time and reads
+    the columns, which is invisible from the outside and cheap enough to
+    run on every read.
+
+    Measured precedent: the Prechin A2's keypad (rows P1.7..P1.4, cols
+    P1.3..P1.0) was mapped on real silicon by src/06-matrix89 and consumed
+    by src/09-keyshow89 in the stc12c5a60s2-lab repo, 2026-08-17. The C
+    this PART emits is that verified scanner.
+
+    Two-key caveat, inherited from the classic scan: two keys pressed in
+    the SAME COLUMN short a driven-low row into an idle-high one. On
+    quasi-bidirectional 8051 ports the weak pull-up limits that current by
+    construction, which is why the part is admitted for the 8051 family
+    first; push-pull targets need row tri-stating before they can opt in.
+    """
+    name: str
+    kind: str                   # "keypad4x4"
+    rows: list                  # 4 pins, top row first — driven low one at a time
+    cols: list                  # 4 pins, left column first — read
+
+    @property
+    def claimed(self) -> list:
+        return self.rows + self.cols
+
+    @property
+    def claimed_where(self) -> list:
+        return [pin.where for pin in self.claimed]
+
+
+@dataclass
 class Pin8051(Pin):
     """The 8051 view: a port and a bit, which is what the registers are named for."""
     port: int = 0
@@ -600,7 +641,8 @@ class Target:
 
 
 class Stc8051Target(Target):
-    supports = frozenset({"pwm", "tone", "print", "port", "table", "part"})
+    supports = frozenset({"pwm", "tone", "print", "port", "table", "part",
+                          "keypad"})
 
     """The 8051 families, which differ from each other only in three flags.
 
@@ -868,6 +910,32 @@ class Stc8051Target(Target):
                 "",
             ]
         for part in program.parts.values():
+            if isinstance(part, KeypadPart):
+                out += [
+                    f"/* {part.name}: a 4x4 matrix keypad, sixteen keys for eight pins.",
+                    " *",
+                    " * The scan drives one row low and reads the columns — the",
+                    " * scanner verified on Prechin A2 silicon (06-matrix89 mapped it,",
+                    " * 09-keyshow89 consumed it). Idle rows sit quasi-high, so the",
+                    " * two-keys-in-one-column short is current-limited by the port's",
+                    " * weak pull-up. The nops respect the 1T core's 4-clock I/O",
+                    " * read-back (a 12T core just wastes two cycles). */",
+                    f"static signed char bw_part_{part.name}_read(void)",
+                    "{",
+                ]
+                for r, rpin in enumerate(part.rows):
+                    out.append(f"    {rpin.sfr} = 0;")
+                    out.append("    __asm__(\"nop\"); __asm__(\"nop\");")
+                    for c, cpin in enumerate(part.cols):
+                        out.append(f"    if (!{cpin.sfr}) {{ {rpin.sfr} = 1; "
+                                   f"return {r * 4 + c}; }}")
+                    out.append(f"    {rpin.sfr} = 1;")
+                out += [
+                    "    return -1;",
+                    "}",
+                    "",
+                ]
+                continue
             out += [
                 f"/* {part.name}: a 74HC595, eight outputs for three pins.",
                 " *",
@@ -2139,6 +2207,9 @@ class ExprParser:
             return Num(0)
         if lowered in self.program.ports:
             return PortRef(lowered)
+        if (lowered in self.program.parts
+                and isinstance(self.program.parts[lowered], KeypadPart)):
+            return KeypadRef(lowered)
         if lowered in self.program.tables:
             if self.take() != "[":
                 raise PseudocodeError(
@@ -2283,6 +2354,10 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
 
     into = re.match(r"set\s+(\w+)\s+to\s+(.+)$", text.strip(), re.I)
     if into and into.group(1).lower() in program.parts:
+        if isinstance(program.parts[into.group(1).lower()], KeypadPart):
+            raise PseudocodeError(
+                line, f"{into.group(1)!r} is a keypad and cannot be written; "
+                      f"read it in an expression (`set k to {into.group(1)}`)")
         return SetPart(into.group(1).lower(),
                        expression(into.group(2), program, line))
     if into and into.group(1).lower() in program.ports:
@@ -2414,6 +2489,10 @@ WHEN_RE = re.compile(r"when\s+(started|flag\s+clicked|powered\s+on)\s*:", re.I)
 WHEN_PIN_RE = re.compile(r"when\s+(\w+)\s+(pressed|released)\s*:", re.I)
 PIN_RE = re.compile(r"pin\s+(\w+)\s*=\s*(\S+)\s+(output|input|analog|pwm|tone)"
                     r"(?:\s+active\s+(low|high))?", re.I)
+KEYPAD_RE = re.compile(
+    r"part\s+(\w+)\s*=\s*keypad4x4\s+"
+    r"rows\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+"
+    r"cols\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$", re.I)
 PART_RE = re.compile(r"part\s+(\w+)\s*=\s*74hc595\s+data\s+(\S+)\s+"
                      r"clock\s+(\S+)\s+latch\s+(\S+)"
                      r"(?:\s+active\s+(low|high))?", re.I)
@@ -2476,6 +2555,48 @@ def parse(source: str) -> Program:
         if clock and not started:
             value = int(clock.group(1).replace("_", ""))
             program.clock = value * 1_000_000 if clock.group(2) == "mhz" else value
+            index += 1
+            continue
+
+        keypad = KEYPAD_RE.fullmatch(lowered)
+        if keypad and not started:
+            require(program, "keypad", line.number, "a KEYPAD4X4 PART")
+            name = keypad.group(1)
+            if name in program.parts or name in program.ports or name in program.pins:
+                raise PseudocodeError(line.number, f"{name!r} declared twice")
+            scratch = Program(part=program.part)
+            tokens = keypad.groups()[1:]
+            roles = ([f"row{i}" for i in range(4)]
+                     + [f"col{i}" for i in range(4)])
+            # rows scan as outputs, cols read as inputs; resolved against a
+            # scratch program for the same reason the 595's pins are
+            claims = [program.target.resolve_pin(
+                          scratch, f"{name}_{role}", token,
+                          "output" if role.startswith("row") else "input",
+                          False, line.number)
+                      for role, token in zip(roles, tokens)]
+            if len({pin.where for pin in claims}) != 8:
+                raise PseudocodeError(
+                    line.number, f"{name!r} names the same pin twice; a 4x4 "
+                                 f"keypad claims eight different pins")
+            for claimed in claims:
+                for other in program.pins.values():
+                    if other.where == claimed.where:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is already declared as "
+                                         f"{other.name!r}; a PART claims its pins")
+                for whole in program.ports.values():
+                    if getattr(claimed, "port", None) == whole.port:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is inside the whole port "
+                                         f"{whole.name!r}, which would clobber it")
+                for prev in program.parts.values():
+                    if claimed.where in prev.claimed_where:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is already claimed by "
+                                         f"{prev.name!r}")
+            program.parts[name] = KeypadPart(name, "keypad4x4",
+                                             claims[:4], claims[4:])
             index += 1
             continue
 
@@ -2687,6 +2808,8 @@ def expr_pseudo(node: Expr, parent_level: int = -1) -> str:
         return f"{node.table}[{expr_pseudo(node.where)}]"
     if isinstance(node, (Var, PinRef)):
         return node.name
+    if isinstance(node, KeypadRef):
+        return node.part
     if isinstance(node, Unary):
         inner = expr_pseudo(node.operand, UNARY_LEVEL)
         return f"not {inner}" if node.op == "not" else f"-{inner}"
@@ -2780,6 +2903,12 @@ def emit_pseudocode(program: Program) -> str:
     if program.parts:
         out.append("")
         for part in program.parts.values():
+            if isinstance(part, KeypadPart):
+                rows = " ".join(p.where for p in part.rows)
+                cols = " ".join(p.where for p in part.cols)
+                out.append(f"  PART {part.name} = KEYPAD4X4 "
+                           f"ROWS {rows} COLS {cols}")
+                continue
             polarity = " ACTIVE LOW" if part.active_low else ""
             out.append(f"  PART {part.name} = 74HC595 "
                        f"DATA {part.data.where} CLOCK {part.clock.where} "
@@ -2857,6 +2986,8 @@ def expr_c(node: Expr, ctx: Emit, parent_level: int = -1) -> str:
         if pin.direction == "analog":
             return ctx.target.read_analog(pin)
         return ctx.target.read_pin(pin)
+    if isinstance(node, KeypadRef):
+        return f"bw_part_{node.part}_read()"
     if isinstance(node, Unary):
         inner = expr_c(node.operand, ctx, UNARY_LEVEL)
         return f"!({inner})" if node.op == "not" else f"-({inner})"
