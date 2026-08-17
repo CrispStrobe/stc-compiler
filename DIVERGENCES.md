@@ -36,3 +36,10 @@ evening (stc12c5a60s2-lab 06-matrix89/09-keyshow89). 8051 family only —
 push-pull targets need row tri-stating before they may opt in.
 sb3-creator's generateC does NOT have it yet; until it does, keypad
 programs compile through this service only (`compile-remote.sh -p`).
+
+**`not` precedence (2026-08-17, same evening):** this service now parses
+`not` at Python's level — looser than comparisons, tighter than and/or —
+because `IF not k = shown` mis-parsing as `(not k) = shown` shipped a
+flashed-clean, silently-dead program to real silicon before the bench
+caught it. sb3-creator's reader/emitter must match or `not a = b`
+round-trips with changed meaning; verify its parser when closing parity.
