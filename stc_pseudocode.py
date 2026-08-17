@@ -143,6 +143,7 @@ PRECEDENCE = [
 ]
 LEVEL = {op: index for index, ops in enumerate(PRECEDENCE) for op in ops}
 UNARY_LEVEL = len(PRECEDENCE)
+NOT_LEVEL = LEVEL["="]          # `not` parses its operand at comparison level
 
 TO_C = {"or": "||", "and": "&&", "=": "==", "!=": "!=",
         "<": "<", ">": ">", "<=": "<=", ">=": ">=",
@@ -2152,6 +2153,17 @@ class ExprParser:
     def parse(self, level: int = 0) -> Expr:
         if level >= len(PRECEDENCE):
             return self.atom()
+        # `not` binds looser than comparisons and tighter than and/or —
+        # Python's precedence, because `IF not k = shown` must mean
+        # `not (k = shown)`. The old atom-level `not` parsed it as
+        # `(not k) = shown`, which compared a boolean to a number and
+        # made a running program silently do nothing (found on the A2
+        # bench, 14-a2-keyshow, 2026-08-17). atom() keeps its own `not`
+        # for the degenerate spots this level never reaches.
+        if (level == NOT_LEVEL and self.peek() is not None
+                and self.peek().lower() == "not"):
+            self.take()
+            return Unary("not", self.parse(level))
         node = self.parse(level + 1)
         while True:
             token = self.peek()
