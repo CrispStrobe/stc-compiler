@@ -29,8 +29,13 @@ dialect-agnostic C/ASM toolchains).
 
 ## Divergence in the OTHER direction (2026-08-17, evening)
 
-**`PART <name> = KEYPAD4X4 ROWS <4 pins> COLS <4 pins>`** now exists
-HERE first: a read-only part (the scanned key 0..15, -1 for none) whose
+**`PART <name> = KEYPAD4X4 ROWS <4 pins> COLS <4 pins>`** — PARITY
+CLOSED (sb3-creator a045ecc, 2026-08-18): the part exists at every
+sb3-creator layer (dialect parser with matching refusals, stc12_keypad
+palette reporter, the silicon-verified C scanner, C reader, decompiler)
+and this oracle's own 14-a2-keyshow.bw round-trips
+pseudocode→C→pseudocode→C byte-identically over there. Historical
+entry follows. Existed HERE first: a read-only part (the scanned key 0..15, -1 for none) whose
 emitted scanner is the one verified on Prechin A2 silicon the same
 evening (stc12c5a60s2-lab 06-matrix89/09-keyshow89). 8051 family only —
 push-pull targets need row tri-stating before they may opt in.
