@@ -163,3 +163,71 @@ class TestKeypadHats(unittest.TestCase):
             "  PART keys = KEYPAD4X4 ROWS P1.7 P1.6 P1.5 P1.4 COLS P1.3 P1.2 P1.1 P1.0\n\n", "")
         with self.assertRaises(sp.PseudocodeError):
             sp.transpile(src)
+
+
+class TestKeypadMicroPython(unittest.TestCase):
+    """The MicroPython lane (A2-BOARD-SUPPORT 'shared scanner — SETTLED
+    2026-08-18'): the scanner IS Pin juggling, same 0..15 index, same
+    debounce contract (two agreeing scans, 5 ms apart), hats on the PART."""
+
+    PICO = """\
+DEVICE PICO:
+  PART keys = KEYPAD4X4 ROWS GP2 GP3 GP4 GP5 COLS GP6 GP7 GP8 GP9
+
+  PIN led1 = GP25 OUTPUT
+
+  WHEN started:
+    FOREVER:
+      IF a key is pressed THEN:
+        turn on led1
+      wait 20 ms
+
+  WHEN key 5 pressed:
+    toggle led1
+"""
+
+    def test_pico_scanner_tristates_rows(self):
+        code, _ = sp.transpile(self.PICO)
+        self.assertIn("def bw_part_keys_read():", code)
+        # drive low, read a pulled-up column, RELEASE the row before returning
+        self.assertIn("_pin2.init(Pin.OUT, value=0)", code)
+        self.assertIn("if not _pin6.value():", code)
+        self.assertIn("_pin2.init(Pin.IN)", code)
+        self.assertIn("return 15", code)
+        self.assertIn("return -1", code)
+        # rows idle tri-stated; columns idle with the pull-up
+        self.assertIn("_pin2 = Pin(2, Pin.IN)", code)
+        self.assertIn("_pin6 = Pin(6, Pin.IN, Pin.PULL_UP)", code)
+
+    def test_pico_debounced_poll_scheduled_first(self):
+        code, _ = sp.transpile(self.PICO)
+        self.assertIn("def bw_kp_keys_poll():", code)
+        # wrap-safe 5 ms gate + two agreeing reads
+        self.assertIn("if time.ticks_diff(time.ticks_ms(), bw_kp_keys_t) >= 5:", code)
+        self.assertIn("if _r == bw_kp_keys_raw:", code)
+        self.assertIn("_tasks = [bw_kp_keys_poll(), bw_task0(), bw_task1()]", code)
+
+    def test_pico_hat_edges_on_debounced_key(self):
+        code, _ = sp.transpile(self.PICO)
+        self.assertIn("_now = 1 if bw_kp_keys_key == 5 else 0", code)
+        self.assertIn("_fired = _now and not _prev", code)
+        # the sugar desugars to the index read, same as the C targets
+        self.assertIn("if bw_part_keys_read() >= 0:", code)
+
+    def test_microbit_scanner_and_pulls(self):
+        src = self.PICO.replace("DEVICE PICO:", "DEVICE MICROBIT:") \
+            .replace("ROWS GP2 GP3 GP4 GP5 COLS GP6 GP7 GP8 GP9",
+                     "ROWS P0 P1 P2 P8 COLS P12 P13 P14 P15") \
+            .replace("GP25", "P16")
+        code, _ = sp.transpile(src)
+        self.assertIn("pin0.write_digital(0)", code)
+        self.assertIn("if not pin12.read_digital():", code)
+        # read_digital() is the micro:bit's tri-state
+        self.assertIn("pin0.read_digital()   # release: back to input", code)
+        self.assertIn("pin12.set_pull(pin12.PULL_UP)", code)
+        # running_time() does not wrap; the plain gate is honest there
+        self.assertIn("if (running_time() - bw_kp_keys_t) >= 5:", code)
+
+
+if __name__ == "__main__":
+    unittest.main()

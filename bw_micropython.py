@@ -95,6 +95,18 @@ class MicroPythonTarget(sp.Target):
     def tone_lines(self, pin, hz: str, pad: str) -> list[str]:
         raise NotImplementedError
 
+    def elapsed_ms(self, since_var: str) -> str:
+        """Milliseconds since `since_var` (a module variable holding now()).
+        Overridden where the tick counter wraps (the Pico)."""
+        return f"({self.now()} - {since_var})"
+
+    def keypad_helper(self, part) -> list[str]:
+        """The KEYPAD4X4 scanner, in this board's Pin vocabulary. The
+        contract is the C targets': drive one row low, read the columns
+        (pull-ups), first low column wins, row released before returning.
+        Boards supply it because tri-stating a row is board vocabulary."""
+        raise NotImplementedError
+
 
 
     # ---- the shared emitter, in full --------------------------------------
@@ -192,7 +204,39 @@ class MicroPythonTarget(sp.Target):
                     ""]
 
         for part in program.parts.values():
-            out += self.shift_helper(part)
+            if isinstance(part, sp.KeypadPart):
+                out += self.keypad_helper(part)
+            else:
+                out += self.shift_helper(part)
+
+        # `WHEN key N` hats share one debounced poll generator per keypad
+        # (same contract as the C targets' bw_kp_<pad>_poll task): scan at
+        # most every 5 ms, a key only becomes current after two agreeing
+        # reads. Scheduled FIRST, so the hats see this pass's key.
+        key_pads = []
+        for hat in program.when_hats:
+            if hat is not None and len(hat) == 3 and hat[0] not in key_pads:
+                key_pads.append(hat[0])
+        poll_names = []
+        for pad in key_pads:
+            out += [
+                f"# {pad}: debounced key state shared by the `WHEN key N` hats.",
+                f"bw_kp_{pad}_raw = -1",
+                f"bw_kp_{pad}_key = -1",
+                f"bw_kp_{pad}_t = 0",
+                f"def bw_kp_{pad}_poll():",
+                f"    global bw_kp_{pad}_raw, bw_kp_{pad}_key, bw_kp_{pad}_t",
+                "    while True:",
+                f"        if {self.elapsed_ms(f'bw_kp_{pad}_t')} >= 5:",
+                f"            bw_kp_{pad}_t = {self.now()}",
+                f"            _r = bw_part_{pad}_read()",
+                f"            if _r == bw_kp_{pad}_raw:",
+                f"                bw_kp_{pad}_key = _r",
+                f"            bw_kp_{pad}_raw = _r",
+                "        yield",
+                "",
+            ]
+            poll_names.append(f"bw_kp_{pad}_poll")
 
         for procedure in program.procedures.values():
             params = ", ".join(procedure.params)
@@ -208,6 +252,27 @@ class MicroPythonTarget(sp.Target):
             name = f"bw_task{number}" if tasks else "bw_script"
             task_names.append(name)
             hat = program.when_hats[number] if program.when_hats else None
+
+            if hat is not None and len(hat) == 3:
+                # `WHEN key N pressed/released:` -- edge over the DEBOUNCED
+                # index kept by the shared poll generator above.
+                pad, edge, key_n = hat
+                fired = ("_now and not _prev" if edge == "pressed"
+                         else "_prev and not _now")
+                out += [f"# WHEN key {key_n} {edge}:", f"def {name}():"]
+                out += self._global_decl(block, program, globals_ + toggled,
+                                         "    ")
+                out += ["    _prev = 0",
+                        "    while True:",
+                        f"        _now = 1 if bw_kp_{pad}_key == {key_n} else 0",
+                        f"        _fired = {fired}",
+                        "        _prev = _now",
+                        "        if _fired:"]
+                body = self._stmts(block, 3, pins, program, tasks,
+                                   globals_ + toggled)
+                out += body or ["            pass"]
+                out += ["        yield", ""]
+                continue
 
             if hat is not None:
                 # An event hat polls its pin and fires on the edge. read_pin
@@ -265,7 +330,7 @@ class MicroPythonTarget(sp.Target):
                 "# script can starve the others. This is the same scheduling",
                 "# contract the C targets get from a Duff's device -- which",
                 "# MicroPython cannot express, having no goto.",
-                "_tasks = [" + ", ".join(f"{n}()" for n in task_names) + "]",
+                "_tasks = [" + ", ".join(f"{n}()" for n in poll_names + task_names) + "]",
                 "while _tasks:",
                 "    for _t in tuple(_tasks):",
                 "        try:",
@@ -402,6 +467,8 @@ class MicroPythonTarget(sp.Target):
                     else self.read_pin(pin))
         if isinstance(node, sp.Index):
             return f"{node.table}[{self._expr(node.where, pins)}]"
+        if isinstance(node, sp.KeypadRef):
+            return f"bw_part_{node.part}_read()"
         if isinstance(node, sp.Unary):
             inner = self._expr(node.operand, pins, sp.UNARY_LEVEL)
             return f"not ({inner})" if node.op == "not" else f"-({inner})"
@@ -442,7 +509,7 @@ class MicrobitTarget(MicroPythonTarget):
     # PORT is the only one left out, and it is a real absence rather than a
     # gap: MicroPython has no whole-port write, and eight separate
     # write_digital calls would not land as the one store a PORT promises.
-    supports = frozenset({"pwm", "tone", "print", "table", "part"})
+    supports = frozenset({"pwm", "tone", "print", "table", "part", "keypad"})
     source_extension = "py"
     compile_hint = ("MicroPython is interpreted on the device, so there is "
                     "nothing to compile: flash the .py with uflash, or paste "
@@ -519,6 +586,26 @@ class MicrobitTarget(MicroPythonTarget):
     def now(self):
         return "running_time()"
 
+    def keypad_helper(self, part) -> list[str]:
+        rows, cols = part.rows, part.cols
+        out = [
+            f"# KEYPAD4X4 {part.name}: sixteen keys for eight pins. Drive one",
+            "# row low and read the columns (pull-ups): a held key pulls its",
+            "# column low. read_digital() switches a pin back to input mode,",
+            "# which is exactly the tri-state a released row needs -- two held",
+            "# keys in one column must never short two driven outputs.",
+            f"def bw_part_{part.name}_read():",
+        ]
+        for r, row in enumerate(rows):
+            out.append(f"    {row.obj}.write_digital(0)")
+            for c, col in enumerate(cols):
+                out.append(f"    if not {col.obj}.read_digital():")
+                out.append(f"        {row.obj}.read_digital()   # release: back to input")
+                out.append(f"        return {r * 4 + c}")
+            out.append(f"    {row.obj}.read_digital()   # release: back to input")
+        out += ["    return -1", ""]
+        return out
+
     # ---- the board's words ----------------------------------------------
     def imports(self, program) -> list[str]:
         out = ["# MicroPython for the BBC micro:bit. Nothing to compile: flash it",
@@ -529,16 +616,28 @@ class MicrobitTarget(MicroPythonTarget):
         return out
 
     def board_setup(self, program) -> list[str]:
-        used = sorted({pin.number for pin in program.pins.values()
+        claimed = [pin for part in program.parts.values()
+                   for pin in getattr(part, "claimed", [])]
+        used = sorted({pin.number for pin in
+                       list(program.pins.values()) + claimed
                        if pin.number in DISPLAY_PINS})
-        if not used:
-            return []
-        return ["# P" + ", P".join(str(n) for n in used)
-                + " are wired to the 5x5 LED matrix. The display driver",
-                "# scans those pins continuously and would fight anything",
-                "# else driving them, so it is switched off.",
-                "display.off()",
-                ""]
+        out = []
+        if used:
+            out += ["# P" + ", P".join(str(n) for n in used)
+                    + " are wired to the 5x5 LED matrix. The display driver",
+                    "# scans those pins continuously and would fight anything",
+                    "# else driving them, so it is switched off.",
+                    "display.off()",
+                    ""]
+        for part in program.parts.values():
+            if isinstance(part, sp.KeypadPart):
+                out.append(f"# {part.name}: columns idle as inputs with the "
+                           "pull-up the scan reads against.")
+                for col in part.cols:
+                    out.append(f"{col.obj}.read_digital()   # input mode first")
+                    out.append(f"{col.obj}.set_pull({col.obj}.PULL_UP)")
+                out.append("")
+        return out
 
     def deadline_set(self, ms: str) -> str:
         # running_time() counts from boot and does not wrap in any run this
@@ -622,7 +721,7 @@ class PicoTarget(MicroPythonTarget):
     toolchain = "uf2"
     default_clock = 125000000          # unused; the runtime owns the timebase
     source_extension = "py"
-    supports = frozenset({"pwm", "tone", "print", "table", "part"})
+    supports = frozenset({"pwm", "tone", "print", "table", "part", "keypad"})
     compile_hint = ("MicroPython is interpreted on the device, so there is "
                     "nothing to compile: copy the .py to the board, or write "
                     "it over the REPL.")
@@ -679,6 +778,32 @@ class PicoTarget(MicroPythonTarget):
     def now(self):
         return "time.ticks_ms()"
 
+    def elapsed_ms(self, since_var: str) -> str:
+        # ticks_diff, not `-`: ticks_ms() wraps, and the runtime owns the
+        # arithmetic that survives it (same reason as deadline_set).
+        return f"time.ticks_diff(time.ticks_ms(), {since_var})"
+
+    def keypad_helper(self, part) -> list[str]:
+        rows, cols = part.rows, part.cols
+        out = [
+            f"# KEYPAD4X4 {part.name}: sixteen keys for eight pins. Drive one",
+            "# row low and read the columns (pull-ups): a held key pulls its",
+            "# column low. Rows are TRI-STATED (input) except while driven --",
+            "# on an RP2040 two held keys in one column would short two",
+            "# driven push-pull outputs (the 8051's quasi-bidirectional rows",
+            "# tolerate that; see the A2 measurements).",
+            f"def bw_part_{part.name}_read():",
+        ]
+        for r, row in enumerate(rows):
+            out.append(f"    {row.obj}.init(Pin.OUT, value=0)")
+            for c, col in enumerate(cols):
+                out.append(f"    if not {col.obj}.value():")
+                out.append(f"        {row.obj}.init(Pin.IN)")
+                out.append(f"        return {r * 4 + c}")
+            out.append(f"    {row.obj}.init(Pin.IN)")
+        out += ["    return -1", ""]
+        return out
+
     # ---- the board's words ----------------------------------------------
     def imports(self, program) -> list[str]:
         wanted = ["Pin"]
@@ -710,6 +835,18 @@ class PicoTarget(MicroPythonTarget):
                     # driver cares about; the duty is what the program sets.
                     out.append(f"{pin.obj}.freq(1000)")
         for part in program.parts.values():
+            if isinstance(part, sp.KeypadPart):
+                # Rows idle TRI-STATED (input, no pull): two held keys in one
+                # column would otherwise short two driven push-pull outputs.
+                # The scanner drives one row at a time via init(). Columns are
+                # inputs with the pull-up the scan reads against.
+                for row in part.rows:
+                    out.append(f"{row.obj} = Pin({row.number}, Pin.IN)"
+                               f"  # {part.name} row (tri-stated between scans)")
+                for col in part.cols:
+                    out.append(f"{col.obj} = Pin({col.number}, Pin.IN, Pin.PULL_UP)"
+                               f"  # {part.name} column")
+                continue
             for claimed in part.claimed:
                 out.append(f"{claimed.obj} = Pin({claimed.number}, Pin.OUT)"
                            f"  # {part.name}")

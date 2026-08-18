@@ -172,3 +172,27 @@ cToPseudocode degraded every hat task to `WHEN flag clicked:`. Its
 <edge>` and both hat kinds round-trip as fixed points. One convention
 divergence stays by design: this side RAISES on a missing keypad or
 key > 15, sb3-creator warns-and-degrades (its house style).
+
+## MicroPython KEYPAD4X4 (2026-08-18) — sb3-creator's MP path must mirror
+
+The settled shared-scanner lane (stc12c5a60s2-lab
+docs/A2-BOARD-SUPPORT.md aabc0ad) is BUILT here for both MicroPython
+targets: `supports` gains "keypad" on Pico and micro:bit, the scanner is
+emitted per part in each board's Pin vocabulary (Pico: rows
+`init(Pin.OUT, value=0)` / released to `init(Pin.IN)` — TRI-STATED, an
+RP2040's push-pull rows short under two held keys in one column;
+micro:bit: `write_digital(0)` / `read_digital()` as the tri-state,
+columns `set_pull(PULL_UP)`), same unrolled shape and 0..15 index as the
+silicon-verified 8051 C. The `WHEN key N` hats ride a shared debounced
+poll GENERATOR scheduled first (`bw_kp_<pad>_poll`, 5 ms gate —
+`ticks_diff` on the Pico, plain arithmetic on running_time() — two
+agreeing reads). Verified behaviorally on the host against a mocked
+machine.Pin: press fires once, held does not re-fire, release edge
+fires, a 3 ms glitch is debounced away. test_keypad.py
+TestKeypadMicroPython pins the emission.
+
+Mirror note: sb3-creator's own MicroPython generator still 8051-gates
+PART KEYPAD4X4 (its parser refuses the part off-8051), so a keypad
+program that compiles here for DEVICE PICO is refused there. The mirror
+is: lift the gate for pico/microbit and lower scan + index + hats in its
+generator-based MP walk, following this emission.
