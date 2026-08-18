@@ -138,7 +138,7 @@ day (splitBinary tracks `[]` like `()`; pinned in keypad-parity.test.mjs).
 Cross-check: examples/78-a2-calculator/program.bw now parses in BOTH
 front ends unchanged.
 
-## Keypad reporters + `WHEN key N pressed` hats (2026-08-18) — sb3-creator must mirror
+## Keypad reporters + `WHEN key N pressed` hats (2026-08-18) — CLOSED same day (sb3-creator 4962d4d)
 
 The A2-BOARD-SUPPORT fan-out item. New vocabulary, all over the sole
 KEYPAD4X4 (sole_keypad mirrors sole_matrix):
@@ -162,3 +162,13 @@ desugar happens at parse time there too (they become plain compare
 blocks over stc12_keypad); the hat needs a real hat block + the shared
 poll in generated C byte-shaped like this side's (test_keypad.py
 TestKeypadHats pins the C), plus Py/JS scheduler equivalents.
+
+Mirror landed as sb3-creator 4962d4d: desugar in parseCondition (blocks
+identical to hand-written `keys >= 0` / `keys = N`), `stc12_whenkey` hat
+with byte-shaped poll + task C, reference-extension HAT block. Mirroring
+exposed that sb3-creator's EXISTING pin-hat round trip was a fiction —
+cToPseudocode degraded every hat task to `WHEN flag clicked:`. Its
+`@bw script` marker now carries `hat pin <name> <edge>` / `hat key <n>
+<edge>` and both hat kinds round-trip as fixed points. One convention
+divergence stays by design: this side RAISES on a missing keypad or
+key > 15, sb3-creator warns-and-degrades (its house style).
