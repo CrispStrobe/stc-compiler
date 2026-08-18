@@ -84,6 +84,42 @@ the Timer-0 ISR **after `bw_ms++`, table-driven, no mul/div**; (c) a whole
 `PORT` overlapping a PART's claimed pins is now refused in BOTH directions
 (this fixed a pre-existing gap that also covered 595/keypad).
 
+**`PART <name> = SEVENSEG8 SEGMENTS <port> SELECT <A> <B> <C>
+[COMMON CATHODE|ANODE]` — landed in reference, NOT yet mirrored to
+sb3-creator (2026-08-18).** An 8-digit 7-segment display, multiplexed via
+a 74HC245 (segments on a whole port) and a 74HC138 (3 address pins for
+digit select). ISR-driven: one digit per tick from an 8-byte frame buffer
+in RAM, 8 digits → 8 ms full cycle = 125 Hz. Built-in 0-F font in __code.
+bw_ms++ stays first in the ISR per requirement #1. 8051 family only.
+
+New vocabulary → C, all writing the RAM frame buffer only:
+- `show number N on display` → `bw_<n>_show_number(N)` (integer, right-aligned)
+- `show digit D = value V on display` → `bw_<n>_show_digit(D, V)` (one tube, 0-F)
+- `set digit D to segments <byte> on display` → `bw_<n>_set_segments(D, segs)` (raw)
+- `clear display` → `bw_<n>_clear()`
+
+**`PART <name> = LEDBANK8 ON <port> [ACTIVE LOW]` — landed in reference,
+NOT yet mirrored to sb3-creator (2026-08-18).** 8 LEDs on a port. All
+writes go through an ISR-owned shadow byte — never direct port stores.
+Emits a compile WARNING when sharing a port with a SEVENSEG8's select pins
+(the A2 board's measured conflict: P2 carries both the 138 select and the
+LEDs). The ISR pushes the shadow byte to the port on every tick; mainline
+only writes the shadow. 8051 family only.
+
+New vocabulary → C:
+- `turn on led N on bank` → `bw_<n>_on(N)` (set bit N in shadow)
+- `turn off led N on bank` → `bw_<n>_off(N)` (clear bit N)
+- `set leds to <byte> on bank` → `bw_<n>_set(byte)` (write all 8)
+- `light only led N on bank` → `bw_<n>_only(N)` (one-hot)
+
+Mirror notes: (a) both PARTs store in `program.parts` with `isinstance`
+dispatch (like MatrixPart/KeypadPart); (b) SEVENSEG8 and LEDBANK8 force
+the ISR path but NOT the cooperative scheduler — a single WHEN block runs
+straight-line with Timer 0 as the ISR scan; (c) the ISR scan hooks go
+after bw_ms++ and after the matrix scan (if present), table-driven, no
+mul/div; (d) `claimed` on SevenSegPart returns the 3 select pins only
+(the segment port is claimed as a whole port, not individual pins).
+
 ## `mod` — closed 2026-08-18
 
 sb3-creator's dialect spells modulo `a mod b` (three gallery programs use
