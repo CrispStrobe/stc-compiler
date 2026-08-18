@@ -157,6 +157,9 @@ TO_C = {"or": "||", "and": "&&", "=": "==", "!=": "!=",
         "<": "<", ">": ">", "<=": "<=", ">=": ">=",
         "+": "+", "-": "-", "*": "*", "/": "/", "%": "%"}
 SYNONYM = {"==": "=", "<>": "!="}
+WORD_OPS = {"mod": "%"}         # spelled-out operators; sb3-creator's
+                                # dialect writes `a mod b`, and the two
+                                # front ends must accept the same programs
 
 
 # =============================================================== statement AST
@@ -2443,7 +2446,7 @@ class ExprParser:
             token = self.peek()
             if token is None:
                 return node
-            op = SYNONYM.get(token, token.lower())
+            op = SYNONYM.get(token, WORD_OPS.get(token.lower(), token.lower()))
             if op not in PRECEDENCE[level]:
                 return node
             self.take()

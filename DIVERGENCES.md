@@ -83,3 +83,21 @@ cooperative-scheduler / ISR path even for a single script (here
 the Timer-0 ISR **after `bw_ms++`, table-driven, no mul/div**; (c) a whole
 `PORT` overlapping a PART's claimed pins is now refused in BOTH directions
 (this fixed a pre-existing gap that also covered 595/keypad).
+
+## `mod` — closed 2026-08-18
+
+sb3-creator's dialect spells modulo `a mod b` (three gallery programs use
+it: 76-multimeter, arduino-02-state-change, eater6502-full-build); this
+front end only knew `%`. Worse than a missing feature, the unknown word
+ended expressions early: `font[copy mod 10]` died with "missing ']' after
+font[". Fixed with a one-entry `WORD_OPS` table (`mod` → `%`) applied in
+the precedence loop, so `mod` binds exactly like `*` and `/`. Both
+spellings now parse; `test_mod_operator.py` pins it.
+
+The same program exposed sb3-creator's mirror-image bug: its operator
+splitter did not track `[` depth, so `font[copy mod 10]` split at ` mod `
+and compiled SILENTLY to string arithmetic (`("font[copy" % "10]")`) with
+zero warnings — worse than this side's loud error. Fixed there the same
+day (splitBinary tracks `[]` like `()`; pinned in keypad-parity.test.mjs).
+Cross-check: examples/78-a2-calculator/program.bw now parses in BOTH
+front ends unchanged.
