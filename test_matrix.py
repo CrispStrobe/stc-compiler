@@ -63,6 +63,7 @@ class RefMatrix:
         self.buf = [0] * (8 * self.PLANES)
         self.dim = self.LEVELS - 1
         self.scan = 0
+        self.phase = 0
         self.rowbit = [0x80 >> y for y in range(8)]
 
     def setpx(self, x, y, level):
@@ -83,15 +84,29 @@ class RefMatrix:
             self.row(y, img[y])
 
     def tick(self):
-        """One ISR pass. Returns (row_select_byte_on_595, column_port_byte)."""
+        """One ISR pass. Returns (row_select_byte_on_595, column_port_byte).
+
+        Bit-plane phase render (BCM): phase p lights 'level > p', so over the
+        LEVELS-1 phases a pixel of level L is lit in L of them (duty L/3). The
+        global dim caps at min(level, dim): a phase renders only while dim > p."""
         rb = self.rowbit[self.scan]
-        if self.dim == 0:
-            lit = 0
+        if self.dim > self.phase:
+            p0 = self.buf[self.scan]
+            p1 = self.buf[self.scan + 8]
+            if self.phase == 0:
+                lit = p0 | p1            # level >= 1
+            elif self.phase == 1:
+                lit = p1                 # level >= 2
+            else:
+                lit = p0 & p1            # level >= 3
         else:
-            lit = self.buf[self.scan] | self.buf[self.scan + 8]
+            lit = 0
         col = ~lit & 0xFF
         row = self.scan
-        self.scan = (self.scan + 1) % 8
+        self.scan += 1
+        if self.scan >= 8:
+            self.scan = 0
+            self.phase = (self.phase + 1) % (self.LEVELS - 1)
         return row, rb, col
 
     def frame(self):
@@ -121,9 +136,13 @@ class TestMatrix(unittest.TestCase):
         stripped = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
         for op in ("*", "/", "%"):
             self.assertNotIn(op, stripped, f"ISR must contain no {op!r}")
-        # One row per tick, wrapping at 8.
+        # One row per tick, wrapping at 8; a completed frame steps the BCM phase.
         self.assertIn("bw_scr_screen_scan++", body)
-        self.assertIn("if (bw_scr_screen_scan >= 8) bw_scr_screen_scan = 0;", body)
+        self.assertIn("if (bw_scr_screen_scan >= 8) {", body)
+        self.assertIn("bw_scr_screen_scan = 0;", body)
+        self.assertIn("bw_scr_screen_phase++;", body)
+        self.assertIn("if (bw_scr_screen_phase >= MATRIX_LEVELS - 1) "
+                      "bw_scr_screen_phase = 0;", body)
 
     def test_isr_is_sole_writer_of_595_and_columns(self):
         c, _ = sp.transpile(SRC)
@@ -165,6 +184,33 @@ class TestMatrix(unittest.TestCase):
         trace = ref.frame()
         rows_lit = [(y, col) for (y, _rb, col) in trace if col != 0xFF]
         self.assertEqual(rows_lit, [(0, 0x7F)])        # ~0x80: only bit7 (left) low
+
+    def test_bcm_duty_per_level(self):
+        """The grayscale claim: over the LEVELS-1 BCM phases a pixel of level L
+        is lit in exactly L of them, so duty = L/3. This is what makes the four
+        painted brightness levels actually distinct on the panel."""
+        colbit = 0x80 >> 3                             # cell x=3
+        for level in range(RefMatrix.LEVELS):          # 0..3
+            ref = RefMatrix()
+            ref.setpx(3, 4, level)                     # cell (x=3, y=4)
+            lit = 0
+            for _ in range(RefMatrix.LEVELS - 1):      # one frame per phase
+                _, _, col = ref.frame()[4]             # row y=4 this phase
+                if (~col & 0xFF) & colbit:
+                    lit += 1
+            self.assertEqual(lit, level,
+                             f"level {level} lit in {lit}/3 phases, want {level}")
+
+    def test_bcm_global_dim_caps_level(self):
+        """`set screen brightness B` caps every pixel at min(level, B): a full-
+        brightness pixel under dim=1 lights in only 1 of the 3 phases (1/3)."""
+        colbit = 0x80 >> 3
+        ref = RefMatrix()
+        ref.setpx(3, 4, RefMatrix.LEVELS - 1)          # full brightness
+        ref.dim = 1                                    # global cap at 1/3
+        lit = sum(1 for _ in range(RefMatrix.LEVELS - 1)
+                  if (~ref.frame()[4][2] & 0xFF) & colbit)
+        self.assertEqual(lit, 1, "dim=1 must cap the pixel at 1/3 duty")
 
     def test_brightness_reporter_lowers(self):
         c, _ = sp.transpile(SRC)
