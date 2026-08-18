@@ -85,8 +85,7 @@ the Timer-0 ISR **after `bw_ms++`, table-driven, no mul/div**; (c) a whole
 (this fixed a pre-existing gap that also covered 595/keypad).
 
 **`PART <name> = SEVENSEG8 SEGMENTS <port> SELECT <A> <B> <C>
-[COMMON CATHODE|ANODE]` — landed in reference, NOT yet mirrored to
-sb3-creator (2026-08-18).** An 8-digit 7-segment display, multiplexed via
+[COMMON CATHODE|ANODE]` — mirror CLOSED same day (sb3-creator 952b623).** An 8-digit 7-segment display, multiplexed via
 a 74HC245 (segments on a whole port) and a 74HC138 (3 address pins for
 digit select). ISR-driven: one digit per tick from an 8-byte frame buffer
 in RAM, 8 digits → 8 ms full cycle = 125 Hz. Built-in 0-F font in __code.
@@ -98,8 +97,8 @@ New vocabulary → C, all writing the RAM frame buffer only:
 - `set digit D to segments <byte> on display` → `bw_<n>_set_segments(D, segs)` (raw)
 - `clear display` → `bw_<n>_clear()`
 
-**`PART <name> = LEDBANK8 ON <port> [ACTIVE LOW]` — landed in reference,
-NOT yet mirrored to sb3-creator (2026-08-18).** 8 LEDs on a port. All
+**`PART <name> = LEDBANK8 ON <port> [ACTIVE LOW]` — mirror CLOSED same
+day (sb3-creator 952b623).** 8 LEDs on a port. All
 writes go through an ISR-owned shadow byte — never direct port stores.
 Emits a compile WARNING when sharing a port with a SEVENSEG8's select pins
 (the A2 board's measured conflict: P2 carries both the 138 select and the
@@ -196,3 +195,12 @@ PART KEYPAD4X4 (its parser refuses the part off-8051), so a keypad
 program that compiles here for DEVICE PICO is refused there. The mirror
 is: lift the gate for pico/microbit and lower scan + index + hats in its
 generator-based MP walk, following this emission.
+
+SEVENSEG8/LEDBANK8 mirror detail (952b623): ISR advance, shadow push,
+font bytes and helper bodies line-identical (test/a2-parts-parity pins
+them against this side's exact lines); shared-port warning mirrored; @bw
+part markers make the C round-trip a fixed point. One deliberate
+divergence: mirror note (b) said these force the ISR but not the
+scheduler — sb3-creator instead forces its scheduler path even for a
+single WHEN (the matrix precedent: its ISR only exists there). Same ISR
+bytes, different main() shell.
