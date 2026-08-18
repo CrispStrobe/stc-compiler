@@ -118,6 +118,14 @@ class KeypadRef(Expr):
 
 
 @dataclass
+class MatrixPixelRef(Expr):
+    """`pixel X Y is on` on a MATRIX8X8: true iff that pixel's level != 0."""
+    part: str
+    x: Expr
+    y: Expr
+
+
+@dataclass
 class Unary(Expr):
     op: str            # "not" | "-"
     operand: Expr
@@ -289,6 +297,51 @@ class Stop(Stmt):
     pass
 
 
+# ---- MATRIX8X8 drawing verbs. All write the RAM frame buffer only; the
+# Timer-0 ISR scans it onto the panel. `part` is the MATRIX8X8's name.
+
+@dataclass
+class MatrixClear(Stmt):
+    part: str
+
+
+@dataclass
+class MatrixSetPixel(Stmt):
+    part: str
+    x: Expr
+    y: Expr
+    # "light" / "clear" (full / off), "on" / "off" (set ... to on|off), or
+    # "brightness" (level carries the Expr). `level` is None except for
+    # "brightness". Kept so decompiling gives back the same sentence.
+    style: str
+    level: Expr = None
+
+
+@dataclass
+class MatrixDrawRow(Stmt):
+    part: str
+    y: Expr
+    bits: Expr
+
+
+@dataclass
+class MatrixImage(Stmt):
+    part: str
+    table: str
+
+
+@dataclass
+class MatrixScroll(Stmt):
+    part: str
+    direction: str              # "left" | "right" | "up" | "down"
+
+
+@dataclass
+class MatrixBrightness(Stmt):
+    part: str
+    level: Expr
+
+
 # ===================================================================== program
 
 @dataclass
@@ -401,6 +454,41 @@ class KeypadPart:
     @property
     def claimed(self) -> list:
         return self.rows + self.cols
+
+    @property
+    def claimed_where(self) -> list:
+        return [pin.where for pin in self.claimed]
+
+
+@dataclass
+class MatrixPart:
+    """An 8x8 LED dot matrix: rows through a 74HC595, columns on a whole port.
+
+    Measured on Prechin A2 silicon (docs/BOARD-PRECHIN-A2.md): the 595 selects
+    the physical ROWS active HIGH with Q7 = top, and the port's eight bits sink
+    the COLUMNS active LOW with bit 7 = left. Both orientations are baked into
+    the emitted scan, so image bytes read top-down / MSB-left -- a literal looks
+    like the picture.
+
+    Multiplexed, so it cannot be scanned in a user loop without monopolising the
+    program. Instead it CLAIMS its eleven pins (three 595 + eight columns) and
+    the Timer-0 ISR is the SOLE writer of the 595 and the column port: one row
+    per tick, 8 rows -> a full frame every 8 ms = 125 Hz. That claim is also what
+    closes the 8051 read-modify-write hazard on the shared port latch -- mainline
+    only ever writes the RAM frame buffer, never the port. See docs/A2-BOARD-SUPPORT.md.
+    """
+    name: str
+    kind: str                   # "matrix8x8"
+    data: Pin                   # 595 SER
+    clock: Pin                  # 595 SCLK
+    latch: Pin                  # 595 RCLK
+    col_port: "Port"            # the whole column port (active-low sinks)
+    columns: list               # its eight pins, for the claim + setup()
+    active_low: bool = False    # unused: the ISR owns column polarity directly
+
+    @property
+    def claimed(self) -> list:
+        return [self.data, self.clock, self.latch] + self.columns
 
     @property
     def claimed_where(self) -> list:
@@ -643,7 +731,7 @@ class Target:
 
 class Stc8051Target(Target):
     supports = frozenset({"pwm", "tone", "print", "port", "table", "part",
-                          "keypad"})
+                          "keypad", "matrix"})
 
     """The 8051 families, which differ from each other only in three flags.
 
@@ -851,10 +939,181 @@ class Stc8051Target(Target):
             "",
         ]
 
+    # ---- MATRIX8X8: frame buffer, ISR scan hook, drawing helpers --------
+    #
+    # Packing (documented once, here): the 8x8 frame is BIT-PLANE packed,
+    # MATRIX_PLANES planes of 8 row-bytes. Plane p, row y is bw_scr_<name>[p*8+y];
+    # within a byte bit(7-x) is column x (bit7 = left). A pixel's brightness LEVEL
+    # is the little-endian bits across the planes -- 2 planes = 4 levels
+    # (MATRIX_LEVELS: 0 off .. 3 full), 16 bytes total. Widening MATRIX_PLANES to 4
+    # gives 16 levels / 32 bytes without touching any verb. Threshold rendering
+    # (this landing) lights a pixel iff its level != 0, which is exactly the OR of
+    # the plane bytes -- one instruction, no per-pixel loop, in the ISR.
+
+    def _matrix_state(self, matrices) -> list[str]:
+        """Buffer, cursor, dim and row-select table -- emitted BEFORE bw_tick,
+        which reads them. #defines are emitted once, not per matrix."""
+        out = [
+            "/* MATRIX8X8 brightness depth. 2 planes = 4 levels; the whole",
+            " * surface (buffer size, every verb) is written in terms of these,",
+            " * so widening to 4 planes / 16 levels is a one-line change. */",
+            "#define MATRIX_PLANES 2",
+            "#define MATRIX_LEVELS 4              /* 1 << MATRIX_PLANES */",
+            "",
+            "/* Clamp a (signed) level to 0..MATRIX_LEVELS-1. */",
+            "static unsigned char bw_scr_level(int v)",
+            "{",
+            "    if (v < 0) return 0;",
+            "    if (v > MATRIX_LEVELS - 1) return MATRIX_LEVELS - 1;",
+            "    return (unsigned char)v;",
+            "}",
+            "",
+        ]
+        for part in matrices:
+            n = part.name
+            out += [
+                f"/* {n}: 8x8 bit-plane frame buffer (see the packing note above).",
+                " * The Timer-0 ISR is the SOLE writer of the 595 and the column",
+                " * port; mainline only ever writes this RAM. */",
+                f"static unsigned char bw_scr_{n}[8 * MATRIX_PLANES];",
+                f"static unsigned char bw_scr_{n}_scan;                 "
+                "/* row cursor 0..7 */",
+                f"static unsigned char bw_scr_{n}_dim = MATRIX_LEVELS - 1;  "
+                "/* global brightness */",
+                "/* Row select, active-high, Q7 = top: row y is 595 output Q(7-y)",
+                " * == bit (0x80 >> y). A table so the ISR shifts no variable. */",
+                f"static const __code unsigned char bw_scr_{n}_rowbit[8] =",
+                "    { 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01 };",
+                "",
+            ]
+        return out
+
+    def _matrix_scan(self, part) -> list[str]:
+        """The per-tick scan, spliced into bw_tick AFTER bw_ms++. One row per
+        tick, table-driven, no mul/div."""
+        n = part.name
+        data, clock, latch = part.data.sfr, part.clock.sfr, part.latch.sfr
+        col = part.col_port.sfr
+        return [
+            "",
+            f"    /* MATRIX8X8 '{n}': advance one row (8 rows -> 125 Hz). The 595",
+            "     * selects the row active-high (Q7=top); columns are active-low. */",
+            "    {",
+            "        unsigned char bw_lit, bw_rb, bw_i;",
+            f"        {col} = 0xFF;                          "
+            "/* blank columns during the row change */",
+            f"        bw_rb = bw_scr_{n}_rowbit[bw_scr_{n}_scan];",
+            f"        {latch} = 0;",
+            "        for (bw_i = 0; bw_i < 8; bw_i++) {   /* clock the byte in, MSB first */",
+            f"            {data} = (bw_rb & 0x80) ? 1 : 0;",
+            "            bw_rb = (unsigned char)(bw_rb << 1);",
+            f"            {clock} = 1; {clock} = 0;",
+            "        }",
+            f"        {latch} = 1; {latch} = 0;              "
+            "/* transfer to the 595 outputs */",
+            "        /* Threshold render: lit iff level != 0 == OR of the bit-planes.",
+            f"         * BCM SEAM -- a later ISR-only change swaps this OR for a",
+            f"         * bw_scr_{n}_phase-selected plane with weighted dwell; the 2-bit",
+            "         * levels are already in the buffer, so no drawing verb changes. */",
+            f"        if (bw_scr_{n}_dim == 0) bw_lit = 0;",
+            f"        else bw_lit = (unsigned char)(bw_scr_{n}[bw_scr_{n}_scan]",
+            f"                                    | bw_scr_{n}[bw_scr_{n}_scan + 8]);",
+            f"        {col} = (unsigned char)~bw_lit;        "
+            "/* active-low columns: lit -> 0 */",
+            f"        bw_scr_{n}_scan++;",
+            f"        if (bw_scr_{n}_scan >= 8) bw_scr_{n}_scan = 0;",
+            "    }",
+        ]
+
+    def _matrix_helpers(self, part) -> list[str]:
+        """The drawing verbs' C helpers -- all write the RAM frame buffer only.
+        Emitted with the other per-part helpers, after bw_tick."""
+        n = part.name
+        return [
+            f"/* Drawing verbs for MATRIX8X8 '{n}'. All write the RAM frame buffer;",
+            " * the Timer-0 ISR scans it. x = column 0..7 (left->right), y = row",
+            " * 0..7 (top->bottom). bit7 of a row byte is the LEFT column, matching",
+            " * the image literals and the column wiring. */",
+            f"static void bw_scr_{n}_clear(void)",
+            "{",
+            "    unsigned char i;",
+            f"    for (i = 0; i < 8 * MATRIX_PLANES; i++) bw_scr_{n}[i] = 0;",
+            "}",
+            "",
+            f"static void bw_scr_{n}_setpx(unsigned char x, unsigned char y, "
+            "unsigned char level)",
+            "{",
+            "    unsigned char m, p;",
+            "    if (x > 7 || y > 7) return;",
+            "    m = (unsigned char)(0x80 >> x);            /* bit7 = left */",
+            "    for (p = 0; p < MATRIX_PLANES; p++) {",
+            f"        if (level & 1) bw_scr_{n}[y + (unsigned char)(p << 3)] |=  m;",
+            f"        else           bw_scr_{n}[y + (unsigned char)(p << 3)] &= "
+            "(unsigned char)~m;",
+            "        level = (unsigned char)(level >> 1);",
+            "    }",
+            "}",
+            "",
+            f"static unsigned char bw_scr_{n}_getpx(unsigned char x, unsigned char y)",
+            "{",
+            "    unsigned char m, p, level = 0;",
+            "    if (x > 7 || y > 7) return 0;",
+            "    m = (unsigned char)(0x80 >> x);",
+            "    for (p = 0; p < MATRIX_PLANES; p++)",
+            f"        if (bw_scr_{n}[y + (unsigned char)(p << 3)] & m) "
+            "level |= (unsigned char)(1 << p);",
+            "    return level;",
+            "}",
+            "",
+            "/* A whole row from an 8-bit image byte: bit7 = left, 1 -> full, 0 -> off. */",
+            f"static void bw_scr_{n}_row(unsigned char y, unsigned char bits)",
+            "{",
+            "    unsigned char p;",
+            "    if (y > 7) return;",
+            f"    for (p = 0; p < MATRIX_PLANES; p++) "
+            f"bw_scr_{n}[y + (unsigned char)(p << 3)] = bits;",
+            "}",
+            "",
+            "/* Blit 8 image bytes, top row first (the heart demo, one call). */",
+            f"static void bw_scr_{n}_image(const __code unsigned char *img)",
+            "{",
+            "    unsigned char y;",
+            f"    for (y = 0; y < 8; y++) bw_scr_{n}_row(y, img[y]);",
+            "}",
+            "",
+            "/* Shift the whole frame one pixel; the vacated edge clears.",
+            " * 0 left, 1 right, 2 up, 3 down. Left is toward x=0 == toward the",
+            " * MSB, so a row byte shifts left. */",
+            f"static void bw_scr_{n}_scroll(unsigned char dir)",
+            "{",
+            "    unsigned char p, y, base;",
+            "    for (p = 0; p < MATRIX_PLANES; p++) {",
+            "        base = (unsigned char)(p << 3);",
+            "        if (dir == 0)",
+            "            for (y = 0; y < 8; y++)",
+            f"                bw_scr_{n}[base + y] = (unsigned char)(bw_scr_{n}[base + y] << 1);",
+            "        else if (dir == 1)",
+            "            for (y = 0; y < 8; y++)",
+            f"                bw_scr_{n}[base + y] = (unsigned char)(bw_scr_{n}[base + y] >> 1);",
+            "        else if (dir == 2) {",
+            f"            for (y = 0; y < 7; y++) bw_scr_{n}[base + y] = bw_scr_{n}[base + y + 1];",
+            f"            bw_scr_{n}[base + 7] = 0;",
+            "        } else {",
+            f"            for (y = 7; y != 0; y--) bw_scr_{n}[base + y] = bw_scr_{n}[base + y - 1];",
+            f"            bw_scr_{n}[base] = 0;",
+            "        }",
+            "    }",
+            "}",
+            "",
+        ]
+
     def runtime(self, program, tasks):
         out = []
+        matrices = [p for p in program.parts.values() if isinstance(p, MatrixPart)]
+        if matrices:
+            out += self._matrix_state(matrices)
         if tasks:
-            out += [
+            tick = [
                 "/* One WHEN block = one cooperative task. Timer 0 interrupts",
                 " * every millisecond; tasks yield at every wait and at every",
                 " * loop iteration (Scratch's own scheduling contract), so no",
@@ -866,6 +1125,10 @@ class Stc8051Target(Target):
                 "    TL0 = (unsigned char)(T0_RELOAD & 0xFF);",
                 "    TH0 = (unsigned char)(T0_RELOAD >> 8);",
                 "    bw_ms++;",
+            ]
+            for part in matrices:
+                tick += self._matrix_scan(part)
+            tick += [
                 "}",
                 "",
                 "/* A 16-bit read is not atomic on an 8051; hold the tick off. */",
@@ -879,6 +1142,7 @@ class Stc8051Target(Target):
                 "}",
                 "",
             ]
+            out += tick
         else:
             out += [
                 "static void delay_ms(unsigned int ms)",
@@ -911,6 +1175,9 @@ class Stc8051Target(Target):
                 "",
             ]
         for part in program.parts.values():
+            if isinstance(part, MatrixPart):
+                out += self._matrix_helpers(part)
+                continue
             if isinstance(part, KeypadPart):
                 out += [
                     f"/* {part.name}: a 4x4 matrix keypad, sixteen keys for eight pins.",
@@ -2058,6 +2325,13 @@ class Program:
     locals_: set = field(default_factory=set)
 
     @property
+    def has_matrix(self) -> bool:
+        """A MATRIX8X8 refreshes itself in the Timer-0 ISR, so its presence
+        forces the cooperative-scheduler code path (the ISR that scans it)
+        even for a single WHEN block that would otherwise run straight-line."""
+        return any(isinstance(p, MatrixPart) for p in self.parts.values())
+
+    @property
     def uses_adc(self) -> bool:
         return any(pin.direction == "analog" for pin in self.pins.values())
 
@@ -2203,6 +2477,23 @@ class ExprParser:
                 if token not in self.program.locals_ and token not in self.program.variables:
                     self.program.variables.append(token)
                 return Var(token)
+        if token.lower() == "pixel":
+            # `pixel X Y is on` / `is off` -- a boolean over the sole MATRIX8X8.
+            # X and Y are atoms (a number, a name or a parenthesised group), so
+            # the trailing `is on` is not swallowed as part of them.
+            part = sole_matrix(self.program, self.line)
+            x = self.atom()
+            y = self.atom()
+            ref = MatrixPixelRef(part.name, x, y)
+            nxt = self.peek()
+            if nxt is not None and nxt.lower() == "is":
+                self.take()
+                state = self.take()
+                if state is None or state.lower() not in ("on", "off"):
+                    raise PseudocodeError(
+                        self.line, "expected 'on' or 'off' after 'pixel X Y is'")
+                return Unary("not", ref) if state.lower() == "off" else ref
+            return ref
         if re.fullmatch(r"0[xX][0-9A-Fa-f]+", token):
             return Num(float(int(token, 16)))
         if re.fullmatch(r"0[bB][01]+", token):
@@ -2322,6 +2613,105 @@ def require(program: Program, feature: str, line: int, what: str) -> None:
                                       if feature in t.supports})))
 
 
+def sole_matrix(program: Program, line: int) -> "MatrixPart":
+    """The one MATRIX8X8 in the program, for the verbs that do not name it
+    (`light pixel`, `draw row`). Naming which screen would be noise on a board
+    with a single matrix, which is every A2-class board."""
+    screens = [p for p in program.parts.values() if isinstance(p, MatrixPart)]
+    if not screens:
+        raise PseudocodeError(
+            line, "no MATRIX8X8 screen is declared; add a "
+                  "'PART <name> = MATRIX8X8 ROWS 74HC595 ... COLUMNS <port>' line")
+    if len(screens) > 1:
+        raise PseudocodeError(
+            line, "several MATRIX8X8 screens are declared; this verb does not say "
+                  "which one to draw on")
+    return screens[0]
+
+
+def _named_matrix(program: Program, name: str, line: int):
+    """The MATRIX8X8 called `name`, or None if `name` is not a matrix. Used by
+    the verbs that DO carry the screen name (clear/scroll/show image/brightness)."""
+    part = program.parts.get(name.lower())
+    return part if isinstance(part, MatrixPart) else None
+
+
+def matrix_statement(text: str, program: Program, line: int):
+    """Parse a MATRIX8X8 drawing verb, or return None if this is not one.
+
+    The pixel/row verbs address the sole screen implicitly; clear/scroll/show
+    image/brightness carry its name. Coordinates and the byte/level are ordinary
+    expressions."""
+    lowered = text.lower()
+
+    px = re.fullmatch(r"(light|clear)\s+pixel\s+(\S+)\s+(\S+)", text, re.I)
+    if px:
+        part = sole_matrix(program, line)
+        return MatrixSetPixel(part.name,
+                              expression(px.group(2), program, line),
+                              expression(px.group(3), program, line),
+                              style=px.group(1).lower())
+
+    onoff = re.fullmatch(r"set\s+pixel\s+(\S+)\s+(\S+)\s+to\s+(on|off)", text, re.I)
+    if onoff:
+        part = sole_matrix(program, line)
+        return MatrixSetPixel(part.name,
+                              expression(onoff.group(1), program, line),
+                              expression(onoff.group(2), program, line),
+                              style=onoff.group(3).lower())
+
+    bright = re.fullmatch(r"set\s+pixel\s+(\S+)\s+(\S+)\s+brightness\s+(.+)",
+                          text, re.I)
+    if bright:
+        part = sole_matrix(program, line)
+        return MatrixSetPixel(part.name,
+                              expression(bright.group(1), program, line),
+                              expression(bright.group(2), program, line),
+                              style="brightness",
+                              level=expression(bright.group(3), program, line))
+
+    row = re.fullmatch(r"draw\s+row\s+(\S+)\s*=\s*(.+)", text, re.I)
+    if row:
+        part = sole_matrix(program, line)
+        return MatrixDrawRow(part.name,
+                             expression(row.group(1), program, line),
+                             expression(row.group(2), program, line))
+
+    image = re.fullmatch(r"show\s+image\s+(\w+)\s+on\s+(\w+)", text, re.I)
+    if image:
+        table, name = image.group(1), image.group(2)
+        part = _named_matrix(program, name, line)
+        if part is None:
+            raise PseudocodeError(line, f"{name!r} is not a MATRIX8X8 screen")
+        if table.lower() not in program.tables:
+            raise PseudocodeError(
+                line, f"{table!r} is not a TABLE; 'show image' blits an 8-byte "
+                      f"TABLE onto the screen")
+        return MatrixImage(part.name, table.lower())
+
+    scroll = re.fullmatch(r"scroll\s+(\w+)\s+(left|right|up|down)", text, re.I)
+    if scroll:
+        part = _named_matrix(program, scroll.group(1), line)
+        if part is None:
+            return None
+        return MatrixScroll(part.name, scroll.group(2).lower())
+
+    sb = re.fullmatch(r"set\s+(\w+)\s+brightness\s+(.+)", text, re.I)
+    if sb:
+        part = _named_matrix(program, sb.group(1), line)
+        if part is not None:
+            return MatrixBrightness(part.name,
+                                    expression(sb.group(2), program, line))
+
+    clr = re.fullmatch(r"clear\s+(\w+)", text, re.I)
+    if clr:
+        part = _named_matrix(program, clr.group(1), line)
+        if part is not None:
+            return MatrixClear(part.name)
+
+    return None
+
+
 def simple_statement(text: str, program: Program, line: int) -> Stmt:
     lowered = text.lower()
 
@@ -2347,6 +2737,10 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
     if wait:
         unit = "ms" if wait.group(2).startswith("m") else "seconds"
         return Wait(expression(wait.group(1), program, line), unit, line)
+
+    drawn = matrix_statement(text, program, line)
+    if drawn is not None:
+        return drawn
 
     turn = re.fullmatch(r"turn\s+(on|off)\s+(\w+)", lowered)
     if turn:
@@ -2505,6 +2899,10 @@ KEYPAD_RE = re.compile(
     r"part\s+(\w+)\s*=\s*keypad4x4\s+"
     r"rows\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+"
     r"cols\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$", re.I)
+MATRIX8X8_RE = re.compile(
+    r"part\s+(\w+)\s*=\s*matrix8x8\s+"
+    r"rows\s+74hc595\s+data\s+(\S+)\s+clock\s+(\S+)\s+latch\s+(\S+)\s+"
+    r"columns\s+(\S+)\s*$", re.I)
 PART_RE = re.compile(r"part\s+(\w+)\s*=\s*74hc595\s+data\s+(\S+)\s+"
                      r"clock\s+(\S+)\s+latch\s+(\S+)"
                      r"(?:\s+active\s+(low|high))?", re.I)
@@ -2612,6 +3010,57 @@ def parse(source: str) -> Program:
             index += 1
             continue
 
+        matrix = MATRIX8X8_RE.fullmatch(lowered)
+        if matrix and not started:
+            require(program, "matrix", line.number, "a MATRIX8X8 PART")
+            name, data, clock, latch, cols = matrix.groups()
+            if name in program.parts or name in program.ports or name in program.pins:
+                raise PseudocodeError(line.number, f"{name!r} declared twice")
+            # Resolved against an empty scratch program of the same device, like
+            # the 595 and keypad: all we want is "is this a real pin/port on this
+            # board, and what is it called". The clash cascade below owns the
+            # user-facing "a PART claims its pins" answer.
+            scratch = Program(part=program.part)
+            ctrl = [program.target.resolve_pin(
+                        scratch, f"{name}_{role}", token, "output", False,
+                        line.number)
+                    for role, token in (("data", data), ("clock", clock),
+                                        ("latch", latch))]
+            # The columns are a WHOLE port (active-low sinks, bit7 = left). The
+            # ISR writes it byte-at-a-time; the eight pins exist for the claim
+            # machinery and for setup()'s output-direction pass.
+            col_port = program.target.resolve_port(
+                scratch, f"{name}_cols", cols, "output", True, line.number)
+            columns = [program.target.resolve_pin(
+                           scratch, f"{name}_c{b}", f"{col_port.label}.{b}",
+                           "output", False, line.number)
+                       for b in range(8)]
+            claims = ctrl + columns
+            if len({pin.where for pin in claims}) != 11:
+                raise PseudocodeError(
+                    line.number, f"{name!r} names the same pin twice; a MATRIX8X8 "
+                                 f"claims three 595 pins and eight column pins")
+            for claimed in claims:
+                for other in program.pins.values():
+                    if other.where == claimed.where:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is already declared as "
+                                         f"{other.name!r}; a PART claims its pins")
+                for whole in program.ports.values():
+                    if getattr(claimed, "port", None) == whole.port:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is inside the whole port "
+                                         f"{whole.name!r}, which would clobber it")
+                for prev in program.parts.values():
+                    if claimed.where in prev.claimed_where:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is already claimed by "
+                                         f"{prev.name!r}")
+            program.parts[name] = MatrixPart(name, "matrix8x8", ctrl[0], ctrl[1],
+                                             ctrl[2], col_port, columns)
+            index += 1
+            continue
+
         part = PART_RE.fullmatch(lowered)
         if part and not started:
             require(program, "part", line.number, "a PART")
@@ -2680,6 +3129,15 @@ def parse(source: str) -> Program:
                     raise PseudocodeError(
                         line.number,
                         f"{where.upper()} is already declared as {other.name!r}")
+            # A PART (595, keypad, MATRIX8X8) that claims any pin on this port
+            # owns that latch -- a whole-port write would clobber its bits and,
+            # for an ISR-scanned part, race the scan on the write-back.
+            for part in program.parts.values():
+                if any(getattr(p, "port", None) == whole.port for p in part.claimed):
+                    raise PseudocodeError(
+                        line.number,
+                        f"{where.upper()} overlaps pins already claimed by "
+                        f"{part.name!r}; a PART owns those latches")
             program.ports[name] = whole
             index += 1
             continue
@@ -2822,6 +3280,8 @@ def expr_pseudo(node: Expr, parent_level: int = -1) -> str:
         return node.name
     if isinstance(node, KeypadRef):
         return node.part
+    if isinstance(node, MatrixPixelRef):
+        return f"pixel {expr_pseudo(node.x)} {expr_pseudo(node.y)} is on"
     if isinstance(node, Unary):
         inner = expr_pseudo(node.operand, UNARY_LEVEL)
         return f"not {inner}" if node.op == "not" else f"-{inner}"
@@ -2839,7 +3299,29 @@ def stmts_pseudo(body: list, depth: int, active_low: dict) -> list[str]:
     pad = "  " * depth
     out = []
     for node in body:
-        if isinstance(node, SetPart):
+        if isinstance(node, MatrixClear):
+            out.append(f"{pad}clear {node.part}")
+        elif isinstance(node, MatrixSetPixel):
+            x, y = expr_pseudo(node.x), expr_pseudo(node.y)
+            if node.style == "light":
+                out.append(f"{pad}light pixel {x} {y}")
+            elif node.style == "clear":
+                out.append(f"{pad}clear pixel {x} {y}")
+            elif node.style in ("on", "off"):
+                out.append(f"{pad}set pixel {x} {y} to {node.style}")
+            else:
+                out.append(f"{pad}set pixel {x} {y} brightness "
+                           f"{expr_pseudo(node.level)}")
+        elif isinstance(node, MatrixDrawRow):
+            out.append(f"{pad}draw row {expr_pseudo(node.y)} = "
+                       f"{expr_pseudo(node.bits)}")
+        elif isinstance(node, MatrixImage):
+            out.append(f"{pad}show image {node.table} on {node.part}")
+        elif isinstance(node, MatrixScroll):
+            out.append(f"{pad}scroll {node.part} {node.direction}")
+        elif isinstance(node, MatrixBrightness):
+            out.append(f"{pad}set {node.part} brightness {expr_pseudo(node.level)}")
+        elif isinstance(node, SetPart):
             out.append(f"{pad}set {node.part} to {expr_pseudo(node.value)}")
         elif isinstance(node, SetPort):
             out.append(f"{pad}set {node.port} to {expr_pseudo(node.value)}")
@@ -2921,6 +3403,11 @@ def emit_pseudocode(program: Program) -> str:
                 out.append(f"  PART {part.name} = KEYPAD4X4 "
                            f"ROWS {rows} COLS {cols}")
                 continue
+            if isinstance(part, MatrixPart):
+                out.append(f"  PART {part.name} = MATRIX8X8 ROWS 74HC595 "
+                           f"DATA {part.data.where} CLOCK {part.clock.where} "
+                           f"LATCH {part.latch.where} COLUMNS {part.col_port.label}")
+                continue
             polarity = " ACTIVE LOW" if part.active_low else ""
             out.append(f"  PART {part.name} = 74HC595 "
                        f"DATA {part.data.where} CLOCK {part.clock.where} "
@@ -3000,6 +3487,9 @@ def expr_c(node: Expr, ctx: Emit, parent_level: int = -1) -> str:
         return ctx.target.read_pin(pin)
     if isinstance(node, KeypadRef):
         return f"bw_part_{node.part}_read()"
+    if isinstance(node, MatrixPixelRef):
+        return (f"(bw_scr_{node.part}_getpx((unsigned char)({expr_c(node.x, ctx)}), "
+                f"(unsigned char)({expr_c(node.y, ctx)})) != 0)")
     if isinstance(node, Unary):
         inner = expr_c(node.operand, ctx, UNARY_LEVEL)
         return f"!({inner})" if node.op == "not" else f"-({inner})"
@@ -3075,11 +3565,43 @@ def _const_value(node: Expr) -> float | None:
     return None
 
 
+def matrix_stmt_c(node: Stmt, pad: str, ctx: Emit) -> list[str] | None:
+    """Lower a MATRIX8X8 drawing verb to a frame-buffer call, or None if `node`
+    is not one. Shared by the straight-line and cooperative back ends, which
+    emit these identically -- every verb is a plain RAM write, never a yield."""
+    if isinstance(node, MatrixClear):
+        return [f"{pad}bw_scr_{node.part}_clear();"]
+    if isinstance(node, MatrixSetPixel):
+        x, y = expr_c(node.x, ctx), expr_c(node.y, ctx)
+        if node.style in ("light", "on"):
+            level = "MATRIX_LEVELS - 1"
+        elif node.style in ("clear", "off"):
+            level = "0"
+        else:                                   # "brightness"
+            level = f"bw_scr_level({expr_c(node.level, ctx)})"
+        return [f"{pad}bw_scr_{node.part}_setpx((unsigned char)({x}), "
+                f"(unsigned char)({y}), (unsigned char)({level}));"]
+    if isinstance(node, MatrixDrawRow):
+        return [f"{pad}bw_scr_{node.part}_row((unsigned char)({expr_c(node.y, ctx)}), "
+                f"(unsigned char)({expr_c(node.bits, ctx)}));"]
+    if isinstance(node, MatrixImage):
+        return [f"{pad}bw_scr_{node.part}_image(bw_tab_{node.table});"]
+    if isinstance(node, MatrixScroll):
+        code = {"left": 0, "right": 1, "up": 2, "down": 3}[node.direction]
+        return [f"{pad}bw_scr_{node.part}_scroll({code});   /* {node.direction} */"]
+    if isinstance(node, MatrixBrightness):
+        return [f"{pad}bw_scr_{node.part}_dim = bw_scr_level({expr_c(node.level, ctx)});"]
+    return None
+
+
 def stmts_c(body: list, depth: int, ctx: Emit) -> list[str]:
     pad = "    " * depth
     out = []
     for node in body:
-        if isinstance(node, SetPin):
+        drawn = matrix_stmt_c(node, pad, ctx)
+        if drawn is not None:
+            out += drawn
+        elif isinstance(node, SetPin):
             out.append(pad + ctx.target.write_pin(ctx.pins[node.pin], node.high))
         elif isinstance(node, SetPwm):
             out.append(pad + ctx.target.write_pwm(ctx.pins[node.pin],
@@ -3186,6 +3708,10 @@ def stmts_task(body: list, depth: int, ctx: Emit,
         return states[0]
 
     for node in body:
+        drawn = matrix_stmt_c(node, pad, ctx)
+        if drawn is not None:
+            out += drawn
+            continue
         if isinstance(node, SetPin):
             out.append(pad + ctx.target.write_pin(ctx.pins[node.pin], node.high))
         elif isinstance(node, SetPwm):
@@ -3289,8 +3815,11 @@ def emit_c(program: Program) -> str:
     ctx = Emit(target, {pin.name: pin for pin in program.pins.values()},
                program.procedures, program)
     # A pin hat must be sampled every tick, so it forces the cooperative
-    # scheduler even when it is the only script in the program.
-    tasks = len(program.whens) > 1 or any(program.when_hats)
+    # scheduler even when it is the only script in the program. A MATRIX8X8
+    # forces it for the same reason: its refresh lives in the Timer-0 ISR, which
+    # only the scheduler path emits.
+    tasks = (len(program.whens) > 1 or any(program.when_hats)
+             or program.has_matrix)
 
     # This said "Hand edits will be lost; change the pseudocode instead." The
     # first half is still true. The second stopped being true when BrickWright's

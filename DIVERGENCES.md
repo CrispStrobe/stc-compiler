@@ -43,3 +43,38 @@ because `IF not k = shown` mis-parsing as `(not k) = shown` shipped a
 flashed-clean, silently-dead program to real silicon before the bench
 caught it. sb3-creator's reader/emitter must match or `not a = b`
 round-trips with changed meaning; verify its parser when closing parity.
+
+**`PART <name> = MATRIX8X8 ROWS 74HC595 DATA <p> CLOCK <p> LATCH <p>
+COLUMNS <port>` — landed in reference, NOT yet mirrored to sb3-creator
+(2026-08-18).** An 8×8 LED dot matrix that refreshes itself in the Timer-0
+ISR (one row per tick → 125 Hz), so the drawing verbs are plain
+frame-buffer writes and the `WHEN` block keeps running. Measured A2 wiring
+(docs/BOARD-PRECHIN-A2.md): 595 rows active-HIGH Q7=top, port columns
+active-LOW bit7=left — both baked into the scan so image bytes read
+top-down / MSB-left. 8051 family only (needs a whole port + the ISR tick),
+like KEYPAD4X4. Frame buffer is **bit-plane packed, 2 planes / 4 levels /
+16 bytes** (`MATRIX_PLANES`/`MATRIX_LEVELS` are the single widen-point to
+16 levels / 32 bytes). This landing renders **threshold** (lit iff level ≠
+0 = OR of the planes); the ISR carries a clearly-marked BCM seam
+(`bw_scr_<name>_phase`) for later, ISR-only grayscale — Layer 2, a joint
+timer decision, deferred. The ISR is the **sole writer** of the 595 and
+the column port (the PART claim refuses PIN/PORT on those pins), which is
+what closes the 8051 read-modify-write hazard.
+
+New vocabulary → C, all writing the RAM frame buffer only:
+- `clear screen` → `bw_scr_<n>_clear()`
+- `light pixel X Y` / `clear pixel X Y` → `bw_scr_<n>_setpx(x,y, MATRIX_LEVELS-1 | 0)`
+- `set pixel X Y to on|off` → same, level MAX / 0
+- `set pixel X Y brightness B` → `bw_scr_<n>_setpx(x,y, bw_scr_level(B))`
+- `draw row Y = <byte>` → `bw_scr_<n>_row(y, bits)` (1-bit → full, 0 → off)
+- `show image <table> on screen` → `bw_scr_<n>_image(bw_tab_<table>)` (1-bit blit)
+- `scroll screen left|right|up|down` → `bw_scr_<n>_scroll(0|1|2|3)`
+- `set screen brightness B` → `bw_scr_<n>_dim = bw_scr_level(B)`
+- reporter `pixel X Y is on` → `(bw_scr_<n>_getpx(x,y) != 0)`
+
+Mirror carefully: (a) presence of a MATRIX8X8 must force sb3-creator's
+cooperative-scheduler / ISR path even for a single script (here
+`Program.has_matrix` feeds the `tasks` decision); (b) the scan hook goes in
+the Timer-0 ISR **after `bw_ms++`, table-driven, no mul/div**; (c) a whole
+`PORT` overlapping a PART's claimed pins is now refused in BOTH directions
+(this fixed a pre-existing gap that also covered 595/keypad).
