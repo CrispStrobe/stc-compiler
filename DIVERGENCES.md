@@ -137,3 +137,28 @@ zero warnings — worse than this side's loud error. Fixed there the same
 day (splitBinary tracks `[]` like `()`; pinned in keypad-parity.test.mjs).
 Cross-check: examples/78-a2-calculator/program.bw now parses in BOTH
 front ends unchanged.
+
+## Keypad reporters + `WHEN key N pressed` hats (2026-08-18) — sb3-creator must mirror
+
+The A2-BOARD-SUPPORT fan-out item. New vocabulary, all over the sole
+KEYPAD4X4 (sole_keypad mirrors sole_matrix):
+
+- `a key is pressed` — DESUGARS at parse time to `<pad> >= 0`; canonical
+  printed form is the desugared one, so the fixed point is `keys >= 0`.
+- `key N is pressed` / `key N is released` — desugars to `<pad> = N` /
+  `not (<pad> = N)`. N range-checked 0..15. A four-token lookahead guard
+  (`key <digit> is pressed|released`) keeps a VARIABLE named `key` (the
+  keyshow example has one) parsing as a variable.
+- **`WHEN key N pressed:` / `released:`** — edge hats. Lowered like the
+  pin hats (polled task, `_prev` edge state) but on a shared DEBOUNCED
+  scan: one `bw_kp_<pad>_poll` task per keypad, dispatched before the
+  hats, reads the matrix at most every 5 ms and only updates
+  `bw_kp_<pad>_key` after two agreeing reads. A hat forces the
+  cooperative scheduler like a pin hat does. `when_hats` entries:
+  pin hat = (pin, edge) 2-tuple, key hat = (pad, edge, n) 3-tuple.
+
+Mirror notes for sb3-creator: the reporters need no new opcodes if the
+desugar happens at parse time there too (they become plain compare
+blocks over stc12_keypad); the hat needs a real hat block + the shared
+poll in generated C byte-shaped like this side's (test_keypad.py
+TestKeypadHats pins the C), plus Py/JS scheduler equivalents.

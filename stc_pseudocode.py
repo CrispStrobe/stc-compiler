@@ -2759,6 +2759,32 @@ class ExprParser:
                 if token not in self.program.locals_ and token not in self.program.variables:
                     self.program.variables.append(token)
                 return Var(token)
+        if token.lower() == "a" and [t.lower() for t in
+                self.tokens[self.pos:self.pos + 3]] == ["key", "is", "pressed"]:
+            # `a key is pressed` -- sugar over the sole KEYPAD4X4, desugared
+            # to `<pad> >= 0` so no new AST shape (and no new lowering in any
+            # back end) is needed. sb3-creator prints the desugared form back,
+            # so the canonical fixed point is `keys >= 0`.
+            self.pos += 3
+            pad = sole_keypad(self.program, self.line)
+            return Binary(">=", KeypadRef(pad.name), Num(0))
+        if (token.lower() == "key"
+                and self.pos + 2 < len(self.tokens)
+                and re.fullmatch(r"\d+", self.tokens[self.pos])
+                and self.tokens[self.pos + 1].lower() == "is"
+                and self.tokens[self.pos + 2].lower() in ("pressed", "released")):
+            # `key N is pressed` / `is released` -- one specific key held (or
+            # not). Guarded by the full four-token shape so a VARIABLE named
+            # `key` (the keyshow example has one) still parses as a variable.
+            n = int(self.take())
+            self.take()
+            state = self.take().lower()
+            if n > 15:
+                raise PseudocodeError(
+                    self.line, f"key {n} does not exist; a KEYPAD4X4 has keys 0..15")
+            pad = sole_keypad(self.program, self.line)
+            ref = Binary("=", KeypadRef(pad.name), Num(n))
+            return Unary("not", ref) if state == "released" else ref
         if token.lower() == "pixel":
             # `pixel X Y is on` / `is off` -- a boolean over the sole MATRIX8X8.
             # X and Y are atoms (a number, a name or a parenthesised group), so
@@ -2909,6 +2935,22 @@ def sole_matrix(program: Program, line: int) -> "MatrixPart":
             line, "several MATRIX8X8 screens are declared; this verb does not say "
                   "which one to draw on")
     return screens[0]
+
+
+def sole_keypad(program: Program, line: int) -> "KeypadPart":
+    """The one KEYPAD4X4, for the phrases that do not name it (`WHEN key N
+    pressed`, `a key is pressed`). Same rule as sole_matrix: every A2-class
+    board has exactly one keypad, so naming it would be noise."""
+    pads = [p for p in program.parts.values() if isinstance(p, KeypadPart)]
+    if not pads:
+        raise PseudocodeError(
+            line, "no KEYPAD4X4 is declared; add a "
+                  "'PART <name> = KEYPAD4X4 ROWS ... COLS ...' line")
+    if len(pads) > 1:
+        raise PseudocodeError(
+            line, "several KEYPAD4X4 parts are declared; this phrase does not "
+                  "say which one it means")
+    return pads[0]
 
 
 def _named_matrix(program: Program, name: str, line: int):
@@ -3227,6 +3269,12 @@ WHEN_RE = re.compile(r"when\s+(started|flag\s+clicked|powered\s+on)\s*:", re.I)
 # stop being available; the millisecond tick is already a debounce interval;
 # and polling is the same state-machine shape the scheduler already has.
 # docs/PARTS-TO-BLOCKS.md in the lab repo has the full reasoning.
+# `WHEN key 5 pressed:` -- an edge hat on the sole KEYPAD4X4. Polled like
+# the pin hats, but through a shared DEBOUNCED scan: one poll task per
+# keypad reads the matrix once per dispatch, and a key must be seen in
+# two consecutive scans before it counts (a scan mid-bounce reads -1 or
+# a neighbour for one pass; two agreeing reads 1 ms apart do not).
+WHEN_KEY_RE = re.compile(r"when\s+key\s+(\d+)\s+(pressed|released)\s*:", re.I)
 WHEN_PIN_RE = re.compile(r"when\s+(\w+)\s+(pressed|released)\s*:", re.I)
 PIN_RE = re.compile(r"pin\s+(\w+)\s*=\s*(\S+)\s+(output|input|analog|pwm|tone)"
                     r"(?:\s+active\s+(low|high))?", re.I)
@@ -3608,6 +3656,22 @@ def parse(source: str) -> Program:
             program.when_hats.append(None)
             continue
 
+        key_hat = WHEN_KEY_RE.fullmatch(lowered)
+        if key_hat:
+            n, edge = int(key_hat.group(1)), key_hat.group(2).lower()
+            if n > 15:
+                raise PseudocodeError(
+                    line.number, f"key {n} does not exist; a KEYPAD4X4 has keys 0..15")
+            pad = sole_keypad(program, line.number)
+            started = True
+            block, index = parse_block(lines, index + 1, line.indent, program)
+            if not block:
+                raise PseudocodeError(
+                    line.number, f"'WHEN key {n} {edge}:' block is empty")
+            program.whens.append(block)
+            program.when_hats.append((pad.name, edge, n))
+            continue
+
         hat = WHEN_PIN_RE.fullmatch(lowered)
         if hat:
             name, edge = hat.group(1), hat.group(2).lower()
@@ -3867,7 +3931,12 @@ def emit_pseudocode(program: Program) -> str:
         out += stmts_pseudo(procedure.body, 2, active_low)
     for number, block in enumerate(program.whens):
         hat = program.when_hats[number] if number < len(program.when_hats) else None
-        header = "  WHEN started:" if hat is None else f"  WHEN {hat[0]} {hat[1]}:"
+        if hat is None:
+            header = "  WHEN started:"
+        elif len(hat) == 3:
+            header = f"  WHEN key {hat[2]} {hat[1]}:"
+        else:
+            header = f"  WHEN {hat[0]} {hat[1]}:"
         out += ["", header]
         out += stmts_pseudo(block, 2, active_low)
     return "\n".join(out) + "\n"
@@ -4329,6 +4398,38 @@ def emit_c(program: Program) -> str:
     if tasks:
         task_lines: list[str] = []
         statics: list[str] = []
+
+        # `WHEN key N` hats share one debounced scan per keypad: a poll task
+        # (dispatched before the hats) reads the matrix at most every 5 ms and
+        # a key only becomes current after two agreeing reads, so a scan
+        # mid-bounce -- which reads -1 or a neighbour for one pass -- cannot
+        # fire a hat. The hats then edge-detect on the debounced value exactly
+        # the way pin hats edge-detect on a level.
+        key_pads = []
+        for hat in program.when_hats:
+            if hat is not None and len(hat) == 3 and hat[0] not in key_pads:
+                key_pads.append(hat[0])
+        tt = target.time_type
+        now = target.now()
+        for pad in key_pads:
+            task_lines += [
+                f"/* {pad}: debounced key state shared by the `WHEN key N` hats. */",
+                f"static signed char bw_kp_{pad}_raw = -1;",
+                f"static signed char bw_kp_{pad}_key = -1;",
+                f"static {tt} bw_kp_{pad}_t;",
+                f"static void bw_kp_{pad}_poll(void)",
+                "{",
+                "    signed char r;",
+                f"    if (({tt})({now} - bw_kp_{pad}_t) < 5)",
+                "        return;                     /* scan every 5 ms */",
+                f"    bw_kp_{pad}_t = {now};",
+                f"    r = bw_part_{pad}_read();",
+                f"    if (r == bw_kp_{pad}_raw)",
+                f"        bw_kp_{pad}_key = r;",
+                f"    bw_kp_{pad}_raw = r;",
+                "}", ""]
+            task_names.append(f"bw_kp_{pad}_poll")
+
         for number, block in enumerate(program.whens):
             task = f"bw_task{number}"
             task_names.append(task)
@@ -4351,6 +4452,36 @@ def emit_c(program: Program) -> str:
                                "    }",
                                f"    {task}_state = 0xFFFF;   /* ran to the end */",
                                "}", ""]
+                continue
+
+            if len(hat) == 3:
+                pad, edge, key_n = hat
+                test = (f"now && !{task}_prev" if edge == "pressed"
+                        else f"!now && {task}_prev")
+                head.append(f"static unsigned char {task}_prev;")
+                task_lines += head
+                task_lines += [
+                    f"/* WHEN key {key_n} {edge}: (script {number + 1})",
+                    " *",
+                    " * Edge-triggered on the DEBOUNCED key from the shared poll task: a",
+                    " * held key runs the body once, and a bouncing contact cannot fire",
+                    " * twice, because the poll only updates after two agreeing scans. */",
+                    f"static void {task}(void)",
+                    "{",
+                    f"    unsigned char now = (bw_kp_{pad}_key == {key_n}) ? 1 : 0;",
+                    f"    unsigned char fired = ({test}) ? 1 : 0;",
+                    f"    {task}_prev = now;",
+                    "",
+                    f"    switch ({task}_state) {{",
+                    "    case 0:",
+                    "        if (!fired)",
+                    "            return;",
+                    f"        {task}_state = 1;",
+                    "    case 1:",
+                    *body,
+                    "    }",
+                    f"    {task}_state = 0;   /* ready for the next edge */",
+                    "}", ""]
                 continue
 
             pin_name, edge = hat

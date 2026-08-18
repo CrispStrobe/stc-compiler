@@ -73,3 +73,93 @@ class TestKeypad(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+HAT_SRC = """\
+DEVICE STC89C52RC:
+  CLOCK 11059200
+
+  PART keys = KEYPAD4X4 ROWS P1.7 P1.6 P1.5 P1.4 COLS P1.3 P1.2 P1.1 P1.0
+
+  PORT segments = P0 OUTPUT
+
+  WHEN started:
+    set segments to 0
+    FOREVER:
+      IF a key is pressed THEN:
+        set segments to 255
+      IF key 3 is pressed THEN:
+        set segments to 3
+      wait 20 ms
+
+  WHEN key 5 pressed:
+    set segments to 5
+
+  WHEN key 14 released:
+    set segments to 0
+"""
+
+
+class TestKeypadHats(unittest.TestCase):
+    """`WHEN key N pressed` + the reporter sugar (A2-BOARD-SUPPORT fan-out).
+
+    The hats poll a shared DEBOUNCED scan -- one poll task per keypad, at
+    most every 5 ms, and a key only becomes current after two agreeing
+    reads -- then edge-detect exactly the way pin hats do."""
+
+    def test_reporters_desugar(self):
+        # `a key is pressed` is `keys >= 0`; `key 3 is pressed` is `keys = 3`.
+        # No new AST shape, so every back end lowers them for free.
+        c, _ = sp.transpile(HAT_SRC)
+        self.assertIn("if (bw_part_keys_read() >= 0) {", c)
+        self.assertIn("if (bw_part_keys_read() == 3) {", c)
+
+    def test_debounced_poll_task(self):
+        c, _ = sp.transpile(HAT_SRC)
+        self.assertIn("static void bw_kp_keys_poll(void)", c)
+        self.assertIn("if ((unsigned int)(bw_now() - bw_kp_keys_t) < 5)", c)
+        self.assertIn("if (r == bw_kp_keys_raw)", c)      # two agreeing reads
+        # the poll is dispatched in the scheduler loop, before the hats
+        self.assertIn("        bw_kp_keys_poll();", c)
+        self.assertLess(c.index("bw_kp_keys_poll();\n"),
+                        c.index("bw_task1();"))
+
+    def test_hats_edge_detect_on_debounced_key(self):
+        c, _ = sp.transpile(HAT_SRC)
+        self.assertIn("unsigned char now = (bw_kp_keys_key == 5) ? 1 : 0;", c)
+        self.assertIn("unsigned char now = (bw_kp_keys_key == 14) ? 1 : 0;", c)
+        # pressed = rising edge, released = falling edge
+        self.assertIn("(now && !bw_task1_prev)", c)
+        self.assertIn("(!now && bw_task2_prev)", c)
+
+    def test_round_trip_is_a_fixed_point(self):
+        c, prog = sp.transpile(HAT_SRC)
+        back = sp.emit_pseudocode(prog)
+        self.assertIn("WHEN key 5 pressed:", back)
+        self.assertIn("WHEN key 14 released:", back)
+        c2, prog2 = sp.transpile(back)
+        self.assertEqual(c2, c)
+        self.assertEqual(sp.emit_pseudocode(prog2), back)
+
+    def test_key_variable_still_a_variable(self):
+        # The keyshow example names a VARIABLE `key`; the four-token guard
+        # (`key <digit> is pressed|released`) must not swallow it.
+        src = HAT_SRC.replace("IF key 3 is pressed THEN:\n        set segments to 3\n      ",
+                              "set key to 7\n      IF key = 7 THEN:\n        set segments to 7\n      ")
+        c, _ = sp.transpile(src)
+        self.assertIn("if (key == 7) {", c)
+
+    def test_out_of_range_key_is_refused(self):
+        for bad in ("WHEN key 16 pressed:", "WHEN key 99 released:"):
+            src = HAT_SRC.replace("WHEN key 14 released:", bad)
+            with self.assertRaises(sp.PseudocodeError):
+                sp.transpile(src)
+        src = HAT_SRC.replace("IF key 3 is pressed THEN:", "IF key 16 is pressed THEN:")
+        with self.assertRaises(sp.PseudocodeError):
+            sp.transpile(src)
+
+    def test_no_keypad_is_refused(self):
+        src = HAT_SRC.replace(
+            "  PART keys = KEYPAD4X4 ROWS P1.7 P1.6 P1.5 P1.4 COLS P1.3 P1.2 P1.1 P1.0\n\n", "")
+        with self.assertRaises(sp.PseudocodeError):
+            sp.transpile(src)
