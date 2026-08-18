@@ -126,6 +126,15 @@ class MatrixPixelRef(Expr):
 
 
 @dataclass
+class Randint(Expr):
+    low: Expr
+    high: Expr
+
+@dataclass
+class ControllerAxis(Expr):
+    axis: str           # "dx" | "dy"
+
+@dataclass
 class Unary(Expr):
     op: str            # "not" | "-"
     operand: Expr
@@ -392,6 +401,45 @@ class SetLeds(Stmt):
 class LightOnlyLed(Stmt):
     bank: str
     index: Expr
+
+
+# ---- Arcade game-engine statements -----------------------------------
+
+@dataclass
+class ArcadeCreate(Stmt):
+    sprite: str
+    kind: str
+
+@dataclass
+class ArcadePlace(Stmt):
+    sprite: str
+    x: Expr
+    y: Expr
+
+@dataclass
+class ArcadeMove(Stmt):
+    sprite: str
+    vx: Expr
+    vy: Expr
+
+@dataclass
+class ArcadeSetFlag(Stmt):
+    sprite: str
+    flag: str           # "stayinscreen" | "destroyonwall"
+
+@dataclass
+class ArcadeScore(Stmt):
+    delta: Expr
+
+@dataclass
+class ArcadeGameOver(Stmt):
+    win: bool
+
+@dataclass
+class ArcadeOnOverlap(Stmt):
+    kind_a: str
+    kind_b: str
+    body: list
 
 
 # ===================================================================== program
@@ -2698,7 +2746,7 @@ def read_lines(source: str) -> list[Line]:
 
 TOKEN_RE = re.compile(r"""\s*(?:
       (?P<number>0[xX][0-9A-Fa-f]+|0[bB][01]+|\d+\.\d+|\d+)
-    | (?P<op><=|>=|!=|<>|==|[-+*/%()<>=\[\]])
+    | (?P<op><=|>=|!=|<>|==|[-+*/%()<>=\[\],])
     | (?P<word>[A-Za-z_][A-Za-z0-9_]*)
     )""", re.X)
 
@@ -2826,6 +2874,18 @@ class ExprParser:
                         self.line, "expected 'on' or 'off' after 'pixel X Y is'")
                 return Unary("not", ref) if state.lower() == "off" else ref
             return ref
+        if token.lower() == "randint" and self.peek() == "(":
+            self.take()  # consume '('
+            low = self.parse()
+            if self.peek() == ",":
+                self.take()
+            high = self.parse()
+            if self.take() != ")":
+                raise PseudocodeError(self.line, "missing ')' after randint")
+            return Randint(low, high)
+        if token.lower() == "controller" and self.peek() is not None and self.peek().lower() in ("dx", "dy"):
+            axis = self.take().lower()
+            return ControllerAxis(axis)
         if re.fullmatch(r"0[xX][0-9A-Fa-f]+", token):
             return Num(float(int(token, 16)))
         if re.fullmatch(r"0[bB][01]+", token):
@@ -2912,6 +2972,14 @@ def parse_block(lines: list[Line], index: int, parent_indent: int,
                                program, line.number)
             inner, index = parse_block(lines, index + 1, indent, program)
             body.append(Repeat(count, inner))
+            continue
+
+        arc_overlap = re.fullmatch(
+            r"arcade\s+on\s+overlap\s+(\w+)\s+(\w+)\s*:", text, re.I)
+        if arc_overlap:
+            inner, index = parse_block(lines, index + 1, indent, program)
+            body.append(ArcadeOnOverlap(arc_overlap.group(1),
+                                         arc_overlap.group(2), inner))
             continue
 
         conditional = re.fullmatch(r"if\s+(.+?)\s+then\s*:", lowered)
@@ -3089,6 +3157,37 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
     drawn = matrix_statement(text, program, line)
     if drawn is not None:
         return drawn
+
+    # ---- Arcade game-engine verbs ----
+    arc_create = re.fullmatch(r"arcade\s+create\s+(\w+)\s+kind\s+(\w+)", text, re.I)
+    if arc_create:
+        return ArcadeCreate(arc_create.group(1).lower(), arc_create.group(2))
+
+    arc_place = re.match(r"arcade\s+place\s+(\w+)\s+x\s+(.+?)\s+y\s+(.+)$", text, re.I)
+    if arc_place:
+        return ArcadePlace(arc_place.group(1).lower(),
+                           expression(arc_place.group(2), program, line),
+                           expression(arc_place.group(3), program, line))
+
+    arc_move = re.match(r"arcade\s+move\s+(\w+)\s+vx\s+(.+?)\s+vy\s+(.+)$", text, re.I)
+    if arc_move:
+        return ArcadeMove(arc_move.group(1).lower(),
+                          expression(arc_move.group(2), program, line),
+                          expression(arc_move.group(3), program, line))
+
+    arc_flag = re.fullmatch(
+        r"arcade\s+set\s+(\w+)\s+(stay\s+in\s+screen|destroy\s+on\s+wall)", text, re.I)
+    if arc_flag:
+        flag = "stayinscreen" if "stay" in arc_flag.group(2).lower() else "destroyonwall"
+        return ArcadeSetFlag(arc_flag.group(1).lower(), flag)
+
+    arc_score = re.match(r"arcade\s+score\s+add\s+(.+)$", text, re.I)
+    if arc_score:
+        return ArcadeScore(expression(arc_score.group(1), program, line))
+
+    arc_over = re.fullmatch(r"arcade\s+game\s+over\s+(win|lose)", text, re.I)
+    if arc_over:
+        return ArcadeGameOver(win=(arc_over.group(1).lower() == "win"))
 
     # ---- SEVENSEG8 verbs ----
     show_num = re.match(r"show\s+number\s+(.+?)\s+on\s+(\w+)$", text, re.I)
@@ -3777,6 +3876,10 @@ def expr_pseudo(node: Expr, parent_level: int = -1) -> str:
         return node.part
     if isinstance(node, MatrixPixelRef):
         return f"pixel {expr_pseudo(node.x)} {expr_pseudo(node.y)} is on"
+    if isinstance(node, Randint):
+        return f"randint({expr_pseudo(node.low)}, {expr_pseudo(node.high)})"
+    if isinstance(node, ControllerAxis):
+        return f"controller {node.axis}"
     if isinstance(node, Unary):
         inner = expr_pseudo(node.operand, UNARY_LEVEL)
         return f"not {inner}" if node.op == "not" else f"-{inner}"
@@ -3883,6 +3986,24 @@ def stmts_pseudo(body: list, depth: int, active_low: dict) -> list[str]:
             out.append(f"{pad}set leds to {expr_pseudo(node.value)} on {node.bank}")
         elif isinstance(node, LightOnlyLed):
             out.append(f"{pad}light only led {expr_pseudo(node.index)} on {node.bank}")
+        elif isinstance(node, ArcadeCreate):
+            out.append(f"{pad}arcade create {node.sprite} kind {node.kind}")
+        elif isinstance(node, ArcadePlace):
+            out.append(f"{pad}arcade place {node.sprite} x {expr_pseudo(node.x)} "
+                       f"y {expr_pseudo(node.y)}")
+        elif isinstance(node, ArcadeMove):
+            out.append(f"{pad}arcade move {node.sprite} vx {expr_pseudo(node.vx)} "
+                       f"vy {expr_pseudo(node.vy)}")
+        elif isinstance(node, ArcadeSetFlag):
+            flag = "stay in screen" if node.flag == "stayinscreen" else "destroy on wall"
+            out.append(f"{pad}arcade set {node.sprite} {flag}")
+        elif isinstance(node, ArcadeScore):
+            out.append(f"{pad}arcade score add {expr_pseudo(node.delta)}")
+        elif isinstance(node, ArcadeGameOver):
+            out.append(f"{pad}arcade game over {'win' if node.win else 'lose'}")
+        elif isinstance(node, ArcadeOnOverlap):
+            out.append(f"{pad}ARCADE ON OVERLAP {node.kind_a} {node.kind_b}:")
+            out += stmts_pseudo(node.body, depth + 1, active_low)
         elif isinstance(node, Stop):
             out.append(f"{pad}stop")
         else:
@@ -4637,3 +4758,6 @@ TARGETS["stc15w408as"] = _stc(
 # are PA0-PA7 / PB0-PB6 (the VIA ports).
 TARGETS["eater6502"] = PortBitAvrTarget(
     "eater6502", "Eater 6502", "eater6502", 32768, ports="AB", default_clock=1000000)
+
+from bw_arcade import ArcadeTarget  # noqa: E402
+TARGETS["arcade"] = ArcadeTarget()

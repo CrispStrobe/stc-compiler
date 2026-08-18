@@ -1,75 +1,26 @@
-# Dodge! — minimal Arcade example skeleton
-#
-# A BrickWright dialect program targeting the Arcade sim.
-# The player sprite dodges falling enemies; score increments each tick.
-# Demonstrates: sprite create, velocity, controller input, overlap, game over.
-#
-# This is the acceptance fixture for ARCADE-SCOPING.md Stage 1.
-# When emit_arcade_ts() exists, this program should compile to Arcade TS
-# and run in the vendored sim.
-
 DEVICE ARCADE
 
-# --- sprites -----------------------------------------------------------
+WHEN started:
+  arcade create player kind Player
+  arcade place player x 80 y 100
+  arcade set player stay in screen
+  set score to 0
+  FOREVER:
+    arcade move player vx (controller dx) vy 0
+    change score by 1
+    arcade score add 1
+    wait 1 seconds
 
-SPRITE Player:
-  WHEN flag clicked:
-    arcade sprite player SHIP
-    arcade place player x 80 y 100
-    arcade set player stay in screen on
+WHEN started:
+  set spawnx to 0
+  FOREVER:
+    set spawnx to randint(10, 150)
+    arcade create enemy kind Enemy
+    arcade place enemy x spawnx y 0
+    arcade move enemy vx 0 vy 40
+    arcade set enemy destroy on wall
+    wait 800 ms
 
-SPRITE Enemy:
-  WHEN flag clicked:
-    FOREVER:
-      arcade sprite enemy DIAMOND
-      arcade place enemy x (pick random 10 to 150) y 0
-      arcade move enemy vx 0 vy 40
-      arcade set enemy destroy on wall on
-      WAIT 0.8 secs
-
-# --- controller --------------------------------------------------------
-
-SPRITE Player:
-  WHEN flag clicked:
-    FOREVER:
-      arcade move player vx (controller dx) vy 0
-
-# --- game logic --------------------------------------------------------
-
-SPRITE Game:
-  WHEN flag clicked:
-    set score to 0
-    FOREVER:
-      change score by 1
-      arcade score add 1
-      WAIT 1 secs
-
-  WHEN arcade overlap player enemy:
-    arcade game over LOSE
-
-# --- expected Arcade TypeScript output (for oracle test) ---------------
-#
-# let player = sprites.create(img`SHIP`, SpriteKind.Player)
-# player.setPosition(80, 100)
-# player.setStayInScreen(true)
-#
-# game.onUpdateInterval(800, function () {
-#     let enemy = sprites.create(img`DIAMOND`, SpriteKind.Enemy)
-#     enemy.setPosition(randint(10, 150), 0)
-#     enemy.setVelocity(0, 40)
-#     enemy.setFlag(SpriteFlag.DestroyOnWall, true)
-# })
-#
-# game.onUpdate(function () {
-#     player.setVelocity(controller.dx(), 0)
-# })
-#
-# let score = 0
-# game.onUpdateInterval(1000, function () {
-#     score += 1
-#     info.changeScoreBy(1)
-# })
-#
-# sprites.onOverlap(SpriteKind.Player, SpriteKind.Enemy, function () {
-#     game.over(false)
-# })
+WHEN started:
+  ARCADE ON OVERLAP Player Enemy:
+    arcade game over lose
