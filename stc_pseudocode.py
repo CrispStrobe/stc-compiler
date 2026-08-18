@@ -345,6 +345,55 @@ class MatrixBrightness(Stmt):
     level: Expr
 
 
+@dataclass
+class ShowNumber(Stmt):
+    display: str
+    value: Expr
+
+
+@dataclass
+class ShowDigit(Stmt):
+    display: str
+    digit: Expr
+    value: Expr
+
+
+@dataclass
+class SetDigitSegments(Stmt):
+    display: str
+    digit: Expr
+    segments: Expr
+
+
+@dataclass
+class ClearDisplay(Stmt):
+    display: str
+
+
+@dataclass
+class TurnOnLed(Stmt):
+    bank: str
+    index: Expr
+
+
+@dataclass
+class TurnOffLed(Stmt):
+    bank: str
+    index: Expr
+
+
+@dataclass
+class SetLeds(Stmt):
+    bank: str
+    value: Expr
+
+
+@dataclass
+class LightOnlyLed(Stmt):
+    bank: str
+    index: Expr
+
+
 # ===================================================================== program
 
 @dataclass
@@ -496,6 +545,43 @@ class MatrixPart:
     @property
     def claimed_where(self) -> list:
         return [pin.where for pin in self.claimed]
+
+
+@dataclass
+class SevenSegPart:
+    """SEVENSEG8: 8-digit 7-seg via 74HC245 (segments on a port) + 74HC138
+    (3 address pins for digit select). ISR-driven multiplexed refresh."""
+    name: str
+    kind: str = "sevenseg8"
+    seg_port: int = 0
+    sel_pins: list = field(default_factory=list)
+    common_anode: bool = False
+
+    @property
+    def claimed(self) -> list:
+        return list(self.sel_pins)
+
+    @property
+    def claimed_where(self) -> list:
+        return [pin.where for pin in self.sel_pins]
+
+
+@dataclass
+class LedBankPart:
+    """LEDBANK8: 8 LEDs on a port. Writes go through an ISR-owned shadow byte."""
+    name: str
+    kind: str = "ledbank8"
+    led_port: int = 0
+    active_low: bool = False
+    led_port_where: str = ""
+
+    @property
+    def claimed(self) -> list:
+        return []
+
+    @property
+    def claimed_where(self) -> list:
+        return []
 
 
 @dataclass
@@ -1110,12 +1196,87 @@ class Stc8051Target(Target):
             "",
         ]
 
+    def _sevenseg_isr_lines(self, program):
+        lines = []
+        for part in program.parts.values():
+            if not isinstance(part, SevenSegPart):
+                continue
+            ss = part
+            a, b, c = ss.sel_pins
+            seg_write = f"P{ss.seg_port}"
+            lines += [
+                f"    /* {ss.name}: advance one digit */",
+                f"    {seg_write} = 0x00;           /* blank during switch */",
+                f"    {a.sfr} = bw_{ss.name}_cur & 0x01 ? 1 : 0;",
+                f"    {b.sfr} = bw_{ss.name}_cur & 0x02 ? 1 : 0;",
+                f"    {c.sfr} = bw_{ss.name}_cur & 0x04 ? 1 : 0;",
+            ]
+            if ss.common_anode:
+                lines.append(f"    {seg_write} = (unsigned char)"
+                             f"~bw_{ss.name}_fb[bw_{ss.name}_cur];")
+            else:
+                lines.append(f"    {seg_write} = "
+                             f"bw_{ss.name}_fb[bw_{ss.name}_cur];")
+            lines.append(
+                f"    bw_{ss.name}_cur = (bw_{ss.name}_cur + 1) & 0x07;")
+        return lines
+
+    def _ledbank_isr_lines(self, program):
+        lines = []
+        for part in program.parts.values():
+            if not isinstance(part, LedBankPart):
+                continue
+            lb = part
+            port_sfr = f"P{lb.led_port}"
+            if lb.active_low:
+                lines.append(f"    {port_sfr} = (unsigned char)"
+                             f"~bw_{lb.name}_shadow;  /* LEDs active low */")
+            else:
+                lines.append(f"    {port_sfr} = bw_{lb.name}_shadow;")
+        return lines
+
     def runtime(self, program, tasks):
         out = []
         matrices = [p for p in program.parts.values() if isinstance(p, MatrixPart)]
+        has_sevenseg = program.has_sevenseg
+        has_ledbank = program.has_ledbank
+        needs_isr = tasks or matrices or has_sevenseg or has_ledbank
+
         if matrices:
             out += self._matrix_state(matrices)
-        if tasks:
+
+        if has_sevenseg:
+            out += [
+                "/* 7-segment font: 0-9, A-F. Common-cathode segment encoding:",
+                " *   bit 0 = a (top), 1 = b (upper-right), 2 = c (lower-right),",
+                " *   3 = d (bottom), 4 = e (lower-left), 5 = f (upper-left),",
+                " *   6 = g (middle), 7 = dp (decimal point). */",
+                "static const __code unsigned char bw_7seg_font[16] = {",
+                "    0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07,",
+                "    0x7F, 0x6F, 0x77, 0x7C, 0x39, 0x5E, 0x79, 0x71",
+                "};",
+                "",
+            ]
+            for part in program.parts.values():
+                if isinstance(part, SevenSegPart):
+                    out += [
+                        f"/* {part.name}: 8-digit frame buffer and scan cursor. */",
+                        f"static unsigned char bw_{part.name}_fb[8];",
+                        f"static unsigned char bw_{part.name}_cur;",
+                        "",
+                    ]
+
+        if has_ledbank:
+            for part in program.parts.values():
+                if isinstance(part, LedBankPart):
+                    out += [
+                        f"/* {part.name}: LED shadow byte — the ISR is the sole "
+                        f"port writer. */",
+                        f"static unsigned char bw_{part.name}_shadow;",
+                        "",
+                    ]
+
+        if needs_isr:
             tick = [
                 "/* One WHEN block = one cooperative task. Timer 0 interrupts",
                 " * every millisecond; tasks yield at every wait and at every",
@@ -1131,20 +1292,43 @@ class Stc8051Target(Target):
             ]
             for part in matrices:
                 tick += self._matrix_scan(part)
+            tick += self._sevenseg_isr_lines(program)
+            tick += self._ledbank_isr_lines(program)
             tick += [
                 "}",
                 "",
-                "/* A 16-bit read is not atomic on an 8051; hold the tick off. */",
-                "static unsigned int bw_now(void)",
-                "{",
-                "    unsigned int t;",
-                "    ET0 = 0;",
-                "    t = bw_ms;",
-                "    ET0 = 1;",
-                "    return t;",
-                "}",
-                "",
             ]
+            if tasks:
+                tick += [
+                    "/* A 16-bit read is not atomic on an 8051; hold the tick off. */",
+                    "static unsigned int bw_now(void)",
+                    "{",
+                    "    unsigned int t;",
+                    "    ET0 = 0;",
+                    "    t = bw_ms;",
+                    "    ET0 = 1;",
+                    "    return t;",
+                    "}",
+                    "",
+                ]
+            else:
+                # ISR parts without cooperative tasks: delay uses bw_ms counter.
+                tick += [
+                    "static void delay_ms(unsigned int ms)",
+                    "{",
+                    "    unsigned int start;",
+                    "    ET0 = 0; start = bw_ms; ET0 = 1;",
+                    "    while (ms--) {",
+                    "        for (;;) {",
+                    "            unsigned int now;",
+                    "            ET0 = 0; now = bw_ms; ET0 = 1;",
+                    "            if (now != start) break;",
+                    "        }",
+                    "        ET0 = 0; start = bw_ms; ET0 = 1;",
+                    "    }",
+                    "}",
+                    "",
+                ]
             out += tick
         else:
             out += [
@@ -1180,6 +1364,76 @@ class Stc8051Target(Target):
         for part in program.parts.values():
             if isinstance(part, MatrixPart):
                 out += self._matrix_helpers(part)
+                continue
+            if isinstance(part, SevenSegPart):
+                n = part.name
+                out += [
+                    f"/* {n}: show a decimal number right-aligned across 8 digits. */",
+                    f"static void bw_{n}_show_number(int n)",
+                    "{",
+                    "    unsigned char i, neg = 0;",
+                    "    unsigned int u;",
+                    f"    for (i = 0; i < 8; i++) bw_{n}_fb[i] = 0x00;",
+                    "    if (n < 0) { neg = 1; u = (unsigned int)(-n); }",
+                    "    else       { u = (unsigned int)n; }",
+                    "    i = 7;",
+                    "    do {",
+                    f"        bw_{n}_fb[i] = bw_7seg_font[u % 10];",
+                    "        u /= 10;",
+                    "        if (i == 0) break;",
+                    "        i--;",
+                    "    } while (u);",
+                    "    if (neg && i > 0)",
+                    f"        bw_{n}_fb[i - 1] = 0x40;  /* minus = segment g */",
+                    "}",
+                    "",
+                    f"static void bw_{n}_show_digit(unsigned char d, unsigned char v)",
+                    "{",
+                    "    if (d > 7) return;",
+                    f"    bw_{n}_fb[d] = bw_7seg_font[v & 0x0F];",
+                    "}",
+                    "",
+                    f"static void bw_{n}_set_segments(unsigned char d, unsigned char segs)",
+                    "{",
+                    "    if (d > 7) return;",
+                    f"    bw_{n}_fb[d] = segs;",
+                    "}",
+                    "",
+                    f"static void bw_{n}_clear(void)",
+                    "{",
+                    "    unsigned char i;",
+                    f"    for (i = 0; i < 8; i++) bw_{n}_fb[i] = 0x00;",
+                    "}",
+                    "",
+                ]
+                continue
+            if isinstance(part, LedBankPart):
+                n = part.name
+                out += [
+                    f"/* {n}: LED helpers — writes go through the shadow byte. */",
+                    f"static void bw_{n}_on(unsigned char n)",
+                    "{",
+                    f"    if (n > 7) return;",
+                    f"    bw_{n}_shadow |= (unsigned char)(1 << n);",
+                    "}",
+                    "",
+                    f"static void bw_{n}_off(unsigned char n)",
+                    "{",
+                    f"    if (n > 7) return;",
+                    f"    bw_{n}_shadow &= (unsigned char)~(1 << n);",
+                    "}",
+                    "",
+                    f"static void bw_{n}_set(unsigned char pattern)",
+                    "{",
+                    f"    bw_{n}_shadow = pattern;",
+                    "}",
+                    "",
+                    f"static void bw_{n}_only(unsigned char n)",
+                    "{",
+                    f"    bw_{n}_shadow = (n > 7) ? 0 : (unsigned char)(1 << n);",
+                    "}",
+                    "",
+                ]
                 continue
             if isinstance(part, KeypadPart):
                 out += [
@@ -1394,6 +1648,10 @@ class Stc8051Target(Target):
         for part in program.parts.values():
             for claimed in part.claimed:
                 outputs[claimed.port] = outputs.get(claimed.port, 0) | claimed.mask
+            if isinstance(part, SevenSegPart):
+                outputs[part.seg_port] = outputs.get(part.seg_port, 0) | 0xFF
+            if isinstance(part, LedBankPart):
+                outputs[part.led_port] = outputs.get(part.led_port, 0) | 0xFF
         if self.port_modes:
             for port in sorted(outputs):
                 mask = outputs[port]
@@ -1473,9 +1731,22 @@ class Stc8051Target(Target):
                 "    }"]
 
     def main(self, program, setup_lines, body_lines, task_names):
+        has_isr_parts = (program.has_matrix or program.has_sevenseg
+                         or program.has_ledbank)
         out = ["void main(void)", "{"] + setup_lines
         if task_names:
             out += self.start_scheduler(task_names)
+        elif has_isr_parts:
+            out += [
+                "",
+                "    TL0 = (unsigned char)(T0_RELOAD & 0xFF);",
+                "    TH0 = (unsigned char)(T0_RELOAD >> 8);",
+                "    ET0 = 1;                       /* millisecond tick */",
+                "    EA  = 1;",
+                "    TR0 = 1;",
+                "",
+            ]
+            out += body_lines
         else:
             out.append("")
             out += body_lines
@@ -2335,6 +2606,14 @@ class Program:
         return any(isinstance(p, MatrixPart) for p in self.parts.values())
 
     @property
+    def has_sevenseg(self) -> bool:
+        return any(isinstance(p, SevenSegPart) for p in self.parts.values())
+
+    @property
+    def has_ledbank(self) -> bool:
+        return any(isinstance(p, LedBankPart) for p in self.parts.values())
+
+    @property
     def uses_adc(self) -> bool:
         return any(pin.direction == "analog" for pin in self.pins.values())
 
@@ -2745,6 +3024,59 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
     if drawn is not None:
         return drawn
 
+    # ---- SEVENSEG8 verbs ----
+    show_num = re.match(r"show\s+number\s+(.+?)\s+on\s+(\w+)$", text, re.I)
+    if show_num and isinstance(program.parts.get(show_num.group(2).lower()),
+                               SevenSegPart):
+        return ShowNumber(show_num.group(2).lower(),
+                          expression(show_num.group(1), program, line))
+
+    show_dig = re.match(r"show\s+digit\s+(.+?)\s*=\s*value\s+(.+?)\s+on\s+(\w+)$",
+                        text, re.I)
+    if show_dig and isinstance(program.parts.get(show_dig.group(3).lower()),
+                               SevenSegPart):
+        return ShowDigit(show_dig.group(3).lower(),
+                         expression(show_dig.group(1), program, line),
+                         expression(show_dig.group(2), program, line))
+
+    set_seg = re.match(r"set\s+digit\s+(.+?)\s+to\s+segments\s+(.+?)\s+on\s+(\w+)$",
+                       text, re.I)
+    if set_seg and isinstance(program.parts.get(set_seg.group(3).lower()),
+                              SevenSegPart):
+        return SetDigitSegments(set_seg.group(3).lower(),
+                                expression(set_seg.group(1), program, line),
+                                expression(set_seg.group(2), program, line))
+
+    clear_disp = re.fullmatch(r"clear\s+(\w+)", lowered)
+    if clear_disp and isinstance(program.parts.get(clear_disp.group(1)),
+                                 SevenSegPart):
+        return ClearDisplay(clear_disp.group(1))
+
+    # ---- LEDBANK8 verbs ----
+    led_on = re.match(r"turn\s+on\s+led\s+(.+?)\s+on\s+(\w+)$", text, re.I)
+    if led_on and isinstance(program.parts.get(led_on.group(2).lower()),
+                             LedBankPart):
+        return TurnOnLed(led_on.group(2).lower(),
+                         expression(led_on.group(1), program, line))
+
+    led_off = re.match(r"turn\s+off\s+led\s+(.+?)\s+on\s+(\w+)$", text, re.I)
+    if led_off and isinstance(program.parts.get(led_off.group(2).lower()),
+                              LedBankPart):
+        return TurnOffLed(led_off.group(2).lower(),
+                          expression(led_off.group(1), program, line))
+
+    set_leds = re.match(r"set\s+leds\s+to\s+(.+?)\s+on\s+(\w+)$", text, re.I)
+    if set_leds and isinstance(program.parts.get(set_leds.group(2).lower()),
+                               LedBankPart):
+        return SetLeds(set_leds.group(2).lower(),
+                       expression(set_leds.group(1), program, line))
+
+    only_led = re.match(r"light\s+only\s+led\s+(.+?)\s+on\s+(\w+)$", text, re.I)
+    if only_led and isinstance(program.parts.get(only_led.group(2).lower()),
+                               LedBankPart):
+        return LightOnlyLed(only_led.group(2).lower(),
+                            expression(only_led.group(1), program, line))
+
     turn = re.fullmatch(r"turn\s+(on|off)\s+(\w+)", lowered)
     if turn:
         pin = program.pins[output_pin(turn.group(2)).lower()]
@@ -2909,6 +3241,13 @@ MATRIX8X8_RE = re.compile(
 PART_RE = re.compile(r"part\s+(\w+)\s*=\s*74hc595\s+data\s+(\S+)\s+"
                      r"clock\s+(\S+)\s+latch\s+(\S+)"
                      r"(?:\s+active\s+(low|high))?", re.I)
+SEVENSEG_RE = re.compile(
+    r"part\s+(\w+)\s*=\s*sevenseg8\s+segments\s+(\S+)\s+"
+    r"select\s+(\S+)\s+(\S+)\s+(\S+)"
+    r"(?:\s+common\s+(cathode|anode))?", re.I)
+LEDBANK_RE = re.compile(
+    r"part\s+(\w+)\s*=\s*ledbank8\s+on\s+(\S+)"
+    r"(?:\s+active\s+(low|high))?", re.I)
 PORT_DECL_RE = re.compile(r"port\s+(\w+)\s*=\s*(\S+)\s+(output|input)"
                           r"(?:\s+active\s+(low|high))?", re.I)
 TABLE_RE = re.compile(r"table\s+(\w+)\s*=\s*(.+)$", re.I)
@@ -3107,6 +3446,71 @@ def parse(source: str) -> Program:
                                          f"{prev.name!r}")
             program.parts[name] = ShiftPart(name, "74hc595", claims[0], claims[1],
                                             claims[2], active == "low")
+            index += 1
+            continue
+
+        sevenseg = SEVENSEG_RE.fullmatch(lowered)
+        if sevenseg and not started:
+            require(program, "part", line.number, "a PART")
+            (name, seg_port_tok, sel_a, sel_b, sel_c, common) = sevenseg.groups()
+            if name in program.parts or name in program.ports or name in program.pins:
+                raise PseudocodeError(line.number, f"{name!r} declared twice")
+            seg_port = program.target.resolve_port(
+                program, f"{name}_seg", seg_port_tok, "output", False, line.number)
+            scratch = Program(part=program.part)
+            sel_claims = [program.target.resolve_pin(
+                              scratch, f"{name}_sel{i}", tok, "output", False,
+                              line.number)
+                          for i, tok in enumerate((sel_a, sel_b, sel_c))]
+            if len({pin.where for pin in sel_claims}) != 3:
+                raise PseudocodeError(
+                    line.number, f"{name!r} names the same select pin twice")
+            for claimed in sel_claims:
+                for other in program.pins.values():
+                    if other.where == claimed.where:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is already declared as "
+                                         f"{other.name!r}; a PART claims its pins")
+                for prev in program.parts.values():
+                    if claimed.where in prev.claimed_where:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is already claimed by "
+                                         f"{prev.name!r}")
+            for whole in program.ports.values():
+                if whole.port == seg_port.port:
+                    raise PseudocodeError(
+                        line.number, f"{seg_port_tok.upper()} is already declared as "
+                                     f"port {whole.name!r}")
+            program.parts[name] = SevenSegPart(
+                name, "sevenseg8", seg_port.port, sel_claims,
+                common_anode=(common == "anode"))
+            index += 1
+            continue
+
+        ledbank = LEDBANK_RE.fullmatch(lowered)
+        if ledbank and not started:
+            require(program, "part", line.number, "a PART")
+            (name, port_tok, active) = ledbank.groups()
+            if name in program.parts or name in program.ports or name in program.pins:
+                raise PseudocodeError(line.number, f"{name!r} declared twice")
+            led_port = program.target.resolve_port(
+                program, f"{name}_port", port_tok, "output", False, line.number)
+            # Warn (not error) if the LED port is shared with a sevenseg's select
+            for ss in program.parts.values():
+                if isinstance(ss, SevenSegPart):
+                    for sp in ss.sel_pins:
+                        if getattr(sp, "port", None) == led_port.port:
+                            import sys
+                            print(f"WARNING: {name} on {port_tok.upper()} shares a port "
+                                  f"with {ss.name}'s select pins; the ISR scan will "
+                                  f"flicker the LEDs during digit multiplexing. "
+                                  f"LED writes go through the shadow byte.",
+                                  file=sys.stderr)
+                            break
+            program.parts[name] = LedBankPart(
+                name, "ledbank8", led_port.port,
+                active_low=(active == "low"),
+                led_port_where=led_port.where)
             index += 1
             continue
 
@@ -3373,6 +3777,24 @@ def stmts_pseudo(body: list, depth: int, active_low: dict) -> list[str]:
         elif isinstance(node, Call):
             args = ", ".join(expr_pseudo(a) for a in node.args)
             out.append(f"{pad}{node.name}{' ' + args if args else ''}")
+        elif isinstance(node, ShowNumber):
+            out.append(f"{pad}show number {expr_pseudo(node.value)} on {node.display}")
+        elif isinstance(node, ShowDigit):
+            out.append(f"{pad}show digit {expr_pseudo(node.digit)} = value "
+                       f"{expr_pseudo(node.value)} on {node.display}")
+        elif isinstance(node, SetDigitSegments):
+            out.append(f"{pad}set digit {expr_pseudo(node.digit)} to segments "
+                       f"{expr_pseudo(node.segments)} on {node.display}")
+        elif isinstance(node, ClearDisplay):
+            out.append(f"{pad}clear {node.display}")
+        elif isinstance(node, TurnOnLed):
+            out.append(f"{pad}turn on led {expr_pseudo(node.index)} on {node.bank}")
+        elif isinstance(node, TurnOffLed):
+            out.append(f"{pad}turn off led {expr_pseudo(node.index)} on {node.bank}")
+        elif isinstance(node, SetLeds):
+            out.append(f"{pad}set leds to {expr_pseudo(node.value)} on {node.bank}")
+        elif isinstance(node, LightOnlyLed):
+            out.append(f"{pad}light only led {expr_pseudo(node.index)} on {node.bank}")
         elif isinstance(node, Stop):
             out.append(f"{pad}stop")
         else:
@@ -3410,6 +3832,17 @@ def emit_pseudocode(program: Program) -> str:
                 out.append(f"  PART {part.name} = MATRIX8X8 ROWS 74HC595 "
                            f"DATA {part.data.where} CLOCK {part.clock.where} "
                            f"LATCH {part.latch.where} COLUMNS {part.col_port.label}")
+                continue
+            if isinstance(part, SevenSegPart):
+                common = " COMMON ANODE" if part.common_anode else ""
+                sel_str = " ".join(pin.where for pin in part.sel_pins)
+                out.append(f"  PART {part.name} = SEVENSEG8 SEGMENTS "
+                           f"P{part.seg_port} SELECT {sel_str}{common}")
+                continue
+            if isinstance(part, LedBankPart):
+                polarity = " ACTIVE LOW" if part.active_low else ""
+                out.append(f"  PART {part.name} = LEDBANK8 ON "
+                           f"{part.led_port_where}{polarity}")
                 continue
             polarity = " ACTIVE LOW" if part.active_low else ""
             out.append(f"  PART {part.name} = 74HC595 "
@@ -3597,11 +4030,44 @@ def matrix_stmt_c(node: Stmt, pad: str, ctx: Emit) -> list[str] | None:
     return None
 
 
+def a2_stmt_c(node: Stmt, pad: str, ctx: Emit) -> list[str] | None:
+    """Lower SEVENSEG8 and LEDBANK8 verbs to C, or None if not one."""
+    if isinstance(node, ShowNumber):
+        return [f"{pad}bw_{node.display}_show_number({expr_c(node.value, ctx)});"]
+    if isinstance(node, ShowDigit):
+        return [f"{pad}bw_{node.display}_show_digit("
+                f"(unsigned char)({expr_c(node.digit, ctx)}), "
+                f"(unsigned char)({expr_c(node.value, ctx)}));"]
+    if isinstance(node, SetDigitSegments):
+        return [f"{pad}bw_{node.display}_set_segments("
+                f"(unsigned char)({expr_c(node.digit, ctx)}), "
+                f"(unsigned char)({expr_c(node.segments, ctx)}));"]
+    if isinstance(node, ClearDisplay):
+        return [f"{pad}bw_{node.display}_clear();"]
+    if isinstance(node, TurnOnLed):
+        return [f"{pad}bw_{node.bank}_on("
+                f"(unsigned char)({expr_c(node.index, ctx)}));"]
+    if isinstance(node, TurnOffLed):
+        return [f"{pad}bw_{node.bank}_off("
+                f"(unsigned char)({expr_c(node.index, ctx)}));"]
+    if isinstance(node, SetLeds):
+        return [f"{pad}bw_{node.bank}_set("
+                f"(unsigned char)({expr_c(node.value, ctx)}));"]
+    if isinstance(node, LightOnlyLed):
+        return [f"{pad}bw_{node.bank}_only("
+                f"(unsigned char)({expr_c(node.index, ctx)}));"]
+    return None
+
+
 def stmts_c(body: list, depth: int, ctx: Emit) -> list[str]:
     pad = "    " * depth
     out = []
     for node in body:
         drawn = matrix_stmt_c(node, pad, ctx)
+        if drawn is not None:
+            out += drawn
+            continue
+        drawn = a2_stmt_c(node, pad, ctx)
         if drawn is not None:
             out += drawn
         elif isinstance(node, SetPin):
@@ -3712,6 +4178,10 @@ def stmts_task(body: list, depth: int, ctx: Emit,
 
     for node in body:
         drawn = matrix_stmt_c(node, pad, ctx)
+        if drawn is not None:
+            out += drawn
+            continue
+        drawn = a2_stmt_c(node, pad, ctx)
         if drawn is not None:
             out += drawn
             continue
