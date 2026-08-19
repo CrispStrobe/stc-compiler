@@ -441,6 +441,30 @@ class ArcadeOnOverlap(Stmt):
     kind_b: str
     body: list
 
+@dataclass
+class ArcadeTilemap(Stmt):
+    name: str
+    cols: Expr
+    rows: Expr
+    tile_size: Expr
+
+@dataclass
+class ArcadeSetTile(Stmt):
+    tilemap: str
+    col: Expr
+    row: Expr
+    tile_index: Expr
+
+@dataclass
+class ArcadeTileWall(Stmt):
+    tilemap: str
+    tile_index: Expr
+
+@dataclass
+class ArcadeSetFrame(Stmt):
+    sprite: str
+    frame: Expr
+
 
 # ===================================================================== program
 
@@ -3189,6 +3213,36 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
     if arc_over:
         return ArcadeGameOver(win=(arc_over.group(1).lower() == "win"))
 
+    arc_tilemap = re.fullmatch(
+        r"arcade\s+tilemap\s+(\w+)\s+cols\s+(\S+)\s+rows\s+(\S+)\s+tile\s+(\S+)",
+        text, re.I)
+    if arc_tilemap:
+        return ArcadeTilemap(arc_tilemap.group(1).lower(),
+                             expression(arc_tilemap.group(2), program, line),
+                             expression(arc_tilemap.group(3), program, line),
+                             expression(arc_tilemap.group(4), program, line))
+
+    arc_settile = re.match(
+        r"arcade\s+set\s+tile\s+(\w+)\s+col\s+(\S+)\s+row\s+(\S+)\s+to\s+(.+)$",
+        text, re.I)
+    if arc_settile:
+        return ArcadeSetTile(arc_settile.group(1).lower(),
+                             expression(arc_settile.group(2), program, line),
+                             expression(arc_settile.group(3), program, line),
+                             expression(arc_settile.group(4), program, line))
+
+    arc_wall = re.fullmatch(
+        r"arcade\s+set\s+wall\s+(\w+)\s+tile\s+(\S+)", text, re.I)
+    if arc_wall:
+        return ArcadeTileWall(arc_wall.group(1).lower(),
+                              expression(arc_wall.group(2), program, line))
+
+    arc_frame = re.match(
+        r"arcade\s+set\s+frame\s+(\w+)\s+to\s+(.+)$", text, re.I)
+    if arc_frame:
+        return ArcadeSetFrame(arc_frame.group(1).lower(),
+                              expression(arc_frame.group(2), program, line))
+
     # ---- SEVENSEG8 verbs ----
     show_num = re.match(r"show\s+number\s+(.+?)\s+on\s+(\w+)$", text, re.I)
     if show_num and isinstance(program.parts.get(show_num.group(2).lower()),
@@ -4004,6 +4058,20 @@ def stmts_pseudo(body: list, depth: int, active_low: dict) -> list[str]:
         elif isinstance(node, ArcadeOnOverlap):
             out.append(f"{pad}ARCADE ON OVERLAP {node.kind_a} {node.kind_b}:")
             out += stmts_pseudo(node.body, depth + 1, active_low)
+        elif isinstance(node, ArcadeTilemap):
+            out.append(f"{pad}arcade tilemap {node.name} cols "
+                       f"{expr_pseudo(node.cols)} rows {expr_pseudo(node.rows)} "
+                       f"tile {expr_pseudo(node.tile_size)}")
+        elif isinstance(node, ArcadeSetTile):
+            out.append(f"{pad}arcade set tile {node.tilemap} col "
+                       f"{expr_pseudo(node.col)} row {expr_pseudo(node.row)} "
+                       f"to {expr_pseudo(node.tile_index)}")
+        elif isinstance(node, ArcadeTileWall):
+            out.append(f"{pad}arcade set wall {node.tilemap} tile "
+                       f"{expr_pseudo(node.tile_index)}")
+        elif isinstance(node, ArcadeSetFrame):
+            out.append(f"{pad}arcade set frame {node.sprite} to "
+                       f"{expr_pseudo(node.frame)}")
         elif isinstance(node, Stop):
             out.append(f"{pad}stop")
         else:

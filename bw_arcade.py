@@ -135,6 +135,27 @@ class ArcadeTarget(sp.Target):
                     f"otherSprite: Sprite) {{")
                 out += self._stmts(node.body, depth + 1, program)
                 out.append(f"{pad}}})")
+            elif isinstance(node, sp.ArcadeTilemap):
+                out.append(f"{pad}tiles.setTilemap(tiles.createTilemap(")
+                out.append(f"{pad}    hex``, // {node.name}: "
+                           f"{self._expr(node.cols)}x{self._expr(node.rows)} "
+                           f"grid, tile size {self._expr(node.tile_size)}")
+                out.append(f"{pad}    img``,")
+                out.append(f"{pad}    [myTiles.transparency16],")
+                out.append(f"{pad}    TileScale.Sixteen")
+                out.append(f"{pad}))")
+            elif isinstance(node, sp.ArcadeSetTile):
+                out.append(f"{pad}tiles.setTileAt(tiles.getTileLocation("
+                           f"{self._expr(node.col)}, {self._expr(node.row)}), "
+                           f"sprites.castle.tileGrass1) "
+                           f"// tile index {self._expr(node.tile_index)}")
+            elif isinstance(node, sp.ArcadeTileWall):
+                out.append(f"{pad}scene.setTileIsWall("
+                           f"{self._expr(node.tile_index)}, true) "
+                           f"// tilemap {node.tilemap}")
+            elif isinstance(node, sp.ArcadeSetFrame):
+                out.append(f"{pad}{node.sprite}.setImage("
+                           f"spritesheet_{node.sprite}[{self._expr(node.frame)}])")
             elif isinstance(node, sp.SetVar):
                 out.append(f"{pad}{node.name} = {self._expr(node.value)}")
             elif isinstance(node, sp.ChangeVar):

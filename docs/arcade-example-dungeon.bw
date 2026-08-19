@@ -1,0 +1,63 @@
+DEVICE ARCADE
+
+WHEN started:
+  arcade tilemap level cols 10 rows 8 tile 16
+  arcade set tile level col 0 row 0 to 2
+  arcade set tile level col 1 row 0 to 2
+  arcade set tile level col 2 row 0 to 2
+  arcade set tile level col 3 row 0 to 2
+  arcade set tile level col 4 row 0 to 2
+  arcade set tile level col 5 row 0 to 2
+  arcade set tile level col 6 row 0 to 2
+  arcade set tile level col 7 row 0 to 2
+  arcade set tile level col 8 row 0 to 2
+  arcade set tile level col 9 row 0 to 2
+  arcade set tile level col 0 row 7 to 2
+  arcade set tile level col 1 row 7 to 2
+  arcade set tile level col 2 row 7 to 2
+  arcade set tile level col 3 row 7 to 2
+  arcade set tile level col 4 row 7 to 2
+  arcade set tile level col 5 row 7 to 2
+  arcade set tile level col 6 row 7 to 2
+  arcade set tile level col 7 row 7 to 2
+  arcade set tile level col 8 row 7 to 2
+  arcade set tile level col 9 row 7 to 2
+  arcade set tile level col 0 row 1 to 2
+  arcade set tile level col 0 row 2 to 2
+  arcade set tile level col 0 row 3 to 2
+  arcade set tile level col 0 row 4 to 2
+  arcade set tile level col 0 row 5 to 2
+  arcade set tile level col 0 row 6 to 2
+  arcade set tile level col 9 row 1 to 2
+  arcade set tile level col 9 row 2 to 2
+  arcade set tile level col 9 row 3 to 2
+  arcade set tile level col 9 row 4 to 2
+  arcade set tile level col 9 row 5 to 2
+  arcade set tile level col 9 row 6 to 2
+  arcade set wall level tile 2
+  arcade create hero kind Player
+  arcade place hero x 80 y 64
+  arcade set hero stay in screen
+  set score to 0
+  set frame to 0
+
+WHEN started:
+  FOREVER:
+    arcade move hero vx (controller dx) vy (controller dy)
+    change frame by 1
+    IF frame > 3 THEN:
+      set frame to 0
+    arcade set frame hero to frame
+    change score by 1
+    arcade score add 1
+    wait 100 ms
+
+WHEN started:
+  FOREVER:
+    arcade create gem kind Gem
+    arcade place gem x randint(32, 128) y randint(32, 96)
+    wait 2 seconds
+
+WHEN started:
+  ARCADE ON OVERLAP Player Gem:
+    arcade score add 10
