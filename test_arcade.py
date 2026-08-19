@@ -540,6 +540,187 @@ class TestBitmapEmit:
         assert "SpriteKind.Gem" in ts
 
 
+# ---- codegen bridge: ops emit correct API calls ----------------------------
+
+class TestCodegenBridge:
+    """Verify each arcade AST op lowers to the right Arcade TypeScript API.
+
+    These are end-to-end: pseudocode string → parse → emit → assert the
+    generated TS contains the correct API call pattern.
+    """
+
+    def _emit(self, source):
+        return sp.emit(sp.parse(source))
+
+    # -- ArcadeCreate → sprites.create
+    def test_create_emits_sprites_create(self):
+        ts = self._emit("DEVICE ARCADE\nWHEN started:\n  arcade create ship kind Ship")
+        assert "ship = sprites.create(img`.`, SpriteKind.Ship)" in ts
+
+    # -- ArcadeMove → setVelocity
+    def test_move_emits_set_velocity(self):
+        ts = self._emit("""\
+DEVICE ARCADE
+WHEN started:
+  arcade create ship kind Ship
+  arcade move ship vx 10 vy 20
+""")
+        assert "ship.setVelocity(10, 20)" in ts
+
+    # -- ArcadeOnOverlap → sprites.onOverlap
+    def test_overlap_emits_on_overlap_callback(self):
+        ts = self._emit("""\
+DEVICE ARCADE
+WHEN started:
+  ARCADE ON OVERLAP Player Enemy:
+    arcade game over lose
+""")
+        assert "sprites.onOverlap(SpriteKind.Player, SpriteKind.Enemy, function" in ts
+        assert "game.over(false)" in ts
+
+    # -- ArcadeScore → info.changeScoreBy
+    def test_score_emits_change_score_by(self):
+        ts = self._emit("DEVICE ARCADE\nWHEN started:\n  arcade score add 5")
+        assert "info.changeScoreBy(5)" in ts
+
+    # -- ArcadeTilemap → tiles.setTilemap
+    def test_tilemap_emits_set_tilemap(self):
+        ts = self._emit("""\
+DEVICE ARCADE
+WHEN started:
+  arcade tilemap world cols 8 rows 6 tile 16
+""")
+        assert "tiles.setTilemap(tiles.createTilemap(" in ts
+        assert "world: 8x6 grid" in ts
+        assert "TileScale.Sixteen" in ts
+
+    # -- ArcadeSetTile → tiles.setTileAt
+    def test_set_tile_emits_set_tile_at(self):
+        ts = self._emit("""\
+DEVICE ARCADE
+WHEN started:
+  arcade set tile world col 3 row 2 to 1
+""")
+        assert "tiles.setTileAt(tiles.getTileLocation(3, 2)" in ts
+
+    # -- ArcadeTileWall → scene.setTileIsWall
+    def test_tile_wall_emits_set_wall(self):
+        ts = self._emit("""\
+DEVICE ARCADE
+WHEN started:
+  arcade set wall world tile 5
+""")
+        assert "scene.setTileIsWall(5, true)" in ts
+
+    # -- ArcadeSetFrame → setImage with spritesheet
+    def test_set_frame_emits_set_image(self):
+        ts = self._emit("""\
+DEVICE ARCADE
+WHEN started:
+  arcade create hero kind Player
+  arcade set frame hero to 2
+""")
+        assert "hero.setImage(spritesheet_hero[2])" in ts
+
+    # -- ArcadePlace → setPosition
+    def test_place_emits_set_position(self):
+        ts = self._emit("""\
+DEVICE ARCADE
+WHEN started:
+  arcade create ball kind Ball
+  arcade place ball x 50 y 75
+""")
+        assert "ball.setPosition(50, 75)" in ts
+
+    # -- ArcadeSetFlag stayinscreen → setStayInScreen
+    def test_flag_stay_emits_stay_in_screen(self):
+        ts = self._emit("""\
+DEVICE ARCADE
+WHEN started:
+  arcade create p kind Player
+  arcade set p stay in screen
+""")
+        assert "p.setStayInScreen(true)" in ts
+
+    # -- ArcadeSetFlag destroyonwall → setFlag
+    def test_flag_destroy_emits_set_flag(self):
+        ts = self._emit("""\
+DEVICE ARCADE
+WHEN started:
+  arcade create b kind Bullet
+  arcade set b destroy on wall
+""")
+        assert "b.setFlag(SpriteFlag.DestroyOnWall, true)" in ts
+
+    # -- ArcadeGameOver win → game.over(true)
+    def test_game_over_win_emits_true(self):
+        ts = self._emit("DEVICE ARCADE\nWHEN started:\n  arcade game over win")
+        assert "game.over(true)" in ts
+
+    # -- ArcadeGameOver lose → game.over(false)
+    def test_game_over_lose_emits_false(self):
+        ts = self._emit("DEVICE ARCADE\nWHEN started:\n  arcade game over lose")
+        assert "game.over(false)" in ts
+
+    # -- controller dx/dy → controller.dx()/dy()
+    def test_controller_axes_emit(self):
+        ts = self._emit("""\
+DEVICE ARCADE
+WHEN started:
+  arcade create p kind Player
+  arcade move p vx (controller dx) vy (controller dy)
+""")
+        assert "controller.dx()" in ts
+        assert "controller.dy()" in ts
+
+    # -- randint → randint()
+    def test_randint_emits(self):
+        ts = self._emit("""\
+DEVICE ARCADE
+WHEN started:
+  set x to randint(1, 100)
+""")
+        assert "randint(1, 100)" in ts
+
+    # -- Full dodge example compiles end-to-end
+    def test_dodge_example_compiles(self):
+        source = open("docs/arcade-example-dodge.bw").read()
+        ts = sp.emit(sp.parse(source))
+        # Every core op must be present
+        assert "sprites.create(" in ts
+        assert ".setPosition(" in ts
+        assert ".setStayInScreen(true)" in ts
+        assert ".setVelocity(" in ts
+        assert ".setFlag(SpriteFlag.DestroyOnWall, true)" in ts
+        assert "info.changeScoreBy(" in ts
+        assert "sprites.onOverlap(" in ts
+        assert "game.over(false)" in ts
+        assert "game.onUpdate(function" in ts
+        assert "controller.dx()" in ts
+        assert "randint(" in ts
+        assert "pause(" in ts
+
+    # -- Full dungeon example with tilemap compiles end-to-end
+    def test_dungeon_example_compiles(self):
+        source = open("docs/arcade-example-dungeon.bw").read()
+        ts = sp.emit(sp.parse(source))
+        # Tilemap ops
+        assert "tiles.setTilemap(tiles.createTilemap(" in ts
+        assert "tiles.setTileAt(tiles.getTileLocation(" in ts
+        assert "scene.setTileIsWall(2, true)" in ts
+        # Sprite sheet
+        assert "spritesheet_hero[" in ts
+        # Sprite ops
+        assert "sprites.create(" in ts
+        assert ".setPosition(" in ts
+        # Game ops
+        assert "info.changeScoreBy(" in ts
+        assert "sprites.onOverlap(" in ts
+        assert "game.onUpdate(function" in ts
+        assert "controller.dx()" in ts
+        assert "controller.dy()" in ts
+
+
 # ---- error handling ---------------------------------------------------------
 
 class TestArcadeErrors:
