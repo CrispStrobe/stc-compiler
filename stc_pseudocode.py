@@ -466,6 +466,91 @@ class ArcadeSetFrame(Stmt):
     frame: Expr
 
 
+# ---- Display-peripheral statements (LCD / TFT / OLED / RGB) ---------
+
+@dataclass
+class LcdPrint(Stmt):
+    display: str
+    text: str = None        # string literal  (one of text/value is set)
+    value: Expr = None      # expression
+
+@dataclass
+class LcdCursor(Stmt):
+    display: str
+    row: Expr
+    col: Expr
+
+@dataclass
+class LcdClear(Stmt):
+    display: str
+
+@dataclass
+class TftPixel(Stmt):
+    display: str
+    x: Expr
+    y: Expr
+    r: Expr
+    g: Expr
+    b: Expr
+
+@dataclass
+class TftFill(Stmt):
+    display: str
+    x: Expr
+    y: Expr
+    w: Expr
+    h: Expr
+    r: Expr
+    g: Expr
+    b: Expr
+
+@dataclass
+class TftClear(Stmt):
+    display: str
+
+@dataclass
+class TftPrint(Stmt):
+    display: str
+    text: str = None
+    value: Expr = None
+
+@dataclass
+class TftCursor(Stmt):
+    display: str
+    row: Expr
+    col: Expr
+
+@dataclass
+class OledPixel(Stmt):
+    display: str
+    x: Expr
+    y: Expr
+    value: Expr
+
+@dataclass
+class OledClear(Stmt):
+    display: str
+
+@dataclass
+class OledPrint(Stmt):
+    display: str
+    text: str = None
+    value: Expr = None
+
+@dataclass
+class OledCursor(Stmt):
+    display: str
+    row: Expr
+    col: Expr
+
+@dataclass
+class RgbSet(Stmt):
+    led: str
+    r: Expr
+    g: Expr
+    b: Expr
+
+
 # ===================================================================== program
 
 @dataclass
@@ -3243,6 +3328,109 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
         return ArcadeSetFrame(arc_frame.group(1).lower(),
                               expression(arc_frame.group(2), program, line))
 
+    # ---- LCD verbs ----
+    lcd_print_s = re.match(r'lcd\s+print\s+"([^"]*)"\s+on\s+(\w+)$', text, re.I)
+    if lcd_print_s:
+        return LcdPrint(lcd_print_s.group(2).lower(), text=lcd_print_s.group(1))
+
+    lcd_print_v = re.match(r"lcd\s+print\s+(.+?)\s+on\s+(\w+)$", text, re.I)
+    if lcd_print_v:
+        return LcdPrint(lcd_print_v.group(2).lower(),
+                        value=expression(lcd_print_v.group(1), program, line))
+
+    lcd_cursor = re.match(r"lcd\s+set\s+cursor\s+(\S+)\s+(\S+)\s+on\s+(\w+)$", text, re.I)
+    if lcd_cursor:
+        return LcdCursor(lcd_cursor.group(3).lower(),
+                         expression(lcd_cursor.group(1), program, line),
+                         expression(lcd_cursor.group(2), program, line))
+
+    lcd_clear = re.fullmatch(r"lcd\s+clear\s+(\w+)", text, re.I)
+    if lcd_clear:
+        return LcdClear(lcd_clear.group(1).lower())
+
+    # ---- TFT verbs ----
+    tft_pixel = re.match(
+        r"tft\s+pixel\s+(\S+)\s+(\S+)\s+R\s+(\S+)\s+G\s+(\S+)\s+B\s+(\S+)\s+on\s+(\w+)$",
+        text, re.I)
+    if tft_pixel:
+        g = tft_pixel.groups()
+        return TftPixel(g[5].lower(),
+                        expression(g[0], program, line),
+                        expression(g[1], program, line),
+                        expression(g[2], program, line),
+                        expression(g[3], program, line),
+                        expression(g[4], program, line))
+
+    tft_fill = re.match(
+        r"tft\s+fill\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+R\s+(\S+)\s+G\s+(\S+)\s+B\s+(\S+)\s+on\s+(\w+)$",
+        text, re.I)
+    if tft_fill:
+        g = tft_fill.groups()
+        return TftFill(g[7].lower(),
+                       expression(g[0], program, line),
+                       expression(g[1], program, line),
+                       expression(g[2], program, line),
+                       expression(g[3], program, line),
+                       expression(g[4], program, line),
+                       expression(g[5], program, line),
+                       expression(g[6], program, line))
+
+    tft_clear = re.fullmatch(r"tft\s+clear\s+(\w+)", text, re.I)
+    if tft_clear:
+        return TftClear(tft_clear.group(1).lower())
+
+    tft_print_s = re.match(r'tft\s+print\s+"([^"]*)"\s+on\s+(\w+)$', text, re.I)
+    if tft_print_s:
+        return TftPrint(tft_print_s.group(2).lower(), text=tft_print_s.group(1))
+
+    tft_print_v = re.match(r"tft\s+print\s+(.+?)\s+on\s+(\w+)$", text, re.I)
+    if tft_print_v:
+        return TftPrint(tft_print_v.group(2).lower(),
+                        value=expression(tft_print_v.group(1), program, line))
+
+    tft_cursor = re.match(r"tft\s+set\s+cursor\s+(\S+)\s+(\S+)\s+on\s+(\w+)$", text, re.I)
+    if tft_cursor:
+        return TftCursor(tft_cursor.group(3).lower(),
+                         expression(tft_cursor.group(1), program, line),
+                         expression(tft_cursor.group(2), program, line))
+
+    # ---- OLED verbs ----
+    oled_pixel = re.match(
+        r"oled\s+pixel\s+(\S+)\s+(\S+)\s+(\S+)\s+on\s+(\w+)$", text, re.I)
+    if oled_pixel:
+        return OledPixel(oled_pixel.group(4).lower(),
+                         expression(oled_pixel.group(1), program, line),
+                         expression(oled_pixel.group(2), program, line),
+                         expression(oled_pixel.group(3), program, line))
+
+    oled_clear = re.fullmatch(r"oled\s+clear\s+(\w+)", text, re.I)
+    if oled_clear:
+        return OledClear(oled_clear.group(1).lower())
+
+    oled_print_s = re.match(r'oled\s+print\s+"([^"]*)"\s+on\s+(\w+)$', text, re.I)
+    if oled_print_s:
+        return OledPrint(oled_print_s.group(2).lower(), text=oled_print_s.group(1))
+
+    oled_print_v = re.match(r"oled\s+print\s+(.+?)\s+on\s+(\w+)$", text, re.I)
+    if oled_print_v:
+        return OledPrint(oled_print_v.group(2).lower(),
+                         value=expression(oled_print_v.group(1), program, line))
+
+    oled_cursor = re.match(r"oled\s+set\s+cursor\s+(\S+)\s+(\S+)\s+on\s+(\w+)$", text, re.I)
+    if oled_cursor:
+        return OledCursor(oled_cursor.group(3).lower(),
+                          expression(oled_cursor.group(1), program, line),
+                          expression(oled_cursor.group(2), program, line))
+
+    # ---- RGB LED verb ----
+    rgb_set = re.match(
+        r"set\s+(\w+)\s+colour\s+to\s+R\s+(\S+)\s+G\s+(\S+)\s+B\s+(\S+)$", text, re.I)
+    if rgb_set:
+        return RgbSet(rgb_set.group(1).lower(),
+                      expression(rgb_set.group(2), program, line),
+                      expression(rgb_set.group(3), program, line),
+                      expression(rgb_set.group(4), program, line))
+
     # ---- SEVENSEG8 verbs ----
     show_num = re.match(r"show\s+number\s+(.+?)\s+on\s+(\w+)$", text, re.I)
     if show_num and isinstance(program.parts.get(show_num.group(2).lower()),
@@ -4072,6 +4260,51 @@ def stmts_pseudo(body: list, depth: int, active_low: dict) -> list[str]:
         elif isinstance(node, ArcadeSetFrame):
             out.append(f"{pad}arcade set frame {node.sprite} to "
                        f"{expr_pseudo(node.frame)}")
+        elif isinstance(node, LcdPrint):
+            if node.text is not None:
+                out.append(f'{pad}lcd print "{node.text}" on {node.display}')
+            else:
+                out.append(f"{pad}lcd print {expr_pseudo(node.value)} on {node.display}")
+        elif isinstance(node, LcdCursor):
+            out.append(f"{pad}lcd set cursor {expr_pseudo(node.row)} "
+                       f"{expr_pseudo(node.col)} on {node.display}")
+        elif isinstance(node, LcdClear):
+            out.append(f"{pad}lcd clear {node.display}")
+        elif isinstance(node, TftPixel):
+            out.append(f"{pad}tft pixel {expr_pseudo(node.x)} {expr_pseudo(node.y)} "
+                       f"R {expr_pseudo(node.r)} G {expr_pseudo(node.g)} "
+                       f"B {expr_pseudo(node.b)} on {node.display}")
+        elif isinstance(node, TftFill):
+            out.append(f"{pad}tft fill {expr_pseudo(node.x)} {expr_pseudo(node.y)} "
+                       f"{expr_pseudo(node.w)} {expr_pseudo(node.h)} "
+                       f"R {expr_pseudo(node.r)} G {expr_pseudo(node.g)} "
+                       f"B {expr_pseudo(node.b)} on {node.display}")
+        elif isinstance(node, TftClear):
+            out.append(f"{pad}tft clear {node.display}")
+        elif isinstance(node, TftPrint):
+            if node.text is not None:
+                out.append(f'{pad}tft print "{node.text}" on {node.display}')
+            else:
+                out.append(f"{pad}tft print {expr_pseudo(node.value)} on {node.display}")
+        elif isinstance(node, TftCursor):
+            out.append(f"{pad}tft set cursor {expr_pseudo(node.row)} "
+                       f"{expr_pseudo(node.col)} on {node.display}")
+        elif isinstance(node, OledPixel):
+            out.append(f"{pad}oled pixel {expr_pseudo(node.x)} {expr_pseudo(node.y)} "
+                       f"{expr_pseudo(node.value)} on {node.display}")
+        elif isinstance(node, OledClear):
+            out.append(f"{pad}oled clear {node.display}")
+        elif isinstance(node, OledPrint):
+            if node.text is not None:
+                out.append(f'{pad}oled print "{node.text}" on {node.display}')
+            else:
+                out.append(f"{pad}oled print {expr_pseudo(node.value)} on {node.display}")
+        elif isinstance(node, OledCursor):
+            out.append(f"{pad}oled set cursor {expr_pseudo(node.row)} "
+                       f"{expr_pseudo(node.col)} on {node.display}")
+        elif isinstance(node, RgbSet):
+            out.append(f"{pad}set {node.led} colour to R {expr_pseudo(node.r)} "
+                       f"G {expr_pseudo(node.g)} B {expr_pseudo(node.b)}")
         elif isinstance(node, Stop):
             out.append(f"{pad}stop")
         else:
@@ -4422,6 +4655,55 @@ def stmts_c(body: list, depth: int, ctx: Emit) -> list[str]:
         elif isinstance(node, Call):
             args = ", ".join(expr_c(a, ctx) for a in node.args)
             out.append(f"{pad}{ctx.procs[node.name.lower()].c_name}({args});")
+        elif isinstance(node, LcdPrint):
+            if node.text is not None:
+                out.append(f'{pad}bw_lcd_print_s({node.display}, "{_c_string(node.text)}");')
+            else:
+                out.append(f"{pad}bw_lcd_print_n({node.display}, {expr_c(node.value, ctx)});")
+        elif isinstance(node, LcdCursor):
+            out.append(f"{pad}bw_lcd_cursor({node.display}, "
+                       f"{expr_c(node.row, ctx)}, {expr_c(node.col, ctx)});")
+        elif isinstance(node, LcdClear):
+            out.append(f"{pad}bw_lcd_clear({node.display});")
+        elif isinstance(node, TftPixel):
+            out.append(f"{pad}bw_tft_pixel({node.display}, "
+                       f"{expr_c(node.x, ctx)}, {expr_c(node.y, ctx)}, "
+                       f"{expr_c(node.r, ctx)}, {expr_c(node.g, ctx)}, "
+                       f"{expr_c(node.b, ctx)});")
+        elif isinstance(node, TftFill):
+            out.append(f"{pad}bw_tft_fill({node.display}, "
+                       f"{expr_c(node.x, ctx)}, {expr_c(node.y, ctx)}, "
+                       f"{expr_c(node.w, ctx)}, {expr_c(node.h, ctx)}, "
+                       f"{expr_c(node.r, ctx)}, {expr_c(node.g, ctx)}, "
+                       f"{expr_c(node.b, ctx)});")
+        elif isinstance(node, TftClear):
+            out.append(f"{pad}bw_tft_clear({node.display});")
+        elif isinstance(node, TftPrint):
+            if node.text is not None:
+                out.append(f'{pad}bw_tft_print_s({node.display}, "{_c_string(node.text)}");')
+            else:
+                out.append(f"{pad}bw_tft_print_n({node.display}, {expr_c(node.value, ctx)});")
+        elif isinstance(node, TftCursor):
+            out.append(f"{pad}bw_tft_cursor({node.display}, "
+                       f"{expr_c(node.row, ctx)}, {expr_c(node.col, ctx)});")
+        elif isinstance(node, OledPixel):
+            out.append(f"{pad}bw_oled_pixel({node.display}, "
+                       f"{expr_c(node.x, ctx)}, {expr_c(node.y, ctx)}, "
+                       f"{expr_c(node.value, ctx)});")
+        elif isinstance(node, OledClear):
+            out.append(f"{pad}bw_oled_clear({node.display});")
+        elif isinstance(node, OledPrint):
+            if node.text is not None:
+                out.append(f'{pad}bw_oled_print_s({node.display}, "{_c_string(node.text)}");')
+            else:
+                out.append(f"{pad}bw_oled_print_n({node.display}, {expr_c(node.value, ctx)});")
+        elif isinstance(node, OledCursor):
+            out.append(f"{pad}bw_oled_cursor({node.display}, "
+                       f"{expr_c(node.row, ctx)}, {expr_c(node.col, ctx)});")
+        elif isinstance(node, RgbSet):
+            out.append(f"{pad}bw_rgb_set({node.led}, "
+                       f"{expr_c(node.r, ctx)}, {expr_c(node.g, ctx)}, "
+                       f"{expr_c(node.b, ctx)});")
         elif isinstance(node, Stop):
             out.append(f"{pad}for (;;) ;   /* stop */")
         else:
@@ -4552,6 +4834,55 @@ def stmts_task(body: list, depth: int, ctx: Emit,
         elif isinstance(node, Call):
             args = ", ".join(expr_c(a, ctx) for a in node.args)
             out.append(f"{pad}{ctx.procs[node.name.lower()].c_name}({args});")
+        elif isinstance(node, LcdPrint):
+            if node.text is not None:
+                out.append(f'{pad}bw_lcd_print_s({node.display}, "{_c_string(node.text)}");')
+            else:
+                out.append(f"{pad}bw_lcd_print_n({node.display}, {expr_c(node.value, ctx)});")
+        elif isinstance(node, LcdCursor):
+            out.append(f"{pad}bw_lcd_cursor({node.display}, "
+                       f"{expr_c(node.row, ctx)}, {expr_c(node.col, ctx)});")
+        elif isinstance(node, LcdClear):
+            out.append(f"{pad}bw_lcd_clear({node.display});")
+        elif isinstance(node, TftPixel):
+            out.append(f"{pad}bw_tft_pixel({node.display}, "
+                       f"{expr_c(node.x, ctx)}, {expr_c(node.y, ctx)}, "
+                       f"{expr_c(node.r, ctx)}, {expr_c(node.g, ctx)}, "
+                       f"{expr_c(node.b, ctx)});")
+        elif isinstance(node, TftFill):
+            out.append(f"{pad}bw_tft_fill({node.display}, "
+                       f"{expr_c(node.x, ctx)}, {expr_c(node.y, ctx)}, "
+                       f"{expr_c(node.w, ctx)}, {expr_c(node.h, ctx)}, "
+                       f"{expr_c(node.r, ctx)}, {expr_c(node.g, ctx)}, "
+                       f"{expr_c(node.b, ctx)});")
+        elif isinstance(node, TftClear):
+            out.append(f"{pad}bw_tft_clear({node.display});")
+        elif isinstance(node, TftPrint):
+            if node.text is not None:
+                out.append(f'{pad}bw_tft_print_s({node.display}, "{_c_string(node.text)}");')
+            else:
+                out.append(f"{pad}bw_tft_print_n({node.display}, {expr_c(node.value, ctx)});")
+        elif isinstance(node, TftCursor):
+            out.append(f"{pad}bw_tft_cursor({node.display}, "
+                       f"{expr_c(node.row, ctx)}, {expr_c(node.col, ctx)});")
+        elif isinstance(node, OledPixel):
+            out.append(f"{pad}bw_oled_pixel({node.display}, "
+                       f"{expr_c(node.x, ctx)}, {expr_c(node.y, ctx)}, "
+                       f"{expr_c(node.value, ctx)});")
+        elif isinstance(node, OledClear):
+            out.append(f"{pad}bw_oled_clear({node.display});")
+        elif isinstance(node, OledPrint):
+            if node.text is not None:
+                out.append(f'{pad}bw_oled_print_s({node.display}, "{_c_string(node.text)}");')
+            else:
+                out.append(f"{pad}bw_oled_print_n({node.display}, {expr_c(node.value, ctx)});")
+        elif isinstance(node, OledCursor):
+            out.append(f"{pad}bw_oled_cursor({node.display}, "
+                       f"{expr_c(node.row, ctx)}, {expr_c(node.col, ctx)});")
+        elif isinstance(node, RgbSet):
+            out.append(f"{pad}bw_rgb_set({node.led}, "
+                       f"{expr_c(node.r, ctx)}, {expr_c(node.g, ctx)}, "
+                       f"{expr_c(node.b, ctx)});")
         elif isinstance(node, Stop):
             out += [f"{pad}{task}_state = 0xFFFF;   /* stop this script */",
                     f"{pad}return;"]
