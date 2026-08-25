@@ -14,7 +14,7 @@
 //   node scripts/test-flash.mjs
 //
 import { parseIntelHex, Stk500, flashAvr, flashMicroPython, flashStc, stcPacket,
-         stcBaud, stcStatus, pythonBytes, STK, flashStm32 } from '../docs/flash.js';
+         stcBaud, stcStatus, pythonBytes, STK, flashStm32, flashEeprom } from '../docs/flash.js';
 
 let passed = 0, failed = 0;
 const ok = (name, cond, detail = '') => {
@@ -574,6 +574,56 @@ class Stm32Rom {
   ok('STM32: erased before writing and jumped to base', rom.log.includes('erase')
      && rom.log.some(l => l === 'go:8000000'));
   ok('STM32: no framing rejections', !rom.log.some(l => l.startsWith('bad')));
+}
+
+
+
+// --- parallel EEPROM (bweep programmer) -----------------------------------
+// A mock of the bweep.ino sketch: identify, then write+verify pages into a
+// simulated 28C256, ACK/NACK per page. The burned image must equal the
+// input byte-for-byte, and a corrupt checksum must draw a NACK.
+class BweepProgrammer {
+  constructor() { this.out = []; this.inbox = []; this.mem = new Uint8Array(32768).fill(0xff); this.state = 'cmd'; this.log = []; }
+  say(bytes) { for (const b of bytes) this.out.push(b); }
+  feed(bytes) { for (const b of bytes) this.inbox.push(b); this.pump(); }
+  pump() {
+    for (;;) {
+      if (this.state === 'cmd') {
+        if (!this.inbox.length) return;
+        const c = this.inbox.shift();
+        if (c === 0x56) { for (const ch of 'BWEEP1\n') this.say([ch.charCodeAt(0)]); this.say([0x79]); }
+        else if (c === 0x51) { this.say([0x79]); }
+        else if (c === 0x57) { this.state = 'w'; }
+        else { this.say([0x1f]); }
+      } else if (this.state === 'w') {
+        if (this.inbox.length < 3) return;
+        const aHi = this.inbox[0], aLo = this.inbox[1], n = this.inbox[2];
+        if (this.inbox.length < 3 + n + 1) return;
+        this.inbox.splice(0, 3);
+        const data = this.inbox.splice(0, n);
+        const ck = this.inbox.shift();
+        let want = n ^ aHi ^ aLo; for (const b of data) want ^= b;
+        if ((want & 0xff) !== ck) { this.log.push('badck'); this.say([0x1f]); this.state = 'cmd'; continue; }
+        const addr = (aHi << 8) | aLo;
+        for (let i = 0; i < n; i++) this.mem[addr + i] = data[i];
+        this.say([0x79]); this.state = 'cmd';
+      }
+    }
+  }
+}
+
+{
+  const prog = new BweepProgrammer();
+  const port = fakePort(prog);
+  // 300 bytes at base 0x10 (deliberately unaligned): forces a short first
+  // page then full 64-byte pages.
+  const image = Uint8Array.from({ length: 300 }, (_, i) => (i * 3 + 7) & 0xff);
+  const res = await flashEeprom(port, image, { base: 0x10, log: () => {} });
+  ok('EEPROM: reported the byte count', res.bytes === 300);
+  let same = true;
+  for (let i = 0; i < image.length; i++) if (prog.mem[0x10 + i] !== image[i]) { same = false; break; }
+  ok('EEPROM: burned image equals the input byte-for-byte', same);
+  ok('EEPROM: no page straddled a boundary (no bad checksums)', !prog.log.includes('badck'));
 }
 
 
