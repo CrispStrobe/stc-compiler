@@ -220,6 +220,14 @@ ARM_TARGETS = {
         "mcu": "cortex-m0plus", "sram": 256 * 1024,
         "description": "RP2040 — Raspberry Pi Pico, 264 KB SRAM, Cortex-M0+",
     },
+    # The image is a REAL flash image (vectors first, SP/reset in words
+    # 0/1) — see stm32f030-flash.ld. origin is the flash base; the
+    # emulator boots via the vector table, so entry need not equal it.
+    "stm32f030": {
+        "mcu": "cortex-m0", "sram": 4 * 1024,
+        "ld": "stm32f030-flash.ld", "origin": 0x08000000,
+        "description": "STM32F030 — Cortex-M0, 16 KB flash at 0x08000000, 4 KB SRAM",
+    },
 }
 
 # 6502 compile target: the composable EATER6502 machine. The assemble path
@@ -878,8 +886,9 @@ def build_arm(req: CompileReq, spec: dict, generated_c: str | None,
     # The linker script lives in the repo root, but on Vercel the deployment
     # dir is read-only. Copy it into the work dir so the linker can find it
     # relative to cwd and without the source path leaking into diagnostics.
-    ld_script = os.path.join(work, "pico-sram.ld")
-    shutil.copy2(ARM_LINKER_SCRIPT, ld_script)
+    ld_name = spec.get("ld", "pico-sram.ld")
+    ld_script = os.path.join(work, ld_name)
+    shutil.copy2(os.path.join(BASE_DIR, ld_name), ld_script)
 
     elf = os.path.join(work, "main.elf")
     cmd = [os.path.join(bin_dir, "arm-none-eabi-gcc"),
@@ -933,7 +942,7 @@ def build_arm(req: CompileReq, spec: dict, generated_c: str | None,
     try:
         objcopy = os.path.join(bin_dir, "arm-none-eabi-objcopy")
         objdump = os.path.join(bin_dir, "arm-none-eabi-objdump")
-        origin = 0x20000000
+        origin = spec.get("origin", 0x20000000)
 
         # Check the ELF entry point: main must land at the origin for the
         # emulator (which jumps to 0x20000000 on reset). Thumb bit (bit 0)
@@ -944,7 +953,9 @@ def build_arm(req: CompileReq, spec: dict, generated_c: str | None,
                 timeout=10, env=env)
             m = re.search(r"start address\s+0x([0-9a-fA-F]+)", hdr.stdout or "")
             entry = int(m.group(1), 16) if m else None
-            if entry is not None and (entry & ~1) != origin:
+            # Vector-table images (the F0) boot via words 0/1 of the image,
+            # not by jumping to the origin — the check is pico-layout only.
+            if "ld" not in spec and entry is not None and (entry & ~1) != origin:
                 shutil.rmtree(work, ignore_errors=True)
                 return {"success": False, "stage": "link",
                         "error": f"ELF entry 0x{entry:08x} is not at the SRAM "

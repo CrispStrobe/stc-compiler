@@ -64,6 +64,26 @@ int main(void) {
 ORIGIN = 0x20000000
 
 
+F0_BLINK_C = """
+#include <stdint.h>
+#define BW_MMIO(a) (*(volatile uint32_t *)(a))
+#define RCC_AHBENR   BW_MMIO(0x40021014u)
+#define GPIOA_MODER  BW_MMIO(0x48000000u)
+#define GPIOA_BSRR   BW_MMIO(0x48000018u)
+static void bw_fault(void) { for (;;) { } }
+int main(void)
+{
+    RCC_AHBENR = (1u << 17);
+    GPIOA_MODER = 1u;
+    for (;;) { GPIOA_BSRR = 1u; GPIOA_BSRR = (1u << 16); }
+}
+__attribute__((section(".vectors"), used))
+const void *vectors[48] = {
+    (void *)0x20001000, (void *)main, [3] = (void *)bw_fault
+};
+"""
+
+
 class TestArmBuild(unittest.TestCase):
     def test_blink_compiles(self):
         req = CompileReq(code=BLINK_C, target="rp2040")
@@ -74,6 +94,22 @@ class TestArmBuild(unittest.TestCase):
         req = CompileReq(code=BLINK_C, target="rp2040")
         result = build_arm(req, ARM_TARGETS["rp2040"], None)
         self.assertGreater(result["bytes"], 0)
+
+    def test_stm32f030_compiles_with_vectors_first(self):
+        # The F0 image is a REAL flash image: SP in word 0 (0x20001000
+        # here), reset handler in word 1. A reordered or dropped vector
+        # table boots garbage — this asserts the table survived -Os.
+        req = CompileReq(code=F0_BLINK_C, target="stm32f030")
+        result = build_arm(req, ARM_TARGETS["stm32f030"], None)
+        self.assertTrue(result["success"], result.get("error"))
+        self.assertEqual(result["origin"], 0x08000000)
+        import base64
+        blob = base64.b64decode(result["base64"])
+        sp = int.from_bytes(blob[0:4], "little")
+        reset = int.from_bytes(blob[4:8], "little")
+        self.assertEqual(sp, 0x20001000, "word 0 is the initial SP")
+        self.assertTrue(0x08000000 <= (reset & ~1) < 0x08004000,
+                        f"word 1 is a flash reset handler (0x{reset:08x})")
 
     def test_entry_at_origin(self):
         req = CompileReq(code=BLINK_C, target="rp2040")
