@@ -918,6 +918,13 @@ export async function flashAvrMega(port, hexText, {
 // PID 0x05dc), driven by vendor control transfers. Chrome/Edge only, and
 // the OS must let the page claim it (Linux udev / macOS just works;
 // Windows needs the WinUSB driver via Zadig).
+//
+// WHY THIS EXISTS AND avrdude DOES NOT: Brickwright ships fully
+// permissive (BSD-3/Apache-2.0/MIT) and avrdude is GPL-2, so it can
+// never be bundled. This clean-room flasher is the point — the product
+// flashes a USBasp with no GPL tool anywhere in it. avrdude is named in
+// a couple of comments only as the reference every AVR programmer knows;
+// nothing here invokes or requires it.
 
 const USBASP = { CONNECT: 1, DISCONNECT: 2, TRANSMIT: 3 };
 
