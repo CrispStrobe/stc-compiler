@@ -600,3 +600,102 @@ export async function flashStc(port, hexText, {
 
 /** The micro:bit's name for it, kept so existing callers still work. */
 export const flashMicrobit = flashMicroPython;
+
+// ------------------------------------------------- STM32 (AN3155)
+//
+// The fourth family, entered a fourth way. The STM32 system bootloader in
+// ROM listens on USART only when BOOT0 is HIGH at reset (the F030 breakout
+// has a jumper), and it speaks AN3155 at 8E1 -- EVEN parity, unlike every
+// other board here. The image is a RAW flash binary, vectors first (word 0
+// is the initial SP, word 1 the reset handler) -- exactly what the compile
+// service emits for target stm32f030, format bin.
+//
+// Byte-for-byte twin of bw-board's src/stm32-isp.js (mock-ROM-tested) and
+// stc's Rust stm32bsl; the three keep identical frame rules so a capture
+// from any of them reads the same.
+
+const STM32_ACK = 0x79;
+const STM32_NACK = 0x1f;
+const STM32_PID_F03X = 0x0444;
+
+function stm32Xor(bytes) { return bytes.reduce((a, b) => a ^ b, 0); }
+function stm32Be32(v) {
+  return Uint8Array.of((v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff);
+}
+
+/**
+ * Flash a raw STM32 image over the ROM bootloader.
+ * @param {SerialPort} port  an OPEN Web Serial port at 8E1 (see openStm32Port)
+ * @param {Uint8Array} image raw flash binary, vectors first
+ */
+export async function flashStm32(port, image, {
+  base = 0x08000000, log = () => {}, timeout = 2000,
+} = {}) {
+  const io = serialTransport(port, { timeout });
+  const one = async (what, t = timeout) => {
+    const b = (await io.read(1))[0];
+    if (b === STM32_NACK) throw new Error(`${what}: NACK`);
+    if (b !== STM32_ACK) throw new Error(`${what}: expected ACK 0x79, got 0x${b.toString(16)}`);
+  };
+  const command = async (cmd, what) => { await io.write(Uint8Array.of(cmd, (~cmd) & 0xff)); await one(what); };
+  try {
+    // init: the 0x7F auto-baud byte; ACK once per reset, NACK on re-init tolerated
+    await io.write(Uint8Array.of(0x7f));
+    const first = (await io.read(1))[0];
+    if (first !== STM32_ACK && first !== STM32_NACK) {
+      throw new Error('init: no bootloader (is BOOT0 high, a fresh reset, and the line 8E1?)');
+    }
+    log('bootloader answered');
+
+    // GET_ID
+    await command(0x02, 'GET_ID');
+    const idn = (await io.read(1))[0];
+    const idbody = await io.read(idn + 1);
+    await one('GET_ID tail');
+    let id = 0; for (const b of idbody) id = (id << 8) | b;
+    log(`product id 0x${id.toString(16)}${id === STM32_PID_F03X ? ' (STM32F03x)' : ''}`);
+
+    // extended global erase (the F0 family's 0x44)
+    await command(0x44, 'EXTENDED_ERASE');
+    await io.write(Uint8Array.of(0xff, 0xff, 0x00));
+    await one('global erase', 30000);
+    log('erased');
+
+    // chunked write, 256 bytes, word-aligned, padded with 0xFF
+    const padded = image.length % 4 === 0 ? image
+      : Uint8Array.of(...image, ...new Uint8Array(4 - (image.length % 4)).fill(0xff));
+    for (let off = 0; off < padded.length; off += 256) {
+      const chunk = padded.subarray(off, Math.min(off + 256, padded.length));
+      const addr = base + off;
+      await command(0x31, 'WRITE_MEMORY');
+      const a = stm32Be32(addr);
+      await io.write(Uint8Array.of(...a, stm32Xor(a)));
+      await one(`write addr 0x${addr.toString(16)}`);
+      const head = (chunk.length - 1) & 0xff;
+      await io.write(Uint8Array.of(head, ...chunk, head ^ stm32Xor(chunk)));
+      await one(`write data 0x${addr.toString(16)}`);
+      log(`  wrote ${chunk.length} bytes at 0x${addr.toString(16).padStart(8, '0')}`);
+    }
+
+    // GO: jump to the application
+    await command(0x21, 'GO');
+    const g = stm32Be32(base);
+    await io.write(Uint8Array.of(...g, stm32Xor(g)));
+    await one('go');
+    log(`done: ${padded.length} bytes written, running`);
+    return { bytes: padded.length, productId: id };
+  } finally {
+    await io.close();
+    try { await port.close(); } catch {}
+  }
+}
+
+/**
+ * Open a Web Serial port at STM32's 8E1 line format. Kept separate from
+ * flashStm32 so a test can hand in a fake port, and so the ONE place the
+ * parity differs from every other board is obvious.
+ */
+export async function openStm32Port(port, { baud = 115200 } = {}) {
+  await port.open({ baudRate: baud, dataBits: 8, parity: 'even', stopBits: 1, flowControl: 'none' });
+  return port;
+}

@@ -14,7 +14,7 @@
 //   node scripts/test-flash.mjs
 //
 import { parseIntelHex, Stk500, flashAvr, flashMicroPython, flashStc, stcPacket,
-         stcBaud, stcStatus, pythonBytes, STK } from '../docs/flash.js';
+         stcBaud, stcStatus, pythonBytes, STK, flashStm32 } from '../docs/flash.js';
 
 let passed = 0, failed = 0;
 const ok = (name, cond, detail = '') => {
@@ -496,6 +496,86 @@ catch (e) { ispError = e; }
 ok('an STC15 is refused by name rather than spoken to in STC12',
    ispError && /stc15 ISP protocol/.test(ispError.message),
    ispError ? ispError.message.slice(0, 62) : 'it proceeded!');
+
+
+// --- STM32 (AN3155) -------------------------------------------------------
+// A mock ROM bootloader speaking AN3155, validating every frame the way
+// silicon does; the flashed image must equal the input byte-for-byte.
+class Stm32Rom {
+  constructor() {
+    this.out = [];
+    this.inbox = [];
+    this.flash = new Map();
+    this.state = 'reset';
+    this.pending = 0;
+    this.erased = false;
+    this.log = [];
+  }
+  say(bytes) { for (const b of bytes) this.out.push(b); }
+  feed(bytes) { for (const b of bytes) this.inbox.push(b); this.pump(); }
+  take(n) { return this.inbox.splice(0, n); }
+  pump() {
+    for (;;) {
+      if (this.state === 'reset') {
+        if (!this.inbox.length) return;
+        const [b] = this.take(1);
+        if (b !== 0x7f) { this.say([0x1f]); continue; }
+        this.say([0x79]); this.state = 'idle';
+      } else if (this.state === 'idle') {
+        if (this.inbox.length < 2) return;
+        const [cmd, comp] = this.take(2);
+        if (((~cmd) & 0xff) !== comp) { this.log.push('badcomp'); this.say([0x1f]); continue; }
+        this.say([0x79]);
+        if (cmd === 0x02) this.say([1, 0x04, 0x44, 0x79]);
+        else if (cmd === 0x44) this.state = 'erase';
+        else if (cmd === 0x31) this.state = 'waddr';
+        else if (cmd === 0x21) this.state = 'goaddr';
+        else { this.log.push('unknown'); this.say([0x1f]); }
+      } else if (this.state === 'erase') {
+        if (this.inbox.length < 3) return;
+        const f = this.take(3);
+        if ((f[0] ^ f[1]) !== f[2]) { this.say([0x1f]); }
+        else { this.erased = true; this.flash.clear(); this.log.push('erase'); this.say([0x79]); }
+        this.state = 'idle';
+      } else if (this.state === 'waddr' || this.state === 'goaddr') {
+        if (this.inbox.length < 5) return;
+        const f = this.take(5);
+        if ((f[0]^f[1]^f[2]^f[3]) !== f[4]) { this.log.push('badaddrcs'); this.say([0x1f]); this.state='idle'; continue; }
+        const addr = ((f[0]<<24)|(f[1]<<16)|(f[2]<<8)|f[3]) >>> 0;
+        if (this.state === 'goaddr') { this.log.push('go:'+addr.toString(16)); this.say([0x79]); this.state='idle'; continue; }
+        this.pending = addr; this.say([0x79]); this.state = 'wdata';
+      } else if (this.state === 'wdata') {
+        if (!this.inbox.length) return;
+        const need = this.inbox[0] + 1;
+        if (this.inbox.length < 1 + need + 1) return;
+        const f = this.take(1 + need + 1);
+        const head = f[0]; const data = f.slice(1, 1 + need);
+        const cs = data.reduce((a, b) => a ^ b, head);
+        if (cs !== f[f.length - 1]) { this.log.push('baddatacs'); this.say([0x1f]); }
+        else { data.forEach((b, i) => this.flash.set(this.pending + i, b)); this.say([0x79]); }
+        this.state = 'idle';
+      }
+    }
+  }
+}
+
+{
+  const rom = new Stm32Rom();
+  const port = fakePort(rom); // Stm32Rom shares the feed/out shape FakeBootloader uses
+  const image = Uint8Array.from({ length: 701 }, (_, i) => (i * 7 + 3) & 0xff);
+  const res = await flashStm32(port, image, { log: () => {} });
+  ok('STM32: flashed byte count padded to a word multiple', res.bytes === 704);
+  ok('STM32: product id read back', res.productId === 0x444);
+  let identical = true;
+  for (let i = 0; i < image.length; i++) {
+    if (rom.flash.get(0x08000000 + i) !== image[i]) { identical = false; break; }
+  }
+  ok('STM32: flash equals the image byte-for-byte', identical);
+  ok('STM32: erased before writing and jumped to base', rom.log.includes('erase')
+     && rom.log.some(l => l === 'go:8000000'));
+  ok('STM32: no framing rejections', !rom.log.some(l => l.startsWith('bad')));
+}
+
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
