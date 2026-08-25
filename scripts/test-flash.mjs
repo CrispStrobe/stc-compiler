@@ -14,7 +14,7 @@
 //   node scripts/test-flash.mjs
 //
 import { parseIntelHex, Stk500, flashAvr, flashMicroPython, flashStc, stcPacket,
-         stcBaud, stcStatus, pythonBytes, STK, flashStm32, flashEeprom, flashAvrMega } from '../docs/flash.js';
+         stcBaud, stcStatus, pythonBytes, STK, flashStm32, flashEeprom, flashAvrMega, flashUsbasp } from '../docs/flash.js';
 
 let passed = 0, failed = 0;
 const ok = (name, cond, detail = '') => {
@@ -689,6 +689,75 @@ class Stk500v2Boot {
   for (let i = 0; i < bytes.length; i++) if (boot.flash[i] !== bytes[i]) { same = false; break; }
   ok('Mega: STK500v2 wrote the image byte-for-byte', same);
   ok('Mega: no frame was rejected', !boot.log.includes('badck') && !boot.log.some(l => l.startsWith('unknown')));
+}
+
+
+
+// --- USBasp (ISP/SPI over WebUSB) -----------------------------------------
+// A mock WebUSB USBasp + a mock ATtiny85: the raw AVR ISP SPI state
+// machine (programming enable, signature, chip erase, page load/write,
+// read-back). The written flash must equal the image byte-for-byte,
+// verify must pass, and a wrong signature must be reported.
+function mockUsbasp(signature = [0x1e, 0x93, 0x0b], flashSize = 8192) {
+  const flash = new Uint8Array(flashSize).fill(0xff);
+  const pageBuf = new Uint8Array(flashSize).fill(0xff); // word buffer, indexed by loaded word*2
+  let enabled = false;
+  // A control-transfer SPI: given 4 bytes (b0..b3 from value/index), return
+  // 4 MISO bytes per the AVR datasheet.
+  function spi(b0, b1, b2, b3) {
+    const out = new Uint8Array(4);
+    if (b0 === 0xac && b1 === 0x53) { out[2] = 0x53; enabled = true; }
+    else if (b0 === 0x30) { out[3] = signature[b2] ?? 0xff; }       // read signature byte b2
+    else if (b0 === 0xac && b1 === 0x80) { flash.fill(0xff); }      // chip erase
+    else if (b0 === 0x40) { pageBuf[(b2 & 0x1f) * 2] = b3; }        // load page low @ word b2 (32-word page)
+    else if (b0 === 0x48) { pageBuf[(b2 & 0x1f) * 2 + 1] = b3; }    // load page high
+    else if (b0 === 0x4c) {                                          // write page @ word (b1<<8|b2)
+      const wordAddr = (b1 << 8) | b2; const byteBase = wordAddr * 2;
+      for (let i = 0; i < 64; i++) flash[byteBase + i] = pageBuf[i];
+      pageBuf.fill(0xff);
+    } else if (b0 === 0x20) { const a = ((b1 << 8) | b2) * 2; out[3] = flash[a]; }      // read low
+    else if (b0 === 0x28) { const a = ((b1 << 8) | b2) * 2 + 1; out[3] = flash[a]; }    // read high
+    return out;
+  }
+  return {
+    flash,
+    configuration: { }, // non-null: selectConfiguration skipped
+    async open() {}, async close() {},
+    async selectConfiguration() {}, async claimInterface() {},
+    async controlTransferOut() { return { status: 'ok' }; },
+    async controlTransferIn(setup) {
+      if (setup.request === 3) { // TRANSMIT
+        const b0 = setup.value & 0xff, b1 = (setup.value >> 8) & 0xff;
+        const b2 = setup.index & 0xff, b3 = (setup.index >> 8) & 0xff;
+        const r = spi(b0, b1, b2, b3);
+        return { data: { buffer: r.buffer } };
+      }
+      return { data: { buffer: new Uint8Array(4).buffer } };
+    },
+  };
+}
+
+{
+  // Build a 200-byte Intel HEX and flash it to a mock ATtiny85.
+  const bytes = Array.from({ length: 200 }, (_, i) => (i * 13 + 9) & 0xff);
+  const recs = [];
+  for (let a = 0; a < bytes.length; a += 16) recs.push(record(a, 0, bytes.slice(a, a + 16)));
+  recs.push(':00000001FF');
+  const dev = mockUsbasp();
+  const res = await flashUsbasp(dev, recs.join('\n'), { log: () => {} });
+  ok('USBasp: identified the ATtiny85 by signature', res.part === 'ATtiny85');
+  ok('USBasp: reported the byte count', res.bytes === 200);
+  let same = true;
+  for (let i = 0; i < bytes.length; i++) if (dev.flash[i] !== bytes[i]) { same = false; break; }
+  ok('USBasp: flashed the image byte-for-byte (and verify passed)', same);
+}
+{
+  // A part we do not know must be reported, not guessed.
+  const dev = mockUsbasp([0x1e, 0xa5, 0xff]);
+  const hex = [record(0, 0, [0x0c, 0x94]), ':00000001FF'].join('\n');
+  let threw = null;
+  try { await flashUsbasp(dev, hex, { log: () => {} }); } catch (e) { threw = e; }
+  ok('USBasp: an unknown signature is refused by name', threw && /unknown AVR signature/.test(threw.message));
 }
 
 

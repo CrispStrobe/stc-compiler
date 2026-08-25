@@ -897,3 +897,119 @@ export async function flashAvrMega(port, hexText, {
     try { await port.close(); } catch {}
   }
 }
+
+// ------------------------------------------------- USBasp (ISP/SPI, WebUSB)
+//
+// An in-system programmer, not a bootloader path: a USBasp / USBISP
+// dongle drives the AVR's 6-pin ICSP header (MOSI/MISO/SCK/RST) over SPI
+// and programs the raw flash — bypassing the bootloader entirely. That
+// makes it the ONLY path for the ATtiny85/88 (which have no serial
+// bootloader at all) and a bootloader-free, DTR-free path for every
+// other AVR (Uno/Nano/Mega/328/168).
+//
+// Clean-room from two open, documented sources — no GPL firmware read:
+//   - the USBasp USB function numbers (fischl.de/usbasp; the same values
+//     avrdude uses), and
+//   - the AVR "Serial Programming Instruction Set" in every AVR
+//     datasheet (Programming Enable / Chip Erase / Load & Write Program
+//     Memory Page / Read).
+//
+// WebUSB, not Web Serial: a USBasp is a raw USB device (VID 0x16c0 /
+// PID 0x05dc), driven by vendor control transfers. Chrome/Edge only, and
+// the OS must let the page claim it (Linux udev / macOS just works;
+// Windows needs the WinUSB driver via Zadig).
+
+const USBASP = { CONNECT: 1, DISCONNECT: 2, TRANSMIT: 3 };
+
+// signature (3 bytes) -> {name, flash bytes, page bytes}. Only the parts
+// we emulate; an unknown signature is reported, never guessed.
+const AVR_BY_SIGNATURE = {
+  '1e930b': { name: 'ATtiny85', flash: 8192, page: 64 },
+  '1e9311': { name: 'ATtiny88', flash: 8192, page: 64 },
+  '1e9307': { name: 'ATmega8',  flash: 8192, page: 64 },
+  '1e940b': { name: 'ATmega168P', flash: 16384, page: 128 },
+  '1e950f': { name: 'ATmega328P', flash: 32768, page: 128 },
+  '1e9801': { name: 'ATmega2560', flash: 262144, page: 256 },
+};
+
+/**
+ * Flash an AVR through a USBasp over WebUSB.
+ * @param {USBDevice} device an opened-or-openable WebUSB device (VID 0x16c0)
+ */
+export async function flashUsbasp(device, hexText, { log = () => {}, verify = true } = {}) {
+  const { image } = parseIntelHex(hexText);
+  await device.open();
+  if (device.configuration === null) await device.selectConfiguration(1);
+  await device.claimInterface(0);
+
+  // One raw 4-byte SPI exchange. USBasp packs the two low bytes into
+  // wValue and the two high into wIndex, and returns the 4 MISO bytes.
+  const transmit = async (b0, b1, b2, b3) => {
+    const r = await device.controlTransferIn({
+      requestType: 'vendor', recipient: 'device', request: USBASP.TRANSMIT,
+      value: b0 | (b1 << 8), index: b2 | (b3 << 8),
+    }, 4);
+    return new Uint8Array(r.data.buffer);
+  };
+  const connect = () => device.controlTransferOut({
+    requestType: 'vendor', recipient: 'device', request: USBASP.CONNECT, value: 0, index: 0,
+  });
+  const disconnect = () => device.controlTransferOut({
+    requestType: 'vendor', recipient: 'device', request: USBASP.DISCONNECT, value: 0, index: 0,
+  });
+
+  try {
+    await connect();
+    // Programming Enable — the 3rd MISO byte echoes 0x53 when the AVR is
+    // in sync (datasheet). A retry, because the first can miss.
+    let synced = false;
+    for (let i = 0; i < 3 && !synced; i++) {
+      const r = await transmit(0xac, 0x53, 0x00, 0x00);
+      synced = r[2] === 0x53;
+    }
+    if (!synced) throw new Error('no AVR answered ISP — check the ICSP wiring, power, and that RESET reaches the chip');
+
+    // Signature: read 3 bytes at 0,1,2.
+    let sig = '';
+    for (let i = 0; i < 3; i++) sig += (await transmit(0x30, 0x00, i, 0x00))[3].toString(16).padStart(2, '0');
+    const part = AVR_BY_SIGNATURE[sig];
+    if (!part) throw new Error(`unknown AVR signature 0x${sig} — this programmer path knows ${Object.values(AVR_BY_SIGNATURE).map(p => p.name).join(', ')}`);
+    log(`target: ${part.name} (signature 0x${sig})`);
+    if (image.length > part.flash) throw new Error(`image ${image.length} B exceeds ${part.name}'s ${part.flash} B flash`);
+
+    // Chip erase, then wait the write cycle.
+    await transmit(0xac, 0x80, 0x00, 0x00);
+    await new Promise(r => setTimeout(r, 12));
+
+    const pageWords = part.page / 2;
+    for (let base = 0; base < image.length; base += part.page) {
+      const page = image.subarray(base, Math.min(base + part.page, image.length));
+      // Load the page buffer word by word (low then high byte).
+      for (let w = 0; w < page.length / 2; w++) {
+        const lo = page[2 * w] ?? 0xff;
+        const hi = page[2 * w + 1] ?? 0xff;
+        await transmit(0x40, 0x00, w & (pageWords - 1), lo);
+        await transmit(0x48, 0x00, w & (pageWords - 1), hi);
+      }
+      // Write the page at its WORD address.
+      const wordAddr = base >> 1;
+      await transmit(0x4c, (wordAddr >> 8) & 0xff, wordAddr & 0xff, 0x00);
+      await new Promise(r => setTimeout(r, 6));
+      log(`  wrote ${page.length} bytes at 0x${base.toString(16).padStart(4, '0')}`);
+    }
+
+    if (verify) {
+      for (let i = 0; i < image.length; i++) {
+        const wordAddr = i >> 1;
+        const cmd = (i & 1) ? 0x28 : 0x20; // read high : read low byte
+        const got = (await transmit(cmd, (wordAddr >> 8) & 0xff, wordAddr & 0xff, 0x00))[3];
+        if (got !== image[i]) throw new Error(`verify failed at 0x${i.toString(16)}: wrote 0x${image[i].toString(16)}, read 0x${got.toString(16)}`);
+      }
+    }
+    log(`done: ${image.length} bytes written${verify ? ' and verified' : ''}`);
+    return { bytes: image.length, part: part.name };
+  } finally {
+    try { await disconnect(); } catch { /* going away anyway */ }
+    try { await device.close(); } catch { /* ditto */ }
+  }
+}
