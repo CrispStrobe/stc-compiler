@@ -1716,6 +1716,11 @@ class ProjectReq(BaseModel):
     options: list[str] = []
     format: str = "hex"
     disassemble: bool = False
+    # The endpoint reads req.symbols on the link path; this field was
+    # never added when symbols support landed there, so EVERY linked
+    # project translation 500'd with AttributeError in production
+    # (found by scripts/test-api.py after the 2026-08-25 redeploy).
+    symbols: bool = False
 
 
 @app.post("/translate-project")

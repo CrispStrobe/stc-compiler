@@ -142,7 +142,9 @@ for fmt, head in (("hex", b":"), ("ihx", b":"), ("bin", None)):
 print("\nerrors are rejected cleanly")
 cases = [
     ("syntax error", {"code": "void main(void) { not C }"}, "syntax error"),
-    ("unknown target", {"code": SOURCE, "target": "attiny85"}, "unknown target"),
+    # attiny85 BECAME a real target (2026-08); an 8051 SOURCE against it now
+    # fails in the compiler, not the router. z9000 stays unknown forever.
+    ("unknown target", {"code": SOURCE, "target": "z9000"}, "unknown target"),
     ("image too large", {"code": SOURCE, "target": "stc12c5a16s2",
                          "options": ["--code-size", "64"]}, "Insufficient"),
     ("bad define name", {"code": SOURCE, "defines": {"BAD;NAME": "1"}}, "bad define"),
