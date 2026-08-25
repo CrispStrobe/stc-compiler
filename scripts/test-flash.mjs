@@ -14,7 +14,7 @@
 //   node scripts/test-flash.mjs
 //
 import { parseIntelHex, Stk500, flashAvr, flashMicroPython, flashStc, stcPacket,
-         stcBaud, stcStatus, pythonBytes, STK, flashStm32, flashEeprom } from '../docs/flash.js';
+         stcBaud, stcStatus, pythonBytes, STK, flashStm32, flashEeprom, flashAvrMega } from '../docs/flash.js';
 
 let passed = 0, failed = 0;
 const ok = (name, cond, detail = '') => {
@@ -624,6 +624,71 @@ class BweepProgrammer {
   for (let i = 0; i < image.length; i++) if (prog.mem[0x10 + i] !== image[i]) { same = false; break; }
   ok('EEPROM: burned image equals the input byte-for-byte', same);
   ok('EEPROM: no page straddled a boundary (no bad checksums)', !prog.log.includes('badck'));
+}
+
+
+
+// --- ATmega2560 / Mega (STK500v2) -----------------------------------------
+// A mock stk500boot: parse framed v2 messages (checksum-verified),
+// answer SIGN_ON, ENTER/LEAVE PROGMODE, LOAD_ADDRESS, PROGRAM_FLASH,
+// READ_FLASH; the written flash must equal the image, and a corrupt
+// frame must be rejected.
+class Stk500v2Boot {
+  constructor() { this.out = []; this.inbox = []; this.flash = new Uint8Array(262144).fill(0xff); this.addr = 0; this.log = []; }
+  feed(bytes) { for (const b of bytes) this.inbox.push(b); this.pump(); }
+  reply(seq, body) {
+    const size = body.length;
+    const f = [0x1b, seq, (size >> 8) & 0xff, size & 0xff, 0x0e, ...body];
+    let ck = 0; for (const b of f) ck ^= b;
+    f.push(ck); for (const b of f) this.out.push(b);
+  }
+  pump() {
+    for (;;) {
+      if (this.inbox.length < 5) return;
+      if (this.inbox[0] !== 0x1b) { this.inbox.shift(); continue; }
+      const seq = this.inbox[1];
+      const size = (this.inbox[2] << 8) | this.inbox[3];
+      if (this.inbox.length < 5 + size + 1) return;
+      const frame = this.inbox.splice(0, 5 + size + 1);
+      let ck = 0; for (let i = 0; i < frame.length - 1; i++) ck ^= frame[i];
+      if (ck !== frame[frame.length - 1]) { this.log.push('badck'); continue; }
+      const body = frame.slice(5, 5 + size);
+      const cmd = body[0];
+      if (cmd === 0x01) this.reply(seq, [0x01, 0x00, 8, ...[...'AVRISP_2'].map(c => c.charCodeAt(0))]);
+      else if (cmd === 0x10) this.reply(seq, [0x10, 0x00]);
+      else if (cmd === 0x11) this.reply(seq, [0x11, 0x00]);
+      else if (cmd === 0x06) { // load address (word, big-endian, top bit flag)
+        const w = (((body[1] & 0x7f) << 24) | (body[2] << 16) | (body[3] << 8) | body[4]) >>> 0;
+        this.addr = w << 1; this.reply(seq, [0x06, 0x00]);
+      } else if (cmd === 0x13) { // program flash
+        const n = (body[1] << 8) | body[2];
+        const data = body.slice(10, 10 + n);
+        for (let i = 0; i < n; i++) this.flash[this.addr + i] = data[i];
+        this.reply(seq, [0x13, 0x00]);
+      } else if (cmd === 0x14) { // read flash
+        const n = (body[1] << 8) | body[2];
+        const data = []; for (let i = 0; i < n; i++) data.push(this.flash[this.addr + i]);
+        this.reply(seq, [0x14, 0x00, ...data, 0x00]);
+      } else { this.log.push('unknown:' + cmd); this.reply(seq, [cmd, 0xc0]); }
+    }
+  }
+}
+
+{
+  const boot = new Stk500v2Boot();
+  const port = fakePort(boot);
+  // Build a small Intel HEX (reuse the record() helper above).
+  const bytes = Array.from({ length: 300 }, (_, i) => (i * 11 + 5) & 0xff);
+  const recs = [];
+  for (let a = 0; a < bytes.length; a += 16) recs.push(record(a, 0, bytes.slice(a, a + 16)));
+  recs.push(':00000001FF');
+  const hex = recs.join('\n');
+  const res = await flashAvrMega(port, hex, { log: () => {}, pageSize: 128 });
+  ok('Mega: reported the byte count', res.bytes >= 300);
+  let same = true;
+  for (let i = 0; i < bytes.length; i++) if (boot.flash[i] !== bytes[i]) { same = false; break; }
+  ok('Mega: STK500v2 wrote the image byte-for-byte', same);
+  ok('Mega: no frame was rejected', !boot.log.includes('badck') && !boot.log.some(l => l.startsWith('unknown')));
 }
 
 
