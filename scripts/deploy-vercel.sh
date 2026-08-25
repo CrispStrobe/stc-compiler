@@ -40,7 +40,7 @@ fi
 # then also refuse the exit-0-but-"Error:" shape (the rate-limit cap).
 LOG="$(mktemp /tmp/stc-vercel-deploy.XXXXXX.log)"
 set +e
-TERM=dumb CI=1 vercel deploy "${TOKEN_ARGS[@]}" --scope "$SCOPE" --yes $PROD \
+TERM=dumb CI=1 vercel deploy ${TOKEN_ARGS[@]+"${TOKEN_ARGS[@]}"} --scope "$SCOPE" --yes $PROD \
     </dev/null >"$LOG" 2>&1
 rc=$?
 set -e

@@ -7,6 +7,12 @@
 # (hit 2026-08-25) and a second host makes the compile service survive
 # one platform's bad day. Like the Vercel deploy: ON RELEASE, BY HAND.
 #
+# GATED (verified 2026-08-25): HF now requires a PRO subscription to host
+# Docker/Gradio Spaces even on free cpu-basic hardware — `hf repo create
+# --space-sdk docker` refuses on the free `cstr` account. This script is
+# ready for the day that changes (subscription or policy); until then the
+# only host is Vercel via scripts/deploy-vercel.sh.
+#
 # Usage: scripts/deploy-hf.sh
 # Auth: HF_TOKEN from /Users/christianstrobele/code/.env (account: cstr),
 #       or an already-logged-in `hf` CLI.
@@ -66,7 +72,7 @@ for the OpenAPI browser.
 EOF
 
 echo "uploading to $SPACE (this pushes ~130 MB of toolchains on first run)…"
-hf upload "$SPACE" "$STAGE" . --repo-type space "${TOKEN_ARGS[@]}" \
+hf upload "$SPACE" "$STAGE" . --repo-type space ${TOKEN_ARGS[@]+"${TOKEN_ARGS[@]}"} \
     --commit-message "deploy $(git rev-parse --short HEAD)"
 
 echo "deploy pushed — build status: https://huggingface.co/spaces/$SPACE"
