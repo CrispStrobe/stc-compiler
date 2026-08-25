@@ -1020,3 +1020,168 @@ export async function flashUsbasp(device, hexText, { log = () => {}, verify = tr
     try { await device.close(); } catch { /* ditto */ }
   }
 }
+
+// ------------------------------------------------- STM32 over SWD (CMSIS-DAP, WebUSB)
+//
+// The sixth path, and the one that needs no bootloader entry at all: a
+// CMSIS-DAP probe drives the target's Serial Wire Debug port, and we
+// program the flash through the debug MEM-AP — halt the core, unlock the
+// flash controller, erase, write halfwords, reset. No BOOT0, no reset
+// button, no ISP.
+//
+// CMSIS-DAP ONLY, deliberately: it is ARM's OPEN debug-probe protocol
+// (USB bulk transfers → WebUSB), so this is permissive top to bottom.
+// The proprietary J-Link protocol is NOT implemented and never will be
+// (SEGGER's, not ours to ship). A CMSIS-DAP / DAPLink probe is what this
+// wants — including a Raspberry Pi Pico running picoprobe, a $4 SWD
+// debugger. Clean-room from the CMSIS-DAP command spec (ARM, open) and
+// the ARMv6-M debug + STM32F0 FPEC register maps (RM0360); the MIT
+// MCUProg/DAPCmdr were architecture cross-checks, no code taken.
+//
+// Chrome/Edge only; the OS must let the page claim the probe.
+
+const DAP = {
+  INFO: 0x00, CONNECT: 0x02, DISCONNECT: 0x03, TRANSFER_CONFIGURE: 0x04,
+  TRANSFER: 0x05, SWJ_CLOCK: 0x11, SWJ_SEQUENCE: 0x12, SWD_CONFIGURE: 0x13,
+  PORT_SWD: 0x01,
+  // transfer request bits
+  RnW: 1 << 1, APnDP: 1 << 0, A2: 1 << 2, A3: 1 << 3,
+  ACK_OK: 0x01,
+};
+
+/** A CMSIS-DAP v2 probe over WebUSB bulk endpoints. */
+export class CmsisDap {
+  constructor(device, { epOut = 1, epIn = 1, log = () => {} } = {}) {
+    this.dev = device; this.epOut = epOut; this.epIn = epIn; this.log = log;
+  }
+  async _cmd(bytes) {
+    await this.dev.transferOut(this.epOut, Uint8Array.from(bytes));
+    const r = await this.dev.transferIn(this.epIn, 64);
+    return new Uint8Array(r.data.buffer);
+  }
+  async connect() {
+    // pick the first bulk out/in endpoints of the (only) interface
+    await this._cmd([DAP.CONNECT, DAP.PORT_SWD]);
+    await this._cmd([DAP.SWJ_CLOCK, 0x00, 0x10, 0x0e, 0x00]); // 1 MHz
+    await this._cmd([DAP.TRANSFER_CONFIGURE, 0, 0x40, 0x00, 0x00, 0x00]);
+    await this._cmd([DAP.SWD_CONFIGURE, 0x00]);
+    // line reset + JTAG-to-SWD (0xE79E) + line reset, then idle — the
+    // canonical SWJ sequence to put the DAP in SWD mode.
+    await this._cmd([DAP.SWJ_SEQUENCE, 51, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x07]);
+    await this._cmd([DAP.SWJ_SEQUENCE, 16, 0x9e, 0xe7]);
+    await this._cmd([DAP.SWJ_SEQUENCE, 51, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x07]);
+    await this._cmd([DAP.SWJ_SEQUENCE, 8, 0x00]);
+  }
+  async disconnect() { try { await this._cmd([DAP.DISCONNECT]); } catch { /* going */ } }
+
+  /** One DAP transfer: read or write a DP/AP register. Returns the read
+   *  word (RnW) or undefined. Throws on a non-OK ACK. */
+  async transfer(req, value) {
+    const write = !(req & DAP.RnW);
+    const body = [DAP.TRANSFER, 0x00, 0x01, req];
+    if (write) body.push(value & 0xff, (value >> 8) & 0xff, (value >> 16) & 0xff, (value >>> 24) & 0xff);
+    const r = await this._cmd(body);
+    // reply: [DAP_TRANSFER, count, ack, (data if read)]
+    if (r[1] !== 1 || (r[2] & 0x07) !== DAP.ACK_OK) throw new Error(`SWD transfer ACK 0x${r[2].toString(16)}`);
+    if (!write) return (r[3] | (r[4] << 8) | (r[5] << 16) | (r[6] << 24)) >>> 0;
+    return undefined;
+  }
+}
+
+// DP/AP register addresses (A[3:2]).
+const DP_SELECT = 0x08, DP_CTRLSTAT = 0x04;
+const AP_CSW = 0x00, AP_TAR = 0x04, AP_DRW = 0x0c;
+
+/** A MEM-AP over a CMSIS-DAP link: word memory read/write to the target. */
+export class SwdMem {
+  constructor(dap) { this.dap = dap; }
+  async init() {
+    // power up debug + system domains, then set the MEM-AP CSW to 32-bit
+    // auto-increment.
+    await this.dap.transfer(DP_CTRLSTAT, 0x50000000);              // CSYSPWRUPREQ|CDBGPWRUPREQ (write DP CTRL/STAT)
+    for (let i = 0; i < 50; i++) {
+      const s = await this.dap.transfer(DP_CTRLSTAT | DAP.RnW);
+      if ((s & 0xf0000000) === 0xf0000000) break;                  // both *PWRUPACK set
+    }
+    await this.dap.transfer(DP_SELECT, 0x00000000);                // AP 0, bank 0
+    await this.dap.transfer(AP_CSW | DAP.APnDP, 0x23000052);       // 32-bit, addr auto-inc
+  }
+  async write32(addr, value) {
+    await this.dap.transfer(AP_TAR | DAP.APnDP, addr >>> 0);
+    await this.dap.transfer(AP_DRW | DAP.APnDP, value >>> 0);
+  }
+  async read32(addr) {
+    await this.dap.transfer(AP_TAR | DAP.APnDP, addr >>> 0);
+    return this.dap.transfer((AP_DRW | DAP.APnDP) | DAP.RnW);
+  }
+}
+
+// STM32F0 FPEC (flash controller) + ARMv6-M debug registers (RM0360 §3, ARM).
+const F0 = {
+  DHCSR: 0xe000edf0, DBGKEY: 0xa05f0000, C_DEBUGEN: 1, C_HALT: 2,
+  FLASH_KEYR: 0x40022004, FLASH_SR: 0x4002200c, FLASH_CR: 0x40022010, FLASH_AR: 0x40022014,
+  KEY1: 0x45670123, KEY2: 0xcdef89ab,
+  CR_PG: 1, CR_PER: 2, CR_MER: 4, CR_STRT: 1 << 6, CR_LOCK: 1 << 7,
+  SR_BSY: 1, AIRCR: 0xe000ed0c, AIRCR_KEY: 0x05fa0000, SYSRESETREQ: 1 << 2,
+};
+
+/**
+ * Flash a raw STM32F0 image over SWD via a CMSIS-DAP probe.
+ * @param {USBDevice} device an opened-or-openable CMSIS-DAP WebUSB device
+ * @param {Uint8Array} image raw flash bytes (vectors first)
+ */
+export async function flashSwdStm32(device, image, { base = 0x08000000, log = () => {} } = {}) {
+  await device.open();
+  if (device.configuration === null) await device.selectConfiguration(1);
+  // claim the vendor (bulk) interface — CMSIS-DAP v2 exposes one.
+  const iface = device.configuration.interfaces.find(i =>
+    i.alternate.endpoints.some(e => e.type === 'bulk')) || device.configuration.interfaces[0];
+  await device.claimInterface(iface.interfaceNumber);
+  const eps = iface.alternate.endpoints;
+  const epOut = (eps.find(e => e.direction === 'out') || { endpointNumber: 1 }).endpointNumber;
+  const epIn = (eps.find(e => e.direction === 'in') || { endpointNumber: 1 }).endpointNumber;
+
+  const dap = new CmsisDap(device, { epOut, epIn, log });
+  const mem = new SwdMem(dap);
+  const waitBsy = async () => { for (let i = 0; i < 10000; i++) { if (!((await mem.read32(F0.FLASH_SR)) & F0.SR_BSY)) return; } throw new Error('FPEC busy timeout'); };
+  try {
+    await dap.connect();
+    const idcode = await dap.transfer(0x00 | DAP.RnW); // DP IDCODE
+    log(`SWD up, DP IDCODE 0x${idcode.toString(16)}`);
+    await mem.init();
+
+    // Halt the core so it is not executing while we reprogram flash.
+    await mem.write32(F0.DHCSR, F0.DBGKEY | F0.C_DEBUGEN | F0.C_HALT);
+
+    // Unlock the flash controller.
+    await mem.write32(F0.FLASH_KEYR, F0.KEY1);
+    await mem.write32(F0.FLASH_KEYR, F0.KEY2);
+
+    // Mass erase.
+    await mem.write32(F0.FLASH_CR, F0.CR_MER);
+    await mem.write32(F0.FLASH_CR, F0.CR_MER | F0.CR_STRT);
+    await waitBsy();
+    log('erased');
+
+    // Program halfwords. The F0 FPEC programs 16 bits at a time; the
+    // MEM-AP write is 32-bit but the controller latches the lower 16 at
+    // each aligned halfword address.
+    await mem.write32(F0.FLASH_CR, F0.CR_PG);
+    const padded = image.length % 2 === 0 ? image : Uint8Array.of(...image, 0xff);
+    for (let i = 0; i < padded.length; i += 2) {
+      const hw = padded[i] | (padded[i + 1] << 8);
+      await mem.write32(base + i, hw);   // 16-bit store to flash space triggers a program
+      if ((i & 0x3ff) === 0) { await waitBsy(); log(`  ${i}/${padded.length} bytes`); }
+    }
+    await waitBsy();
+    await mem.write32(F0.FLASH_CR, F0.CR_LOCK);
+    log(`done: ${padded.length} bytes written`);
+
+    // System reset to run the new image.
+    await mem.write32(F0.AIRCR, F0.AIRCR_KEY | F0.SYSRESETREQ);
+    return { bytes: padded.length, idcode: idcode >>> 0 };
+  } finally {
+    await dap.disconnect();
+    try { await device.close(); } catch { /* ditto */ }
+  }
+}

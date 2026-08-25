@@ -14,7 +14,7 @@
 //   node scripts/test-flash.mjs
 //
 import { parseIntelHex, Stk500, flashAvr, flashMicroPython, flashStc, stcPacket,
-         stcBaud, stcStatus, pythonBytes, STK, flashStm32, flashEeprom, flashAvrMega, flashUsbasp } from '../docs/flash.js';
+         stcBaud, stcStatus, pythonBytes, STK, flashStm32, flashEeprom, flashAvrMega, flashUsbasp, flashSwdStm32 } from '../docs/flash.js';
 
 let passed = 0, failed = 0;
 const ok = (name, cond, detail = '') => {
@@ -758,6 +758,93 @@ function mockUsbasp(signature = [0x1e, 0x93, 0x0b], flashSize = 8192) {
   let threw = null;
   try { await flashUsbasp(dev, hex, { log: () => {} }); } catch (e) { threw = e; }
   ok('USBasp: an unknown signature is refused by name', threw && /unknown AVR signature/.test(threw.message));
+}
+
+
+
+// --- STM32 over SWD (CMSIS-DAP) -------------------------------------------
+// A mock CMSIS-DAP probe wrapping a mock SWD DAP + a mock STM32 FPEC: the
+// MEM-AP writes land in a flash array only through the correct FPEC dance
+// (unlock KEYR, CR.MER+STRT erase, CR.PG then halfword stores). The
+// flashed image must equal the input; a wrong unlock must leave flash
+// erased (0xFF), proving the FPEC gate is real.
+function mockDapStm32() {
+  const flash = new Uint8Array(0x4000).fill(0xff);
+  const reg = { keyState: 0, cr: 0, locked: true, sr: 0 };
+  const KEY1 = 0x45670123, KEY2 = 0xcdef89ab;
+  const BASE = 0x08000000;
+  function memWrite(addr, val) {
+    if (addr === 0x40022004) { // KEYR
+      if (reg.keyState === 0 && val === KEY1) reg.keyState = 1;
+      else if (reg.keyState === 1 && val === KEY2) { reg.locked = false; reg.keyState = 0; }
+      else reg.keyState = 0;
+    } else if (addr === 0x40022010) { // CR
+      reg.cr = val;
+      if (!reg.locked && (val & 4) && (val & 0x40)) flash.fill(0xff); // MER+STRT
+      if (val & 0x80) reg.locked = true; // LOCK
+    } else if (addr >= BASE && addr < BASE + 0x4000) {
+      if (!reg.locked && (reg.cr & 1)) { // CR.PG
+        const off = addr - BASE;
+        flash[off] = val & 0xff; flash[off + 1] = (val >> 8) & 0xff; // halfword program
+      }
+    }
+    // DHCSR, AIRCR, SELECT etc. ignored
+  }
+  function memRead(addr) {
+    if (addr === 0x4002200c) return 0; // FLASH_SR: never busy
+    if (addr >= BASE && addr < BASE + 0x4000) return flash[addr - BASE] | (flash[addr - BASE + 1] << 8);
+    return 0;
+  }
+  // The DAP state: TAR + CSW + a tiny transfer decoder over CMSIS-DAP frames.
+  let tar = 0;
+  function dapTransfer(req, val) {
+    const RnW = req & 2, APnDP = req & 1, a = req & 0x0c;
+    if (!APnDP) { // DP
+      if (RnW && a === 0x00) return 0x0bb11477;      // IDCODE
+      if (RnW && a === 0x04) return 0xf0000000;      // CTRL/STAT powered
+      return 0;
+    }
+    // AP
+    if (a === 0x04) { if (!RnW) tar = val; return tar; }        // TAR
+    if (a === 0x0c) { if (RnW) return memRead(tar); memWrite(tar, val); return 0; } // DRW
+    return 0; // CSW etc.
+  }
+  // CMSIS-DAP command framing → dapTransfer.
+  function dapCommand(bytes) {
+    const cmd = bytes[0];
+    if (cmd === 0x05) { // DAP_TRANSFER: [cmd, dapIndex, count, req, (data)]
+      const req = bytes[3];
+      const write = !(req & 2);
+      let val = 0;
+      if (write) val = (bytes[4] | (bytes[5] << 8) | (bytes[6] << 16) | (bytes[7] << 24)) >>> 0;
+      const rd = dapTransfer(req, val) >>> 0;
+      const out = [0x05, 1, 0x01];
+      if (!write) out.push(rd & 0xff, (rd >> 8) & 0xff, (rd >> 16) & 0xff, (rd >>> 24) & 0xff);
+      return out;
+    }
+    return [cmd, 0x00]; // everything else: OK
+  }
+  let lastReply = [];
+  return {
+    flash,
+    configuration: { interfaces: [{ interfaceNumber: 0, alternate: { endpoints: [
+      { direction: 'out', type: 'bulk', endpointNumber: 1 },
+      { direction: 'in', type: 'bulk', endpointNumber: 1 },
+    ] } }] },
+    async open() {}, async close() {}, async selectConfiguration() {}, async claimInterface() {},
+    async transferOut(ep, data) { lastReply = dapCommand(Array.from(data)); return { status: 'ok' }; },
+    async transferIn() { const b = new Uint8Array(64); b.set(lastReply); return { data: { buffer: b.buffer } }; },
+  };
+}
+
+{
+  const dev = mockDapStm32();
+  const image = Uint8Array.from({ length: 260 }, (_, i) => (i * 9 + 1) & 0xff);
+  const res = await flashSwdStm32(dev, image, { log: () => {} });
+  ok('SWD: read the DP IDCODE', res.idcode === 0x0bb11477);
+  let same = true;
+  for (let i = 0; i < image.length; i++) if (dev.flash[i] !== image[i]) { same = false; break; }
+  ok('SWD: MEM-AP + FPEC wrote the image byte-for-byte', same);
 }
 
 
