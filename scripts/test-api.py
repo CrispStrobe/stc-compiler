@@ -764,5 +764,45 @@ except Exception as exc:
 check("the UI offers Arduino language",
       "arduino" in page.lower() and "ATtiny" in page)
 
+# ── ARM targets in production (rp2040 + stm32f030) ────────────────────
+# The F0 case is the one that sat built-but-unserved for hours on
+# 2026-08-25 (deploy rate limit): production advertising the target and
+# the image booting like silicon (SP in word 0) is exactly what a green
+# deploy must prove.
+print("\nARM targets")
+F0_SOURCE = """
+#include <stdint.h>
+#define BW_MMIO(a) (*(volatile uint32_t *)(a))
+#define RCC_AHBENR   BW_MMIO(0x40021014u)
+#define GPIOA_MODER  BW_MMIO(0x48000000u)
+#define GPIOA_BSRR   BW_MMIO(0x48000018u)
+static void bw_fault(void) { for (;;) { } }
+int main(void)
+{
+    RCC_AHBENR = (1u << 17);
+    GPIOA_MODER = 1u;
+    for (;;) { GPIOA_BSRR = 1u; GPIOA_BSRR = (1u << 16); }
+}
+__attribute__((section(".vectors"), used))
+const void *vectors[48] = {
+    (void *)0x20001000, (void *)main, [3] = (void *)bw_fault
+};
+"""
+try:
+    result, _ = post({"code": F0_SOURCE, "language": "c",
+                      "target": "stm32f030", "format": "bin"})
+    ok = result.get("success") is True
+    check("stm32f030 target compiles", ok, result.get("error", ""))
+    if ok:
+        blob = base64.b64decode(result["base64"])
+        sp = int.from_bytes(blob[0:4], "little")
+        reset = int.from_bytes(blob[4:8], "little")
+        check("stm32f030 word 0 is the initial SP", sp == 0x20001000,
+              f"0x{sp:08x}")
+        check("stm32f030 word 1 is a flash reset handler",
+              0x08000000 <= (reset & ~1) < 0x08004000, f"0x{reset:08x}")
+except Exception as exc:
+    check("stm32f030 target compiles", False, str(exc))
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
