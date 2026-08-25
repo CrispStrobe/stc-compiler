@@ -58,7 +58,7 @@ def _c_string(text: str) -> str:
             out.append(char)
     return "".join(out)
 
-PORT_RE = re.compile(r"^P([0-4])\.([0-7])$", re.I)
+PORT_RE = re.compile(r"^P([0-5])\.([0-7])$", re.I)
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -112,6 +112,29 @@ class PinRef(Expr):
 
 
 @dataclass
+class KeypadRef(Expr):
+    """Reading a KEYPAD4X4 PART: the scanned key 0..15, or -1 for none."""
+    part: str
+
+
+@dataclass
+class MatrixPixelRef(Expr):
+    """`pixel X Y is on` on a MATRIX8X8: true iff that pixel's level != 0."""
+    part: str
+    x: Expr
+    y: Expr
+
+
+@dataclass
+class Randint(Expr):
+    low: Expr
+    high: Expr
+
+@dataclass
+class ControllerAxis(Expr):
+    axis: str           # "dx" | "dy"
+
+@dataclass
 class Unary(Expr):
     op: str            # "not" | "-"
     operand: Expr
@@ -137,11 +160,15 @@ PRECEDENCE = [
 ]
 LEVEL = {op: index for index, ops in enumerate(PRECEDENCE) for op in ops}
 UNARY_LEVEL = len(PRECEDENCE)
+NOT_LEVEL = LEVEL["="]          # `not` parses its operand at comparison level
 
 TO_C = {"or": "||", "and": "&&", "=": "==", "!=": "!=",
         "<": "<", ">": ">", "<=": "<=", ">=": ">=",
         "+": "+", "-": "-", "*": "*", "/": "/", "%": "%"}
 SYNONYM = {"==": "=", "<>": "!="}
+WORD_OPS = {"mod": "%"}         # spelled-out operators; sb3-creator's
+                                # dialect writes `a mod b`, and the two
+                                # front ends must accept the same programs
 
 
 # =============================================================== statement AST
@@ -282,6 +309,248 @@ class Stop(Stmt):
     pass
 
 
+# ---- MATRIX8X8 drawing verbs. All write the RAM frame buffer only; the
+# Timer-0 ISR scans it onto the panel. `part` is the MATRIX8X8's name.
+
+@dataclass
+class MatrixClear(Stmt):
+    part: str
+
+
+@dataclass
+class MatrixSetPixel(Stmt):
+    part: str
+    x: Expr
+    y: Expr
+    # "light" / "clear" (full / off), "on" / "off" (set ... to on|off), or
+    # "brightness" (level carries the Expr). `level` is None except for
+    # "brightness". Kept so decompiling gives back the same sentence.
+    style: str
+    level: Expr = None
+
+
+@dataclass
+class MatrixDrawRow(Stmt):
+    part: str
+    y: Expr
+    bits: Expr
+
+
+@dataclass
+class MatrixImage(Stmt):
+    part: str
+    table: str
+
+
+@dataclass
+class MatrixScroll(Stmt):
+    part: str
+    direction: str              # "left" | "right" | "up" | "down"
+
+
+@dataclass
+class MatrixBrightness(Stmt):
+    part: str
+    level: Expr
+
+
+@dataclass
+class ShowNumber(Stmt):
+    display: str
+    value: Expr
+
+
+@dataclass
+class ShowDigit(Stmt):
+    display: str
+    digit: Expr
+    value: Expr
+
+
+@dataclass
+class SetDigitSegments(Stmt):
+    display: str
+    digit: Expr
+    segments: Expr
+
+
+@dataclass
+class ClearDisplay(Stmt):
+    display: str
+
+
+@dataclass
+class TurnOnLed(Stmt):
+    bank: str
+    index: Expr
+
+
+@dataclass
+class TurnOffLed(Stmt):
+    bank: str
+    index: Expr
+
+
+@dataclass
+class SetLeds(Stmt):
+    bank: str
+    value: Expr
+
+
+@dataclass
+class LightOnlyLed(Stmt):
+    bank: str
+    index: Expr
+
+
+# ---- Arcade game-engine statements -----------------------------------
+
+@dataclass
+class ArcadeCreate(Stmt):
+    sprite: str
+    kind: str
+
+@dataclass
+class ArcadePlace(Stmt):
+    sprite: str
+    x: Expr
+    y: Expr
+
+@dataclass
+class ArcadeMove(Stmt):
+    sprite: str
+    vx: Expr
+    vy: Expr
+
+@dataclass
+class ArcadeSetFlag(Stmt):
+    sprite: str
+    flag: str           # "stayinscreen" | "destroyonwall"
+
+@dataclass
+class ArcadeScore(Stmt):
+    delta: Expr
+
+@dataclass
+class ArcadeGameOver(Stmt):
+    win: bool
+
+@dataclass
+class ArcadeOnOverlap(Stmt):
+    kind_a: str
+    kind_b: str
+    body: list
+
+@dataclass
+class ArcadeTilemap(Stmt):
+    name: str
+    cols: Expr
+    rows: Expr
+    tile_size: Expr
+
+@dataclass
+class ArcadeSetTile(Stmt):
+    tilemap: str
+    col: Expr
+    row: Expr
+    tile_index: Expr
+
+@dataclass
+class ArcadeTileWall(Stmt):
+    tilemap: str
+    tile_index: Expr
+
+@dataclass
+class ArcadeSetFrame(Stmt):
+    sprite: str
+    frame: Expr
+
+
+# ---- Display-peripheral statements (LCD / TFT / OLED / RGB) ---------
+
+@dataclass
+class LcdPrint(Stmt):
+    display: str
+    text: str = None        # string literal  (one of text/value is set)
+    value: Expr = None      # expression
+
+@dataclass
+class LcdCursor(Stmt):
+    display: str
+    row: Expr
+    col: Expr
+
+@dataclass
+class LcdClear(Stmt):
+    display: str
+
+@dataclass
+class TftPixel(Stmt):
+    display: str
+    x: Expr
+    y: Expr
+    r: Expr
+    g: Expr
+    b: Expr
+
+@dataclass
+class TftFill(Stmt):
+    display: str
+    x: Expr
+    y: Expr
+    w: Expr
+    h: Expr
+    r: Expr
+    g: Expr
+    b: Expr
+
+@dataclass
+class TftClear(Stmt):
+    display: str
+
+@dataclass
+class TftPrint(Stmt):
+    display: str
+    text: str = None
+    value: Expr = None
+
+@dataclass
+class TftCursor(Stmt):
+    display: str
+    row: Expr
+    col: Expr
+
+@dataclass
+class OledPixel(Stmt):
+    display: str
+    x: Expr
+    y: Expr
+    value: Expr
+
+@dataclass
+class OledClear(Stmt):
+    display: str
+
+@dataclass
+class OledPrint(Stmt):
+    display: str
+    text: str = None
+    value: Expr = None
+
+@dataclass
+class OledCursor(Stmt):
+    display: str
+    row: Expr
+    col: Expr
+
+@dataclass
+class RgbSet(Stmt):
+    led: str
+    r: Expr
+    g: Expr
+    b: Expr
+
+
 # ===================================================================== program
 
 @dataclass
@@ -363,6 +632,113 @@ class ShiftPart:
     def claimed_where(self) -> list:
         """The three locations as the target spells them, for clash checks."""
         return [pin.where for pin in self.claimed]
+
+
+@dataclass
+class KeypadPart:
+    """A 4x4 matrix keypad: sixteen keys for eight pins.
+
+    Modelled as a read-only value — the scanned key 0..15 (row-major from
+    the top-left), or -1 while nothing is pressed — because that is what a
+    program wants to know. The scan drives one row low at a time and reads
+    the columns, which is invisible from the outside and cheap enough to
+    run on every read.
+
+    Measured precedent: the Prechin A2's keypad (rows P1.7..P1.4, cols
+    P1.3..P1.0) was mapped on real silicon by src/06-matrix89 and consumed
+    by src/09-keyshow89 in the stc12c5a60s2-lab repo, 2026-08-17. The C
+    this PART emits is that verified scanner.
+
+    Two-key caveat, inherited from the classic scan: two keys pressed in
+    the SAME COLUMN short a driven-low row into an idle-high one. On
+    quasi-bidirectional 8051 ports the weak pull-up limits that current by
+    construction, which is why the part is admitted for the 8051 family
+    first; push-pull targets need row tri-stating before they can opt in.
+    """
+    name: str
+    kind: str                   # "keypad4x4"
+    rows: list                  # 4 pins, top row first — driven low one at a time
+    cols: list                  # 4 pins, left column first — read
+
+    @property
+    def claimed(self) -> list:
+        return self.rows + self.cols
+
+    @property
+    def claimed_where(self) -> list:
+        return [pin.where for pin in self.claimed]
+
+
+@dataclass
+class MatrixPart:
+    """An 8x8 LED dot matrix: rows through a 74HC595, columns on a whole port.
+
+    Measured on Prechin A2 silicon (docs/BOARD-PRECHIN-A2.md): the 595 selects
+    the physical ROWS active HIGH with Q7 = top, and the port's eight bits sink
+    the COLUMNS active LOW with bit 7 = left. Both orientations are baked into
+    the emitted scan, so image bytes read top-down / MSB-left -- a literal looks
+    like the picture.
+
+    Multiplexed, so it cannot be scanned in a user loop without monopolising the
+    program. Instead it CLAIMS its eleven pins (three 595 + eight columns) and
+    the Timer-0 ISR is the SOLE writer of the 595 and the column port: one row
+    per tick, 8 rows -> a full frame every 8 ms = 125 Hz. That claim is also what
+    closes the 8051 read-modify-write hazard on the shared port latch -- mainline
+    only ever writes the RAM frame buffer, never the port. See docs/A2-BOARD-SUPPORT.md.
+    """
+    name: str
+    kind: str                   # "matrix8x8"
+    data: Pin                   # 595 SER
+    clock: Pin                  # 595 SCLK
+    latch: Pin                  # 595 RCLK
+    col_port: "Port"            # the whole column port (active-low sinks)
+    columns: list               # its eight pins, for the claim + setup()
+    active_low: bool = False    # unused: the ISR owns column polarity directly
+
+    @property
+    def claimed(self) -> list:
+        return [self.data, self.clock, self.latch] + self.columns
+
+    @property
+    def claimed_where(self) -> list:
+        return [pin.where for pin in self.claimed]
+
+
+@dataclass
+class SevenSegPart:
+    """SEVENSEG8: 8-digit 7-seg via 74HC245 (segments on a port) + 74HC138
+    (3 address pins for digit select). ISR-driven multiplexed refresh."""
+    name: str
+    kind: str = "sevenseg8"
+    seg_port: int = 0
+    sel_pins: list = field(default_factory=list)
+    common_anode: bool = False
+
+    @property
+    def claimed(self) -> list:
+        return list(self.sel_pins)
+
+    @property
+    def claimed_where(self) -> list:
+        return [pin.where for pin in self.sel_pins]
+
+
+@dataclass
+class LedBankPart:
+    """LEDBANK8: 8 LEDs on a port. Writes go through an ISR-owned shadow byte."""
+    name: str
+    kind: str = "ledbank8"
+    led_port: int = 0
+    active_low: bool = False
+    led_port_where: str = ""
+
+    @property
+    def claimed(self) -> list:
+        return []
+
+    @property
+    def claimed_where(self) -> list:
+        return []
 
 
 @dataclass
@@ -600,7 +976,8 @@ class Target:
 
 
 class Stc8051Target(Target):
-    supports = frozenset({"pwm", "tone", "print", "port", "table", "part"})
+    supports = frozenset({"pwm", "tone", "print", "port", "table", "part",
+                          "keypad", "matrix"})
 
     """The 8051 families, which differ from each other only in three flags.
 
@@ -612,7 +989,8 @@ class Stc8051Target(Target):
     """
 
     def __init__(self, key: str, display: str, header: str,
-                 port_modes: bool, aux_1t_bit: bool, adc: bool, pwm: bool = False):
+                 port_modes: bool, aux_1t_bit: bool, adc: bool, pwm: bool = False,
+                 p5: bool = False):
         self.key = key
         self.display = display
         self.header = header        # the SDCC header with this family's registers
@@ -620,6 +998,7 @@ class Stc8051Target(Target):
         self.aux_1t_bit = aux_1t_bit  # AUXR.7 selects T0 1T mode and must be cleared
         self.adc = adc                # 10-bit ADC on P1 (STC12 only)
         self.pwm = pwm                # PCA capture/compare modules with PWM mode
+        self.p5 = p5                  # port 5 exists (STC15; P5.4/P5.5 on DIP-40)
         # Where UART1's baud rate comes from. The STC12 has a dedicated
         # baud-rate timer; the STC89 has to spend Timer 1 on it, which is the
         # same Timer 1 a TONE pin wants -- so on that family the two features
@@ -656,6 +1035,20 @@ class Stc8051Target(Target):
                 line, f"{where.upper()} is not a pin on the {self.display}; "
                       "use P0.0 to P4.7")
         port, bit = int(match.group(1)), int(match.group(2))
+
+        # P5 is an STC15 port (STC15-PERIPHERAL-MODEL.md par.3). On parts
+        # without it the pin does not exist; on the STC15 DIP-40 only
+        # P5.4 (RST-shared) and P5.5 are bonded -- the RBS15667 console's
+        # buzzer is P5.5, which is why this stopped being hypothetical.
+        if port == 5:
+            if not getattr(self, "p5", False):
+                raise PseudocodeError(
+                    line, f"P5.{bit} does not exist on the {self.display}; "
+                          "port 5 is an STC15 feature (STC15-PERIPHERAL-MODEL.md)")
+            if bit not in (4, 5):
+                raise PseudocodeError(
+                    line, f"P5.{bit} is not bonded on the DIP-40; "
+                          "only P5.4 and P5.5 reach pins")
 
         # Two names for one physical pin is always a mistake, and nothing
         # downstream would notice: program.pins is keyed by name, so both
@@ -749,9 +1142,39 @@ class Stc8051Target(Target):
 
     # ---- the shell ------------------------------------------------------
     def prologue(self, program):
+        supplement = []
+        if self.p5:
+            # The STC15 supplement -- everything the STC15 has that SDCC's
+            # stc12.h does not declare, emitted for EVERY STC15 program so
+            # the header story is complete, never patched per feature.
+            # Deduped against the shipped stc12.h (SDCC 4.5.0): it already
+            # carries P5/P5M0/P5M1 at the STC15's addresses but stops the
+            # sbits at P5_3. Addresses: STC15-PERIPHERAL-MODEL.md par.3.
+            # sb3-creator emits the identical block; this file is the
+            # reference implementation, so the two must not drift.
+            supplement = [
+                "/* STC15 supplement -- registers stc12.h lacks (STC15-PERIPHERAL-MODEL.md) */",
+                "__sbit __at (0xCC) P5_4;      /* DIP-40 pin 17, RST-shared */",
+                "__sbit __at (0xCD) P5_5;      /* DIP-40 pin 19 */",
+                "__sbit __at (0xCE) P5_6;      /* not bonded on DIP-40 */",
+                "__sbit __at (0xCF) P5_7;      /* not bonded on DIP-40 */",
+                "__sfr  __at (0xD6) T2H;       /* Timer 2 -- the UART1 baud source */",
+                "__sfr  __at (0xD7) T2L;",
+                "__sfr  __at (0xBA) P_SW2;     /* peripheral pin switch 2 */",
+                "__sfr  __at (0xAA) WKTCL;     /* wake-up timer */",
+                "__sfr  __at (0xAB) WKTCH;",
+                "__sfr  __at (0xDC) CCAPM2;    /* third PCA/CCP channel */",
+                "__sfr  __at (0xEC) CCAP2L;",
+                "__sfr  __at (0xFC) CCAP2H;",
+                "__sfr  __at (0xF4) PCA_PWM2;",
+                "#define P_SW1    AUXR1        /* STC15 name for 0xA2 */",
+                "#define INT_CLKO WAKE_CLKO    /* STC15 name for 0x8F */",
+                "",
+            ]
         return [
             f"#include <{self.header}>",
             "",
+            *supplement,
             f"#define FOSC_HZ {program.clock}UL",
             "",
             "/* Timer 0, mode 1, clocked at FOSC/12 -- accuracy depends only on",
@@ -762,10 +1185,280 @@ class Stc8051Target(Target):
             "",
         ]
 
+    # ---- MATRIX8X8: frame buffer, ISR scan hook, drawing helpers --------
+    #
+    # Packing (documented once, here): the 8x8 frame is BIT-PLANE packed,
+    # MATRIX_PLANES planes of 8 row-bytes. Plane p, row y is bw_scr_<name>[p*8+y];
+    # within a byte bit(7-x) is column x (bit7 = left). A pixel's brightness LEVEL
+    # is the little-endian bits across the planes -- 2 planes = 4 levels
+    # (MATRIX_LEVELS: 0 off .. 3 full), 16 bytes total. Widening MATRIX_PLANES to 4
+    # gives 16 levels / 32 bytes without touching any verb. Threshold rendering
+    # (this landing) lights a pixel iff its level != 0, which is exactly the OR of
+    # the plane bytes -- one instruction, no per-pixel loop, in the ISR.
+
+    def _matrix_state(self, matrices) -> list[str]:
+        """Buffer, cursor, dim and row-select table -- emitted BEFORE bw_tick,
+        which reads them. #defines are emitted once, not per matrix."""
+        out = [
+            "/* MATRIX8X8 brightness depth. 2 planes = 4 levels; the whole",
+            " * surface (buffer size, every verb) is written in terms of these,",
+            " * so widening to 4 planes / 16 levels is a one-line change. */",
+            "#define MATRIX_PLANES 2",
+            "#define MATRIX_LEVELS 4              /* 1 << MATRIX_PLANES */",
+            "",
+            "/* Clamp a (signed) level to 0..MATRIX_LEVELS-1. */",
+            "static unsigned char bw_scr_level(int v)",
+            "{",
+            "    if (v < 0) return 0;",
+            "    if (v > MATRIX_LEVELS - 1) return MATRIX_LEVELS - 1;",
+            "    return (unsigned char)v;",
+            "}",
+            "",
+        ]
+        for part in matrices:
+            n = part.name
+            out += [
+                f"/* {n}: 8x8 bit-plane frame buffer (see the packing note above).",
+                " * The Timer-0 ISR is the SOLE writer of the 595 and the column",
+                " * port; mainline only ever writes this RAM. */",
+                f"static unsigned char bw_scr_{n}[8 * MATRIX_PLANES];",
+                f"static unsigned char bw_scr_{n}_scan;                 "
+                "/* row cursor 0..7 */",
+                f"static unsigned char bw_scr_{n}_phase;                "
+                "/* BCM phase 0..MATRIX_LEVELS-2 */",
+                f"static unsigned char bw_scr_{n}_dim = MATRIX_LEVELS - 1;  "
+                "/* global brightness */",
+                "/* Row select, active-high, Q7 = top: row y is 595 output Q(7-y)",
+                " * == bit (0x80 >> y). A table so the ISR shifts no variable. */",
+                f"static const __code unsigned char bw_scr_{n}_rowbit[8] =",
+                "    { 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01 };",
+                "",
+            ]
+        return out
+
+    def _matrix_scan(self, part) -> list[str]:
+        """The per-tick scan, spliced into bw_tick AFTER bw_ms++. One row per
+        tick, table-driven, no mul/div."""
+        n = part.name
+        data, clock, latch = part.data.sfr, part.clock.sfr, part.latch.sfr
+        col = part.col_port.sfr
+        return [
+            "",
+            f"    /* MATRIX8X8 '{n}': advance one row (8 rows -> 125 Hz). The 595",
+            "     * selects the row active-high (Q7=top); columns are active-low. */",
+            "    {",
+            "        unsigned char bw_lit, bw_rb, bw_i;",
+            f"        {col} = 0xFF;                          "
+            "/* blank columns during the row change */",
+            f"        bw_rb = bw_scr_{n}_rowbit[bw_scr_{n}_scan];",
+            f"        {latch} = 0;",
+            "        for (bw_i = 0; bw_i < 8; bw_i++) {   /* clock the byte in, MSB first */",
+            f"            {data} = (bw_rb & 0x80) ? 1 : 0;",
+            "            bw_rb = (unsigned char)(bw_rb << 1);",
+            f"            {clock} = 1; {clock} = 0;",
+            "        }",
+            f"        {latch} = 1; {latch} = 0;              "
+            "/* transfer to the 595 outputs */",
+            "        /* Grayscale by bit-plane phase render (BCM). Over a cycle of",
+            "         * MATRIX_LEVELS-1 phases a pixel of level L is lit in L of them,",
+            "         * so its duty is L/(MATRIX_LEVELS-1): 0, 1/3, 2/3, 1 for the 4",
+            "         * levels. The phase mask says 'level > phase', read straight off",
+            "         * the two bit-planes p0 (LSB) and p1 (MSB):",
+            "         *   phase 0: level>=1 = p0 | p1",
+            "         *   phase 1: level>=2 = p1",
+            "         *   phase 2: level>=3 = p0 & p1",
+            f"         * The global dim caps every pixel at min(level, bw_scr_{n}_dim):",
+            "         * a phase renders only while dim > phase. Table-free, no mul/div;",
+            "         * still one row per tick. (The masks are 2-plane specific -- a",
+            "         * widen to 4 planes/16 levels generalizes them to a level compare.) */",
+            f"        if (bw_scr_{n}_dim > bw_scr_{n}_phase) {{",
+            f"            unsigned char bw_p0 = bw_scr_{n}[bw_scr_{n}_scan];",
+            f"            unsigned char bw_p1 = bw_scr_{n}[bw_scr_{n}_scan + 8];",
+            f"            if (bw_scr_{n}_phase == 0) bw_lit = (unsigned char)(bw_p0 | bw_p1);",
+            f"            else if (bw_scr_{n}_phase == 1) bw_lit = bw_p1;",
+            "            else bw_lit = (unsigned char)(bw_p0 & bw_p1);",
+            "        } else {",
+            "            bw_lit = 0;",
+            "        }",
+            f"        {col} = (unsigned char)~bw_lit;        "
+            "/* active-low columns: lit -> 0 */",
+            "        /* Advance the row; a completed frame steps the BCM phase. The",
+            "         * phase cycle is MATRIX_LEVELS-1 frames long (3 frames = 24 ms",
+            "         * = ~42 Hz grayscale cycle at 8 ms/frame; the anti-flicker timer",
+            "         * choice is a bench decision, this is the duty-correct reference). */",
+            f"        bw_scr_{n}_scan++;",
+            f"        if (bw_scr_{n}_scan >= 8) {{",
+            f"            bw_scr_{n}_scan = 0;",
+            f"            bw_scr_{n}_phase++;",
+            f"            if (bw_scr_{n}_phase >= MATRIX_LEVELS - 1) bw_scr_{n}_phase = 0;",
+            "        }",
+            "    }",
+        ]
+
+    def _matrix_helpers(self, part) -> list[str]:
+        """The drawing verbs' C helpers -- all write the RAM frame buffer only.
+        Emitted with the other per-part helpers, after bw_tick."""
+        n = part.name
+        return [
+            f"/* Drawing verbs for MATRIX8X8 '{n}'. All write the RAM frame buffer;",
+            " * the Timer-0 ISR scans it. x = column 0..7 (left->right), y = row",
+            " * 0..7 (top->bottom). bit7 of a row byte is the LEFT column, matching",
+            " * the image literals and the column wiring. */",
+            f"static void bw_scr_{n}_clear(void)",
+            "{",
+            "    unsigned char i;",
+            f"    for (i = 0; i < 8 * MATRIX_PLANES; i++) bw_scr_{n}[i] = 0;",
+            "}",
+            "",
+            f"static void bw_scr_{n}_setpx(unsigned char x, unsigned char y, "
+            "unsigned char level)",
+            "{",
+            "    unsigned char m, p;",
+            "    if (x > 7 || y > 7) return;",
+            "    m = (unsigned char)(0x80 >> x);            /* bit7 = left */",
+            "    for (p = 0; p < MATRIX_PLANES; p++) {",
+            f"        if (level & 1) bw_scr_{n}[y + (unsigned char)(p << 3)] |=  m;",
+            f"        else           bw_scr_{n}[y + (unsigned char)(p << 3)] &= "
+            "(unsigned char)~m;",
+            "        level = (unsigned char)(level >> 1);",
+            "    }",
+            "}",
+            "",
+            f"static unsigned char bw_scr_{n}_getpx(unsigned char x, unsigned char y)",
+            "{",
+            "    unsigned char m, p, level = 0;",
+            "    if (x > 7 || y > 7) return 0;",
+            "    m = (unsigned char)(0x80 >> x);",
+            "    for (p = 0; p < MATRIX_PLANES; p++)",
+            f"        if (bw_scr_{n}[y + (unsigned char)(p << 3)] & m) "
+            "level |= (unsigned char)(1 << p);",
+            "    return level;",
+            "}",
+            "",
+            "/* A whole row from an 8-bit image byte: bit7 = left, 1 -> full, 0 -> off. */",
+            f"static void bw_scr_{n}_row(unsigned char y, unsigned char bits)",
+            "{",
+            "    unsigned char p;",
+            "    if (y > 7) return;",
+            f"    for (p = 0; p < MATRIX_PLANES; p++) "
+            f"bw_scr_{n}[y + (unsigned char)(p << 3)] = bits;",
+            "}",
+            "",
+            "/* Blit 8 image bytes, top row first (the heart demo, one call). */",
+            f"static void bw_scr_{n}_image(const __code unsigned char *img)",
+            "{",
+            "    unsigned char y;",
+            f"    for (y = 0; y < 8; y++) bw_scr_{n}_row(y, img[y]);",
+            "}",
+            "",
+            "/* Shift the whole frame one pixel; the vacated edge clears.",
+            " * 0 left, 1 right, 2 up, 3 down. Left is toward x=0 == toward the",
+            " * MSB, so a row byte shifts left. */",
+            f"static void bw_scr_{n}_scroll(unsigned char dir)",
+            "{",
+            "    unsigned char p, y, base;",
+            "    for (p = 0; p < MATRIX_PLANES; p++) {",
+            "        base = (unsigned char)(p << 3);",
+            "        if (dir == 0)",
+            "            for (y = 0; y < 8; y++)",
+            f"                bw_scr_{n}[base + y] = (unsigned char)(bw_scr_{n}[base + y] << 1);",
+            "        else if (dir == 1)",
+            "            for (y = 0; y < 8; y++)",
+            f"                bw_scr_{n}[base + y] = (unsigned char)(bw_scr_{n}[base + y] >> 1);",
+            "        else if (dir == 2) {",
+            f"            for (y = 0; y < 7; y++) bw_scr_{n}[base + y] = bw_scr_{n}[base + y + 1];",
+            f"            bw_scr_{n}[base + 7] = 0;",
+            "        } else {",
+            f"            for (y = 7; y != 0; y--) bw_scr_{n}[base + y] = bw_scr_{n}[base + y - 1];",
+            f"            bw_scr_{n}[base] = 0;",
+            "        }",
+            "    }",
+            "}",
+            "",
+        ]
+
+    def _sevenseg_isr_lines(self, program):
+        lines = []
+        for part in program.parts.values():
+            if not isinstance(part, SevenSegPart):
+                continue
+            ss = part
+            a, b, c = ss.sel_pins
+            seg_write = f"P{ss.seg_port}"
+            lines += [
+                f"    /* {ss.name}: advance one digit */",
+                f"    {seg_write} = 0x00;           /* blank during switch */",
+                f"    {a.sfr} = bw_{ss.name}_cur & 0x01 ? 1 : 0;",
+                f"    {b.sfr} = bw_{ss.name}_cur & 0x02 ? 1 : 0;",
+                f"    {c.sfr} = bw_{ss.name}_cur & 0x04 ? 1 : 0;",
+            ]
+            if ss.common_anode:
+                lines.append(f"    {seg_write} = (unsigned char)"
+                             f"~bw_{ss.name}_fb[bw_{ss.name}_cur];")
+            else:
+                lines.append(f"    {seg_write} = "
+                             f"bw_{ss.name}_fb[bw_{ss.name}_cur];")
+            lines.append(
+                f"    bw_{ss.name}_cur = (bw_{ss.name}_cur + 1) & 0x07;")
+        return lines
+
+    def _ledbank_isr_lines(self, program):
+        lines = []
+        for part in program.parts.values():
+            if not isinstance(part, LedBankPart):
+                continue
+            lb = part
+            port_sfr = f"P{lb.led_port}"
+            if lb.active_low:
+                lines.append(f"    {port_sfr} = (unsigned char)"
+                             f"~bw_{lb.name}_shadow;  /* LEDs active low */")
+            else:
+                lines.append(f"    {port_sfr} = bw_{lb.name}_shadow;")
+        return lines
+
     def runtime(self, program, tasks):
         out = []
-        if tasks:
+        matrices = [p for p in program.parts.values() if isinstance(p, MatrixPart)]
+        has_sevenseg = program.has_sevenseg
+        has_ledbank = program.has_ledbank
+        needs_isr = tasks or matrices or has_sevenseg or has_ledbank
+
+        if matrices:
+            out += self._matrix_state(matrices)
+
+        if has_sevenseg:
             out += [
+                "/* 7-segment font: 0-9, A-F. Common-cathode segment encoding:",
+                " *   bit 0 = a (top), 1 = b (upper-right), 2 = c (lower-right),",
+                " *   3 = d (bottom), 4 = e (lower-left), 5 = f (upper-left),",
+                " *   6 = g (middle), 7 = dp (decimal point). */",
+                "static const __code unsigned char bw_7seg_font[16] = {",
+                "    0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07,",
+                "    0x7F, 0x6F, 0x77, 0x7C, 0x39, 0x5E, 0x79, 0x71",
+                "};",
+                "",
+            ]
+            for part in program.parts.values():
+                if isinstance(part, SevenSegPart):
+                    out += [
+                        f"/* {part.name}: 8-digit frame buffer and scan cursor. */",
+                        f"static unsigned char bw_{part.name}_fb[8];",
+                        f"static unsigned char bw_{part.name}_cur;",
+                        "",
+                    ]
+
+        if has_ledbank:
+            for part in program.parts.values():
+                if isinstance(part, LedBankPart):
+                    out += [
+                        f"/* {part.name}: LED shadow byte — the ISR is the sole "
+                        f"port writer. */",
+                        f"static unsigned char bw_{part.name}_shadow;",
+                        "",
+                    ]
+
+        if needs_isr:
+            tick = [
                 "/* One WHEN block = one cooperative task. Timer 0 interrupts",
                 " * every millisecond; tasks yield at every wait and at every",
                 " * loop iteration (Scratch's own scheduling contract), so no",
@@ -777,19 +1470,47 @@ class Stc8051Target(Target):
                 "    TL0 = (unsigned char)(T0_RELOAD & 0xFF);",
                 "    TH0 = (unsigned char)(T0_RELOAD >> 8);",
                 "    bw_ms++;",
-                "}",
-                "",
-                "/* A 16-bit read is not atomic on an 8051; hold the tick off. */",
-                "static unsigned int bw_now(void)",
-                "{",
-                "    unsigned int t;",
-                "    ET0 = 0;",
-                "    t = bw_ms;",
-                "    ET0 = 1;",
-                "    return t;",
+            ]
+            for part in matrices:
+                tick += self._matrix_scan(part)
+            tick += self._sevenseg_isr_lines(program)
+            tick += self._ledbank_isr_lines(program)
+            tick += [
                 "}",
                 "",
             ]
+            if tasks:
+                tick += [
+                    "/* A 16-bit read is not atomic on an 8051; hold the tick off. */",
+                    "static unsigned int bw_now(void)",
+                    "{",
+                    "    unsigned int t;",
+                    "    ET0 = 0;",
+                    "    t = bw_ms;",
+                    "    ET0 = 1;",
+                    "    return t;",
+                    "}",
+                    "",
+                ]
+            else:
+                # ISR parts without cooperative tasks: delay uses bw_ms counter.
+                tick += [
+                    "static void delay_ms(unsigned int ms)",
+                    "{",
+                    "    unsigned int start;",
+                    "    ET0 = 0; start = bw_ms; ET0 = 1;",
+                    "    while (ms--) {",
+                    "        for (;;) {",
+                    "            unsigned int now;",
+                    "            ET0 = 0; now = bw_ms; ET0 = 1;",
+                    "            if (now != start) break;",
+                    "        }",
+                    "        ET0 = 0; start = bw_ms; ET0 = 1;",
+                    "    }",
+                    "}",
+                    "",
+                ]
+            out += tick
         else:
             out += [
                 "static void delay_ms(unsigned int ms)",
@@ -822,6 +1543,105 @@ class Stc8051Target(Target):
                 "",
             ]
         for part in program.parts.values():
+            if isinstance(part, MatrixPart):
+                out += self._matrix_helpers(part)
+                continue
+            if isinstance(part, SevenSegPart):
+                n = part.name
+                out += [
+                    f"/* {n}: show a decimal number right-aligned across 8 digits. */",
+                    f"static void bw_{n}_show_number(int n)",
+                    "{",
+                    "    unsigned char i, neg = 0;",
+                    "    unsigned int u;",
+                    f"    for (i = 0; i < 8; i++) bw_{n}_fb[i] = 0x00;",
+                    "    if (n < 0) { neg = 1; u = (unsigned int)(-n); }",
+                    "    else       { u = (unsigned int)n; }",
+                    "    i = 7;",
+                    "    do {",
+                    f"        bw_{n}_fb[i] = bw_7seg_font[u % 10];",
+                    "        u /= 10;",
+                    "        if (i == 0) break;",
+                    "        i--;",
+                    "    } while (u);",
+                    "    if (neg && i > 0)",
+                    f"        bw_{n}_fb[i - 1] = 0x40;  /* minus = segment g */",
+                    "}",
+                    "",
+                    f"static void bw_{n}_show_digit(unsigned char d, unsigned char v)",
+                    "{",
+                    "    if (d > 7) return;",
+                    f"    bw_{n}_fb[d] = bw_7seg_font[v & 0x0F];",
+                    "}",
+                    "",
+                    f"static void bw_{n}_set_segments(unsigned char d, unsigned char segs)",
+                    "{",
+                    "    if (d > 7) return;",
+                    f"    bw_{n}_fb[d] = segs;",
+                    "}",
+                    "",
+                    f"static void bw_{n}_clear(void)",
+                    "{",
+                    "    unsigned char i;",
+                    f"    for (i = 0; i < 8; i++) bw_{n}_fb[i] = 0x00;",
+                    "}",
+                    "",
+                ]
+                continue
+            if isinstance(part, LedBankPart):
+                n = part.name
+                out += [
+                    f"/* {n}: LED helpers — writes go through the shadow byte. */",
+                    f"static void bw_{n}_on(unsigned char n)",
+                    "{",
+                    f"    if (n > 7) return;",
+                    f"    bw_{n}_shadow |= (unsigned char)(1 << n);",
+                    "}",
+                    "",
+                    f"static void bw_{n}_off(unsigned char n)",
+                    "{",
+                    f"    if (n > 7) return;",
+                    f"    bw_{n}_shadow &= (unsigned char)~(1 << n);",
+                    "}",
+                    "",
+                    f"static void bw_{n}_set(unsigned char pattern)",
+                    "{",
+                    f"    bw_{n}_shadow = pattern;",
+                    "}",
+                    "",
+                    f"static void bw_{n}_only(unsigned char n)",
+                    "{",
+                    f"    bw_{n}_shadow = (n > 7) ? 0 : (unsigned char)(1 << n);",
+                    "}",
+                    "",
+                ]
+                continue
+            if isinstance(part, KeypadPart):
+                out += [
+                    f"/* {part.name}: a 4x4 matrix keypad, sixteen keys for eight pins.",
+                    " *",
+                    " * The scan drives one row low and reads the columns — the",
+                    " * scanner verified on Prechin A2 silicon (06-matrix89 mapped it,",
+                    " * 09-keyshow89 consumed it). Idle rows sit quasi-high, so the",
+                    " * two-keys-in-one-column short is current-limited by the port's",
+                    " * weak pull-up. The nops respect the 1T core's 4-clock I/O",
+                    " * read-back (a 12T core just wastes two cycles). */",
+                    f"static signed char bw_part_{part.name}_read(void)",
+                    "{",
+                ]
+                for r, rpin in enumerate(part.rows):
+                    out.append(f"    {rpin.sfr} = 0;")
+                    out.append("    __asm__(\"nop\"); __asm__(\"nop\");")
+                    for c, cpin in enumerate(part.cols):
+                        out.append(f"    if (!{cpin.sfr}) {{ {rpin.sfr} = 1; "
+                                   f"return {r * 4 + c}; }}")
+                    out.append(f"    {rpin.sfr} = 1;")
+                out += [
+                    "    return -1;",
+                    "}",
+                    "",
+                ]
+                continue
             out += [
                 f"/* {part.name}: a 74HC595, eight outputs for three pins.",
                 " *",
@@ -1009,6 +1829,10 @@ class Stc8051Target(Target):
         for part in program.parts.values():
             for claimed in part.claimed:
                 outputs[claimed.port] = outputs.get(claimed.port, 0) | claimed.mask
+            if isinstance(part, SevenSegPart):
+                outputs[part.seg_port] = outputs.get(part.seg_port, 0) | 0xFF
+            if isinstance(part, LedBankPart):
+                outputs[part.led_port] = outputs.get(part.led_port, 0) | 0xFF
         if self.port_modes:
             for port in sorted(outputs):
                 mask = outputs[port]
@@ -1088,9 +1912,22 @@ class Stc8051Target(Target):
                 "    }"]
 
     def main(self, program, setup_lines, body_lines, task_names):
+        has_isr_parts = (program.has_matrix or program.has_sevenseg
+                         or program.has_ledbank)
         out = ["void main(void)", "{"] + setup_lines
         if task_names:
             out += self.start_scheduler(task_names)
+        elif has_isr_parts:
+            out += [
+                "",
+                "    TL0 = (unsigned char)(T0_RELOAD & 0xFF);",
+                "    TH0 = (unsigned char)(T0_RELOAD >> 8);",
+                "    ET0 = 1;                       /* millisecond tick */",
+                "    EA  = 1;",
+                "    TR0 = 1;",
+                "",
+            ]
+            out += body_lines
         else:
             out.append("")
             out += body_lines
@@ -1386,7 +2223,7 @@ AVR_328P_PINS = {
 }
 AVR_328P_BY_PORT = {location: label for label, location in AVR_328P_PINS.items()}
 
-AVR_PIN_RE = re.compile(r"^(?:([da])(\d{1,2})|p([b-d])(\d))$", re.I)
+AVR_PIN_RE = re.compile(r"^(?:([da])(\d{1,2})|p([a-l])(\d))$", re.I)
 
 # Timer 0 prescalers, smallest first, with their CS02:CS00 bits. The tick wants
 # an EXACT millisecond, so the emitter picks the first prescaler that divides
@@ -1844,8 +2681,44 @@ class AvrTarget(Target):
         return out + ["}", ""]
 
 
-def _stc(key, display, header, port_modes, aux_1t_bit, adc, pwm=False):
-    return Stc8051Target(key, display, header, port_modes, aux_1t_bit, adc, pwm)
+def _stc(key, display, header, port_modes, aux_1t_bit, adc, pwm=False, p5=False):
+    return Stc8051Target(key, display, header, port_modes, aux_1t_bit, adc, pwm, p5)
+
+
+class PortBitAvrTarget(AvrTarget):
+    """AVR or 6502 parts that use port-letter+bit pin naming (PA0, PB7).
+
+    Unlike AvrTarget (which maps D0-D13/A0-A5 to the ATmega328P pinout),
+    this target accepts any port letter A-L with any bit 0-7 directly.
+    Used for ATtiny88, ATtiny85, eater6502.
+    """
+
+    def __init__(self, key: str, display: str, mcu: str, flash: int,
+                 ports: str = "ABCD", default_clock: int = 8000000):
+        super().__init__(key, display, mcu, flash)
+        self._ports = frozenset(ports.upper())
+        self.default_clock = default_clock
+
+    def resolve_pin(self, program, name, where, direction, active_low, line):
+        match = AVR_PIN_RE.match(where)
+        if not match:
+            raise PseudocodeError(
+                line, f"{where.upper()} is not a pin on the {self.display}; "
+                      f"use P{'/P'.join(sorted(self._ports))}0-7")
+        kind, number, port, bit = match.groups()
+        if kind:
+            raise PseudocodeError(
+                line, f"{self.display} uses port names (PB0, PD7), "
+                      f"not Arduino numbers ({where.upper()})")
+        port = port.upper()
+        bit = int(bit)
+        if port not in self._ports:
+            raise PseudocodeError(
+                line, f"Port {port} does not exist on the {self.display}; "
+                      f"known ports: {', '.join(sorted(self._ports))}")
+        label = f"P{port}{bit}"
+        channel = None
+        return AvrPin(name, label, direction, active_low, port, bit, channel)
 
 
 TARGETS = {
@@ -1859,7 +2732,7 @@ TARGETS = {
     # at 0xD6/0xD7, S3CON...) are registers this generator never writes.
     # Keil TRANSLATION of arbitrary STC15 code is a different problem with
     # its own family shim.
-    "stc15f2k60s2": _stc("stc15f2k60s2", "STC15F2K60S2", "stc12.h", True, True, True, True),
+    "stc15f2k60s2": _stc("stc15f2k60s2", "STC15F2K60S2", "stc12.h", True, True, True, True, p5=True),
 
     # Both are ATmega328P boards and differ here only in how many analog pins
     # the package brings out: the Uno's header stops at A5, the Nano carries
@@ -1905,6 +2778,21 @@ class Program:
     when_hats: list = field(default_factory=list)
     body: list = field(default_factory=list)
     locals_: set = field(default_factory=set)
+
+    @property
+    def has_matrix(self) -> bool:
+        """A MATRIX8X8 refreshes itself in the Timer-0 ISR, so its presence
+        forces the cooperative-scheduler code path (the ISR that scans it)
+        even for a single WHEN block that would otherwise run straight-line."""
+        return any(isinstance(p, MatrixPart) for p in self.parts.values())
+
+    @property
+    def has_sevenseg(self) -> bool:
+        return any(isinstance(p, SevenSegPart) for p in self.parts.values())
+
+    @property
+    def has_ledbank(self) -> bool:
+        return any(isinstance(p, LedBankPart) for p in self.parts.values())
 
     @property
     def uses_adc(self) -> bool:
@@ -1967,7 +2855,7 @@ def read_lines(source: str) -> list[Line]:
 
 TOKEN_RE = re.compile(r"""\s*(?:
       (?P<number>0[xX][0-9A-Fa-f]+|0[bB][01]+|\d+\.\d+|\d+)
-    | (?P<op><=|>=|!=|<>|==|[-+*/%()<>=\[\]])
+    | (?P<op><=|>=|!=|<>|==|[-+*/%()<>=\[\],])
     | (?P<word>[A-Za-z_][A-Za-z0-9_]*)
     )""", re.X)
 
@@ -2002,12 +2890,23 @@ class ExprParser:
     def parse(self, level: int = 0) -> Expr:
         if level >= len(PRECEDENCE):
             return self.atom()
+        # `not` binds looser than comparisons and tighter than and/or —
+        # Python's precedence, because `IF not k = shown` must mean
+        # `not (k = shown)`. The old atom-level `not` parsed it as
+        # `(not k) = shown`, which compared a boolean to a number and
+        # made a running program silently do nothing (found on the A2
+        # bench, 14-a2-keyshow, 2026-08-17). atom() keeps its own `not`
+        # for the degenerate spots this level never reaches.
+        if (level == NOT_LEVEL and self.peek() is not None
+                and self.peek().lower() == "not"):
+            self.take()
+            return Unary("not", self.parse(level))
         node = self.parse(level + 1)
         while True:
             token = self.peek()
             if token is None:
                 return node
-            op = SYNONYM.get(token, token.lower())
+            op = SYNONYM.get(token, WORD_OPS.get(token.lower(), token.lower()))
             if op not in PRECEDENCE[level]:
                 return node
             self.take()
@@ -2026,6 +2925,76 @@ class ExprParser:
             return Unary("-", self.atom())
         if token.lower() == "not":
             return Unary("not", self.atom())
+        if token.lower() == "read":
+            # sb3-creator's dialect spells a pin read as `read <pin>`; ours
+            # is the bare pin name. The oracle accepts what the other
+            # implementation emits, or parity is a fiction: `read x` is
+            # exactly PinRef(x) (polarity applied like any pin read).
+            nxt = self.peek()
+            if nxt is not None and nxt.lower() in self.program.pins:
+                self.take()
+                return PinRef(nxt.lower())
+            # `read` not followed by a pin falls through to being a
+            # variable name, as before.
+            if NAME_RE.match(token):
+                if token not in self.program.locals_ and token not in self.program.variables:
+                    self.program.variables.append(token)
+                return Var(token)
+        if token.lower() == "a" and [t.lower() for t in
+                self.tokens[self.pos:self.pos + 3]] == ["key", "is", "pressed"]:
+            # `a key is pressed` -- sugar over the sole KEYPAD4X4, desugared
+            # to `<pad> >= 0` so no new AST shape (and no new lowering in any
+            # back end) is needed. sb3-creator prints the desugared form back,
+            # so the canonical fixed point is `keys >= 0`.
+            self.pos += 3
+            pad = sole_keypad(self.program, self.line)
+            return Binary(">=", KeypadRef(pad.name), Num(0))
+        if (token.lower() == "key"
+                and self.pos + 2 < len(self.tokens)
+                and re.fullmatch(r"\d+", self.tokens[self.pos])
+                and self.tokens[self.pos + 1].lower() == "is"
+                and self.tokens[self.pos + 2].lower() in ("pressed", "released")):
+            # `key N is pressed` / `is released` -- one specific key held (or
+            # not). Guarded by the full four-token shape so a VARIABLE named
+            # `key` (the keyshow example has one) still parses as a variable.
+            n = int(self.take())
+            self.take()
+            state = self.take().lower()
+            if n > 15:
+                raise PseudocodeError(
+                    self.line, f"key {n} does not exist; a KEYPAD4X4 has keys 0..15")
+            pad = sole_keypad(self.program, self.line)
+            ref = Binary("=", KeypadRef(pad.name), Num(n))
+            return Unary("not", ref) if state == "released" else ref
+        if token.lower() == "pixel":
+            # `pixel X Y is on` / `is off` -- a boolean over the sole MATRIX8X8.
+            # X and Y are atoms (a number, a name or a parenthesised group), so
+            # the trailing `is on` is not swallowed as part of them.
+            part = sole_matrix(self.program, self.line)
+            x = self.atom()
+            y = self.atom()
+            ref = MatrixPixelRef(part.name, x, y)
+            nxt = self.peek()
+            if nxt is not None and nxt.lower() == "is":
+                self.take()
+                state = self.take()
+                if state is None or state.lower() not in ("on", "off"):
+                    raise PseudocodeError(
+                        self.line, "expected 'on' or 'off' after 'pixel X Y is'")
+                return Unary("not", ref) if state.lower() == "off" else ref
+            return ref
+        if token.lower() == "randint" and self.peek() == "(":
+            self.take()  # consume '('
+            low = self.parse()
+            if self.peek() == ",":
+                self.take()
+            high = self.parse()
+            if self.take() != ")":
+                raise PseudocodeError(self.line, "missing ')' after randint")
+            return Randint(low, high)
+        if token.lower() == "controller" and self.peek() is not None and self.peek().lower() in ("dx", "dy"):
+            axis = self.take().lower()
+            return ControllerAxis(axis)
         if re.fullmatch(r"0[xX][0-9A-Fa-f]+", token):
             return Num(float(int(token, 16)))
         if re.fullmatch(r"0[bB][01]+", token):
@@ -2042,6 +3011,9 @@ class ExprParser:
             return Num(0)
         if lowered in self.program.ports:
             return PortRef(lowered)
+        if (lowered in self.program.parts
+                and isinstance(self.program.parts[lowered], KeypadPart)):
+            return KeypadRef(lowered)
         if lowered in self.program.tables:
             if self.take() != "[":
                 raise PseudocodeError(
@@ -2111,6 +3083,14 @@ def parse_block(lines: list[Line], index: int, parent_indent: int,
             body.append(Repeat(count, inner))
             continue
 
+        arc_overlap = re.fullmatch(
+            r"arcade\s+on\s+overlap\s+(\w+)\s+(\w+)\s*:", text, re.I)
+        if arc_overlap:
+            inner, index = parse_block(lines, index + 1, indent, program)
+            body.append(ArcadeOnOverlap(arc_overlap.group(1),
+                                         arc_overlap.group(2), inner))
+            continue
+
         conditional = re.fullmatch(r"if\s+(.+?)\s+then\s*:", lowered)
         if conditional:
             raw = text[len("if"):].strip()
@@ -2142,6 +3122,121 @@ def require(program: Program, feature: str, line: int, what: str) -> None:
                                       if feature in t.supports})))
 
 
+def sole_matrix(program: Program, line: int) -> "MatrixPart":
+    """The one MATRIX8X8 in the program, for the verbs that do not name it
+    (`light pixel`, `draw row`). Naming which screen would be noise on a board
+    with a single matrix, which is every A2-class board."""
+    screens = [p for p in program.parts.values() if isinstance(p, MatrixPart)]
+    if not screens:
+        raise PseudocodeError(
+            line, "no MATRIX8X8 screen is declared; add a "
+                  "'PART <name> = MATRIX8X8 ROWS 74HC595 ... COLUMNS <port>' line")
+    if len(screens) > 1:
+        raise PseudocodeError(
+            line, "several MATRIX8X8 screens are declared; this verb does not say "
+                  "which one to draw on")
+    return screens[0]
+
+
+def sole_keypad(program: Program, line: int) -> "KeypadPart":
+    """The one KEYPAD4X4, for the phrases that do not name it (`WHEN key N
+    pressed`, `a key is pressed`). Same rule as sole_matrix: every A2-class
+    board has exactly one keypad, so naming it would be noise."""
+    pads = [p for p in program.parts.values() if isinstance(p, KeypadPart)]
+    if not pads:
+        raise PseudocodeError(
+            line, "no KEYPAD4X4 is declared; add a "
+                  "'PART <name> = KEYPAD4X4 ROWS ... COLS ...' line")
+    if len(pads) > 1:
+        raise PseudocodeError(
+            line, "several KEYPAD4X4 parts are declared; this phrase does not "
+                  "say which one it means")
+    return pads[0]
+
+
+def _named_matrix(program: Program, name: str, line: int):
+    """The MATRIX8X8 called `name`, or None if `name` is not a matrix. Used by
+    the verbs that DO carry the screen name (clear/scroll/show image/brightness)."""
+    part = program.parts.get(name.lower())
+    return part if isinstance(part, MatrixPart) else None
+
+
+def matrix_statement(text: str, program: Program, line: int):
+    """Parse a MATRIX8X8 drawing verb, or return None if this is not one.
+
+    The pixel/row verbs address the sole screen implicitly; clear/scroll/show
+    image/brightness carry its name. Coordinates and the byte/level are ordinary
+    expressions."""
+    lowered = text.lower()
+
+    px = re.fullmatch(r"(light|clear)\s+pixel\s+(\S+)\s+(\S+)", text, re.I)
+    if px:
+        part = sole_matrix(program, line)
+        return MatrixSetPixel(part.name,
+                              expression(px.group(2), program, line),
+                              expression(px.group(3), program, line),
+                              style=px.group(1).lower())
+
+    onoff = re.fullmatch(r"set\s+pixel\s+(\S+)\s+(\S+)\s+to\s+(on|off)", text, re.I)
+    if onoff:
+        part = sole_matrix(program, line)
+        return MatrixSetPixel(part.name,
+                              expression(onoff.group(1), program, line),
+                              expression(onoff.group(2), program, line),
+                              style=onoff.group(3).lower())
+
+    bright = re.fullmatch(r"set\s+pixel\s+(\S+)\s+(\S+)\s+brightness\s+(.+)",
+                          text, re.I)
+    if bright:
+        part = sole_matrix(program, line)
+        return MatrixSetPixel(part.name,
+                              expression(bright.group(1), program, line),
+                              expression(bright.group(2), program, line),
+                              style="brightness",
+                              level=expression(bright.group(3), program, line))
+
+    row = re.fullmatch(r"draw\s+row\s+(\S+)\s*=\s*(.+)", text, re.I)
+    if row:
+        part = sole_matrix(program, line)
+        return MatrixDrawRow(part.name,
+                             expression(row.group(1), program, line),
+                             expression(row.group(2), program, line))
+
+    image = re.fullmatch(r"show\s+image\s+(\w+)\s+on\s+(\w+)", text, re.I)
+    if image:
+        table, name = image.group(1), image.group(2)
+        part = _named_matrix(program, name, line)
+        if part is None:
+            raise PseudocodeError(line, f"{name!r} is not a MATRIX8X8 screen")
+        if table.lower() not in program.tables:
+            raise PseudocodeError(
+                line, f"{table!r} is not a TABLE; 'show image' blits an 8-byte "
+                      f"TABLE onto the screen")
+        return MatrixImage(part.name, table.lower())
+
+    scroll = re.fullmatch(r"scroll\s+(\w+)\s+(left|right|up|down)", text, re.I)
+    if scroll:
+        part = _named_matrix(program, scroll.group(1), line)
+        if part is None:
+            return None
+        return MatrixScroll(part.name, scroll.group(2).lower())
+
+    sb = re.fullmatch(r"set\s+(\w+)\s+brightness\s+(.+)", text, re.I)
+    if sb:
+        part = _named_matrix(program, sb.group(1), line)
+        if part is not None:
+            return MatrixBrightness(part.name,
+                                    expression(sb.group(2), program, line))
+
+    clr = re.fullmatch(r"clear\s+(\w+)", text, re.I)
+    if clr:
+        part = _named_matrix(program, clr.group(1), line)
+        if part is not None:
+            return MatrixClear(part.name)
+
+    return None
+
+
 def simple_statement(text: str, program: Program, line: int) -> Stmt:
     lowered = text.lower()
 
@@ -2168,6 +3263,227 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
         unit = "ms" if wait.group(2).startswith("m") else "seconds"
         return Wait(expression(wait.group(1), program, line), unit, line)
 
+    drawn = matrix_statement(text, program, line)
+    if drawn is not None:
+        return drawn
+
+    # ---- Arcade game-engine verbs ----
+    arc_create = re.fullmatch(r"arcade\s+create\s+(\w+)\s+kind\s+(\w+)", text, re.I)
+    if arc_create:
+        return ArcadeCreate(arc_create.group(1).lower(), arc_create.group(2))
+
+    arc_place = re.match(r"arcade\s+place\s+(\w+)\s+x\s+(.+?)\s+y\s+(.+)$", text, re.I)
+    if arc_place:
+        return ArcadePlace(arc_place.group(1).lower(),
+                           expression(arc_place.group(2), program, line),
+                           expression(arc_place.group(3), program, line))
+
+    arc_move = re.match(r"arcade\s+move\s+(\w+)\s+vx\s+(.+?)\s+vy\s+(.+)$", text, re.I)
+    if arc_move:
+        return ArcadeMove(arc_move.group(1).lower(),
+                          expression(arc_move.group(2), program, line),
+                          expression(arc_move.group(3), program, line))
+
+    arc_flag = re.fullmatch(
+        r"arcade\s+set\s+(\w+)\s+(stay\s+in\s+screen|destroy\s+on\s+wall)", text, re.I)
+    if arc_flag:
+        flag = "stayinscreen" if "stay" in arc_flag.group(2).lower() else "destroyonwall"
+        return ArcadeSetFlag(arc_flag.group(1).lower(), flag)
+
+    arc_score = re.match(r"arcade\s+score\s+add\s+(.+)$", text, re.I)
+    if arc_score:
+        return ArcadeScore(expression(arc_score.group(1), program, line))
+
+    arc_over = re.fullmatch(r"arcade\s+game\s+over\s+(win|lose)", text, re.I)
+    if arc_over:
+        return ArcadeGameOver(win=(arc_over.group(1).lower() == "win"))
+
+    arc_tilemap = re.fullmatch(
+        r"arcade\s+tilemap\s+(\w+)\s+cols\s+(\S+)\s+rows\s+(\S+)\s+tile\s+(\S+)",
+        text, re.I)
+    if arc_tilemap:
+        return ArcadeTilemap(arc_tilemap.group(1).lower(),
+                             expression(arc_tilemap.group(2), program, line),
+                             expression(arc_tilemap.group(3), program, line),
+                             expression(arc_tilemap.group(4), program, line))
+
+    arc_settile = re.match(
+        r"arcade\s+set\s+tile\s+(\w+)\s+col\s+(\S+)\s+row\s+(\S+)\s+to\s+(.+)$",
+        text, re.I)
+    if arc_settile:
+        return ArcadeSetTile(arc_settile.group(1).lower(),
+                             expression(arc_settile.group(2), program, line),
+                             expression(arc_settile.group(3), program, line),
+                             expression(arc_settile.group(4), program, line))
+
+    arc_wall = re.fullmatch(
+        r"arcade\s+set\s+wall\s+(\w+)\s+tile\s+(\S+)", text, re.I)
+    if arc_wall:
+        return ArcadeTileWall(arc_wall.group(1).lower(),
+                              expression(arc_wall.group(2), program, line))
+
+    arc_frame = re.match(
+        r"arcade\s+set\s+frame\s+(\w+)\s+to\s+(.+)$", text, re.I)
+    if arc_frame:
+        return ArcadeSetFrame(arc_frame.group(1).lower(),
+                              expression(arc_frame.group(2), program, line))
+
+    # ---- LCD verbs ----
+    lcd_print_s = re.match(r'lcd\s+print\s+"([^"]*)"\s+on\s+(\w+)$', text, re.I)
+    if lcd_print_s:
+        return LcdPrint(lcd_print_s.group(2).lower(), text=lcd_print_s.group(1))
+
+    lcd_print_v = re.match(r"lcd\s+print\s+(.+?)\s+on\s+(\w+)$", text, re.I)
+    if lcd_print_v:
+        return LcdPrint(lcd_print_v.group(2).lower(),
+                        value=expression(lcd_print_v.group(1), program, line))
+
+    lcd_cursor = re.match(r"lcd\s+set\s+cursor\s+(\S+)\s+(\S+)\s+on\s+(\w+)$", text, re.I)
+    if lcd_cursor:
+        return LcdCursor(lcd_cursor.group(3).lower(),
+                         expression(lcd_cursor.group(1), program, line),
+                         expression(lcd_cursor.group(2), program, line))
+
+    lcd_clear = re.fullmatch(r"lcd\s+clear\s+(\w+)", text, re.I)
+    if lcd_clear:
+        return LcdClear(lcd_clear.group(1).lower())
+
+    # ---- TFT verbs ----
+    tft_pixel = re.match(
+        r"tft\s+pixel\s+(\S+)\s+(\S+)\s+R\s+(\S+)\s+G\s+(\S+)\s+B\s+(\S+)\s+on\s+(\w+)$",
+        text, re.I)
+    if tft_pixel:
+        g = tft_pixel.groups()
+        return TftPixel(g[5].lower(),
+                        expression(g[0], program, line),
+                        expression(g[1], program, line),
+                        expression(g[2], program, line),
+                        expression(g[3], program, line),
+                        expression(g[4], program, line))
+
+    tft_fill = re.match(
+        r"tft\s+fill\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+R\s+(\S+)\s+G\s+(\S+)\s+B\s+(\S+)\s+on\s+(\w+)$",
+        text, re.I)
+    if tft_fill:
+        g = tft_fill.groups()
+        return TftFill(g[7].lower(),
+                       expression(g[0], program, line),
+                       expression(g[1], program, line),
+                       expression(g[2], program, line),
+                       expression(g[3], program, line),
+                       expression(g[4], program, line),
+                       expression(g[5], program, line),
+                       expression(g[6], program, line))
+
+    tft_clear = re.fullmatch(r"tft\s+clear\s+(\w+)", text, re.I)
+    if tft_clear:
+        return TftClear(tft_clear.group(1).lower())
+
+    tft_print_s = re.match(r'tft\s+print\s+"([^"]*)"\s+on\s+(\w+)$', text, re.I)
+    if tft_print_s:
+        return TftPrint(tft_print_s.group(2).lower(), text=tft_print_s.group(1))
+
+    tft_print_v = re.match(r"tft\s+print\s+(.+?)\s+on\s+(\w+)$", text, re.I)
+    if tft_print_v:
+        return TftPrint(tft_print_v.group(2).lower(),
+                        value=expression(tft_print_v.group(1), program, line))
+
+    tft_cursor = re.match(r"tft\s+set\s+cursor\s+(\S+)\s+(\S+)\s+on\s+(\w+)$", text, re.I)
+    if tft_cursor:
+        return TftCursor(tft_cursor.group(3).lower(),
+                         expression(tft_cursor.group(1), program, line),
+                         expression(tft_cursor.group(2), program, line))
+
+    # ---- OLED verbs ----
+    oled_pixel = re.match(
+        r"oled\s+pixel\s+(\S+)\s+(\S+)\s+(\S+)\s+on\s+(\w+)$", text, re.I)
+    if oled_pixel:
+        return OledPixel(oled_pixel.group(4).lower(),
+                         expression(oled_pixel.group(1), program, line),
+                         expression(oled_pixel.group(2), program, line),
+                         expression(oled_pixel.group(3), program, line))
+
+    oled_clear = re.fullmatch(r"oled\s+clear\s+(\w+)", text, re.I)
+    if oled_clear:
+        return OledClear(oled_clear.group(1).lower())
+
+    oled_print_s = re.match(r'oled\s+print\s+"([^"]*)"\s+on\s+(\w+)$', text, re.I)
+    if oled_print_s:
+        return OledPrint(oled_print_s.group(2).lower(), text=oled_print_s.group(1))
+
+    oled_print_v = re.match(r"oled\s+print\s+(.+?)\s+on\s+(\w+)$", text, re.I)
+    if oled_print_v:
+        return OledPrint(oled_print_v.group(2).lower(),
+                         value=expression(oled_print_v.group(1), program, line))
+
+    oled_cursor = re.match(r"oled\s+set\s+cursor\s+(\S+)\s+(\S+)\s+on\s+(\w+)$", text, re.I)
+    if oled_cursor:
+        return OledCursor(oled_cursor.group(3).lower(),
+                          expression(oled_cursor.group(1), program, line),
+                          expression(oled_cursor.group(2), program, line))
+
+    # ---- RGB LED verb ----
+    rgb_set = re.match(
+        r"set\s+(\w+)\s+colour\s+to\s+R\s+(\S+)\s+G\s+(\S+)\s+B\s+(\S+)$", text, re.I)
+    if rgb_set:
+        return RgbSet(rgb_set.group(1).lower(),
+                      expression(rgb_set.group(2), program, line),
+                      expression(rgb_set.group(3), program, line),
+                      expression(rgb_set.group(4), program, line))
+
+    # ---- SEVENSEG8 verbs ----
+    show_num = re.match(r"show\s+number\s+(.+?)\s+on\s+(\w+)$", text, re.I)
+    if show_num and isinstance(program.parts.get(show_num.group(2).lower()),
+                               SevenSegPart):
+        return ShowNumber(show_num.group(2).lower(),
+                          expression(show_num.group(1), program, line))
+
+    show_dig = re.match(r"show\s+digit\s+(.+?)\s*=\s*value\s+(.+?)\s+on\s+(\w+)$",
+                        text, re.I)
+    if show_dig and isinstance(program.parts.get(show_dig.group(3).lower()),
+                               SevenSegPart):
+        return ShowDigit(show_dig.group(3).lower(),
+                         expression(show_dig.group(1), program, line),
+                         expression(show_dig.group(2), program, line))
+
+    set_seg = re.match(r"set\s+digit\s+(.+?)\s+to\s+segments\s+(.+?)\s+on\s+(\w+)$",
+                       text, re.I)
+    if set_seg and isinstance(program.parts.get(set_seg.group(3).lower()),
+                              SevenSegPart):
+        return SetDigitSegments(set_seg.group(3).lower(),
+                                expression(set_seg.group(1), program, line),
+                                expression(set_seg.group(2), program, line))
+
+    clear_disp = re.fullmatch(r"clear\s+(\w+)", lowered)
+    if clear_disp and isinstance(program.parts.get(clear_disp.group(1)),
+                                 SevenSegPart):
+        return ClearDisplay(clear_disp.group(1))
+
+    # ---- LEDBANK8 verbs ----
+    led_on = re.match(r"turn\s+on\s+led\s+(.+?)\s+on\s+(\w+)$", text, re.I)
+    if led_on and isinstance(program.parts.get(led_on.group(2).lower()),
+                             LedBankPart):
+        return TurnOnLed(led_on.group(2).lower(),
+                         expression(led_on.group(1), program, line))
+
+    led_off = re.match(r"turn\s+off\s+led\s+(.+?)\s+on\s+(\w+)$", text, re.I)
+    if led_off and isinstance(program.parts.get(led_off.group(2).lower()),
+                              LedBankPart):
+        return TurnOffLed(led_off.group(2).lower(),
+                          expression(led_off.group(1), program, line))
+
+    set_leds = re.match(r"set\s+leds\s+to\s+(.+?)\s+on\s+(\w+)$", text, re.I)
+    if set_leds and isinstance(program.parts.get(set_leds.group(2).lower()),
+                               LedBankPart):
+        return SetLeds(set_leds.group(2).lower(),
+                       expression(set_leds.group(1), program, line))
+
+    only_led = re.match(r"light\s+only\s+led\s+(.+?)\s+on\s+(\w+)$", text, re.I)
+    if only_led and isinstance(program.parts.get(only_led.group(2).lower()),
+                               LedBankPart):
+        return LightOnlyLed(only_led.group(2).lower(),
+                            expression(only_led.group(1), program, line))
+
     turn = re.fullmatch(r"turn\s+(on|off)\s+(\w+)", lowered)
     if turn:
         pin = program.pins[output_pin(turn.group(2)).lower()]
@@ -2186,6 +3502,10 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
 
     into = re.match(r"set\s+(\w+)\s+to\s+(.+)$", text.strip(), re.I)
     if into and into.group(1).lower() in program.parts:
+        if isinstance(program.parts[into.group(1).lower()], KeypadPart):
+            raise PseudocodeError(
+                line, f"{into.group(1)!r} is a keypad and cannot be written; "
+                      f"read it in an expression (`set k to {into.group(1)}`)")
         return SetPart(into.group(1).lower(),
                        expression(into.group(2), program, line))
     if into and into.group(1).lower() in program.ports:
@@ -2314,12 +3634,33 @@ WHEN_RE = re.compile(r"when\s+(started|flag\s+clicked|powered\s+on)\s*:", re.I)
 # stop being available; the millisecond tick is already a debounce interval;
 # and polling is the same state-machine shape the scheduler already has.
 # docs/PARTS-TO-BLOCKS.md in the lab repo has the full reasoning.
+# `WHEN key 5 pressed:` -- an edge hat on the sole KEYPAD4X4. Polled like
+# the pin hats, but through a shared DEBOUNCED scan: one poll task per
+# keypad reads the matrix once per dispatch, and a key must be seen in
+# two consecutive scans before it counts (a scan mid-bounce reads -1 or
+# a neighbour for one pass; two agreeing reads 1 ms apart do not).
+WHEN_KEY_RE = re.compile(r"when\s+key\s+(\d+)\s+(pressed|released)\s*:", re.I)
 WHEN_PIN_RE = re.compile(r"when\s+(\w+)\s+(pressed|released)\s*:", re.I)
 PIN_RE = re.compile(r"pin\s+(\w+)\s*=\s*(\S+)\s+(output|input|analog|pwm|tone)"
                     r"(?:\s+active\s+(low|high))?", re.I)
+KEYPAD_RE = re.compile(
+    r"part\s+(\w+)\s*=\s*keypad4x4\s+"
+    r"rows\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+"
+    r"cols\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$", re.I)
+MATRIX8X8_RE = re.compile(
+    r"part\s+(\w+)\s*=\s*matrix8x8\s+"
+    r"rows\s+74hc595\s+data\s+(\S+)\s+clock\s+(\S+)\s+latch\s+(\S+)\s+"
+    r"columns\s+(\S+)\s*$", re.I)
 PART_RE = re.compile(r"part\s+(\w+)\s*=\s*74hc595\s+data\s+(\S+)\s+"
                      r"clock\s+(\S+)\s+latch\s+(\S+)"
                      r"(?:\s+active\s+(low|high))?", re.I)
+SEVENSEG_RE = re.compile(
+    r"part\s+(\w+)\s*=\s*sevenseg8\s+segments\s+(\S+)\s+"
+    r"select\s+(\S+)\s+(\S+)\s+(\S+)"
+    r"(?:\s+common\s+(cathode|anode))?", re.I)
+LEDBANK_RE = re.compile(
+    r"part\s+(\w+)\s*=\s*ledbank8\s+on\s+(\S+)"
+    r"(?:\s+active\s+(low|high))?", re.I)
 PORT_DECL_RE = re.compile(r"port\s+(\w+)\s*=\s*(\S+)\s+(output|input)"
                           r"(?:\s+active\s+(low|high))?", re.I)
 TABLE_RE = re.compile(r"table\s+(\w+)\s*=\s*(.+)$", re.I)
@@ -2339,7 +3680,7 @@ def parse(source: str) -> Program:
     program = Program()
     index = 0
 
-    device = re.fullmatch(r"device\s+([\w-]+)\s*:", lines[0].text, re.I)
+    device = re.fullmatch(r"device\s+([\w-]+)\s*:?", lines[0].text, re.I)
     if device:
         program.part = device.group(1).lower()
         if program.part in TARGETS:
@@ -2379,6 +3720,99 @@ def parse(source: str) -> Program:
         if clock and not started:
             value = int(clock.group(1).replace("_", ""))
             program.clock = value * 1_000_000 if clock.group(2) == "mhz" else value
+            index += 1
+            continue
+
+        keypad = KEYPAD_RE.fullmatch(lowered)
+        if keypad and not started:
+            require(program, "keypad", line.number, "a KEYPAD4X4 PART")
+            name = keypad.group(1)
+            if name in program.parts or name in program.ports or name in program.pins:
+                raise PseudocodeError(line.number, f"{name!r} declared twice")
+            scratch = Program(part=program.part)
+            tokens = keypad.groups()[1:]
+            roles = ([f"row{i}" for i in range(4)]
+                     + [f"col{i}" for i in range(4)])
+            # rows scan as outputs, cols read as inputs; resolved against a
+            # scratch program for the same reason the 595's pins are
+            claims = [program.target.resolve_pin(
+                          scratch, f"{name}_{role}", token,
+                          "output" if role.startswith("row") else "input",
+                          False, line.number)
+                      for role, token in zip(roles, tokens)]
+            if len({pin.where for pin in claims}) != 8:
+                raise PseudocodeError(
+                    line.number, f"{name!r} names the same pin twice; a 4x4 "
+                                 f"keypad claims eight different pins")
+            for claimed in claims:
+                for other in program.pins.values():
+                    if other.where == claimed.where:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is already declared as "
+                                         f"{other.name!r}; a PART claims its pins")
+                for whole in program.ports.values():
+                    if getattr(claimed, "port", None) == whole.port:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is inside the whole port "
+                                         f"{whole.name!r}, which would clobber it")
+                for prev in program.parts.values():
+                    if claimed.where in prev.claimed_where:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is already claimed by "
+                                         f"{prev.name!r}")
+            program.parts[name] = KeypadPart(name, "keypad4x4",
+                                             claims[:4], claims[4:])
+            index += 1
+            continue
+
+        matrix = MATRIX8X8_RE.fullmatch(lowered)
+        if matrix and not started:
+            require(program, "matrix", line.number, "a MATRIX8X8 PART")
+            name, data, clock, latch, cols = matrix.groups()
+            if name in program.parts or name in program.ports or name in program.pins:
+                raise PseudocodeError(line.number, f"{name!r} declared twice")
+            # Resolved against an empty scratch program of the same device, like
+            # the 595 and keypad: all we want is "is this a real pin/port on this
+            # board, and what is it called". The clash cascade below owns the
+            # user-facing "a PART claims its pins" answer.
+            scratch = Program(part=program.part)
+            ctrl = [program.target.resolve_pin(
+                        scratch, f"{name}_{role}", token, "output", False,
+                        line.number)
+                    for role, token in (("data", data), ("clock", clock),
+                                        ("latch", latch))]
+            # The columns are a WHOLE port (active-low sinks, bit7 = left). The
+            # ISR writes it byte-at-a-time; the eight pins exist for the claim
+            # machinery and for setup()'s output-direction pass.
+            col_port = program.target.resolve_port(
+                scratch, f"{name}_cols", cols, "output", True, line.number)
+            columns = [program.target.resolve_pin(
+                           scratch, f"{name}_c{b}", f"{col_port.label}.{b}",
+                           "output", False, line.number)
+                       for b in range(8)]
+            claims = ctrl + columns
+            if len({pin.where for pin in claims}) != 11:
+                raise PseudocodeError(
+                    line.number, f"{name!r} names the same pin twice; a MATRIX8X8 "
+                                 f"claims three 595 pins and eight column pins")
+            for claimed in claims:
+                for other in program.pins.values():
+                    if other.where == claimed.where:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is already declared as "
+                                         f"{other.name!r}; a PART claims its pins")
+                for whole in program.ports.values():
+                    if getattr(claimed, "port", None) == whole.port:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is inside the whole port "
+                                         f"{whole.name!r}, which would clobber it")
+                for prev in program.parts.values():
+                    if claimed.where in prev.claimed_where:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is already claimed by "
+                                         f"{prev.name!r}")
+            program.parts[name] = MatrixPart(name, "matrix8x8", ctrl[0], ctrl[1],
+                                             ctrl[2], col_port, columns)
             index += 1
             continue
 
@@ -2428,6 +3862,72 @@ def parse(source: str) -> Program:
             index += 1
             continue
 
+        sevenseg = SEVENSEG_RE.fullmatch(lowered)
+        if sevenseg and not started:
+            require(program, "part", line.number, "a PART")
+            (name, seg_port_tok, sel_a, sel_b, sel_c, common) = sevenseg.groups()
+            if name in program.parts or name in program.ports or name in program.pins:
+                raise PseudocodeError(line.number, f"{name!r} declared twice")
+            seg_port = program.target.resolve_port(
+                program, f"{name}_seg", seg_port_tok, "output", False, line.number)
+            scratch = Program(part=program.part)
+            sel_claims = [program.target.resolve_pin(
+                              scratch, f"{name}_sel{i}", tok, "output", False,
+                              line.number)
+                          for i, tok in enumerate((sel_a, sel_b, sel_c))]
+            if len({pin.where for pin in sel_claims}) != 3:
+                raise PseudocodeError(
+                    line.number, f"{name!r} names the same select pin twice")
+            for claimed in sel_claims:
+                for other in program.pins.values():
+                    if other.where == claimed.where:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is already declared as "
+                                         f"{other.name!r}; a PART claims its pins")
+                for prev in program.parts.values():
+                    if claimed.where in prev.claimed_where:
+                        raise PseudocodeError(
+                            line.number, f"{claimed.where} is already claimed by "
+                                         f"{prev.name!r}")
+            for whole in program.ports.values():
+                if whole.port == seg_port.port:
+                    raise PseudocodeError(
+                        line.number, f"{seg_port_tok.upper()} is already declared as "
+                                     f"port {whole.name!r}")
+            program.parts[name] = SevenSegPart(
+                name, "sevenseg8", seg_port.port, sel_claims,
+                common_anode=(common == "anode"))
+            index += 1
+            continue
+
+        ledbank = LEDBANK_RE.fullmatch(lowered)
+        if ledbank and not started:
+            require(program, "part", line.number, "a PART")
+            (name, port_tok, active) = ledbank.groups()
+            if name in program.parts or name in program.ports or name in program.pins:
+                raise PseudocodeError(line.number, f"{name!r} declared twice")
+            led_port = program.target.resolve_port(
+                program, f"{name}_port", port_tok, "output", False, line.number)
+            # Warn (not error) if the LED port is shared with a sevenseg's select
+            for ss in program.parts.values():
+                if isinstance(ss, SevenSegPart):
+                    for sp in ss.sel_pins:
+                        if getattr(sp, "port", None) == led_port.port:
+                            import sys
+                            print(f"WARNING: {name} on {port_tok.upper()} shares a port "
+                                  f"with {ss.name}'s select pins; the 74HC138 address "
+                                  f"visibly drives those LEDs, and a whole-port LED "
+                                  f"write overwrites the digit address. Use separate "
+                                  f"modes/examples.",
+                                  file=sys.stderr)
+                            break
+            program.parts[name] = LedBankPart(
+                name, "ledbank8", led_port.port,
+                active_low=(active == "low"),
+                led_port_where=led_port.where)
+            index += 1
+            continue
+
         port = PORT_DECL_RE.fullmatch(lowered)
         if port and not started:
             require(program, "port", line.number, "a whole-port PORT")
@@ -2450,6 +3950,15 @@ def parse(source: str) -> Program:
                     raise PseudocodeError(
                         line.number,
                         f"{where.upper()} is already declared as {other.name!r}")
+            # A PART (595, keypad, MATRIX8X8) that claims any pin on this port
+            # owns that latch -- a whole-port write would clobber its bits and,
+            # for an ISR-scanned part, race the scan on the write-back.
+            for part in program.parts.values():
+                if any(getattr(p, "port", None) == whole.port for p in part.claimed):
+                    raise PseudocodeError(
+                        line.number,
+                        f"{where.upper()} overlaps pins already claimed by "
+                        f"{part.name!r}; a PART owns those latches")
             program.ports[name] = whole
             index += 1
             continue
@@ -2511,6 +4020,22 @@ def parse(source: str) -> Program:
                 raise PseudocodeError(line.number, "'WHEN started:' block is empty")
             program.whens.append(block)
             program.when_hats.append(None)
+            continue
+
+        key_hat = WHEN_KEY_RE.fullmatch(lowered)
+        if key_hat:
+            n, edge = int(key_hat.group(1)), key_hat.group(2).lower()
+            if n > 15:
+                raise PseudocodeError(
+                    line.number, f"key {n} does not exist; a KEYPAD4X4 has keys 0..15")
+            pad = sole_keypad(program, line.number)
+            started = True
+            block, index = parse_block(lines, index + 1, line.indent, program)
+            if not block:
+                raise PseudocodeError(
+                    line.number, f"'WHEN key {n} {edge}:' block is empty")
+            program.whens.append(block)
+            program.when_hats.append((pad.name, edge, n))
             continue
 
         hat = WHEN_PIN_RE.fullmatch(lowered)
@@ -2590,6 +4115,14 @@ def expr_pseudo(node: Expr, parent_level: int = -1) -> str:
         return f"{node.table}[{expr_pseudo(node.where)}]"
     if isinstance(node, (Var, PinRef)):
         return node.name
+    if isinstance(node, KeypadRef):
+        return node.part
+    if isinstance(node, MatrixPixelRef):
+        return f"pixel {expr_pseudo(node.x)} {expr_pseudo(node.y)} is on"
+    if isinstance(node, Randint):
+        return f"randint({expr_pseudo(node.low)}, {expr_pseudo(node.high)})"
+    if isinstance(node, ControllerAxis):
+        return f"controller {node.axis}"
     if isinstance(node, Unary):
         inner = expr_pseudo(node.operand, UNARY_LEVEL)
         return f"not {inner}" if node.op == "not" else f"-{inner}"
@@ -2607,7 +4140,29 @@ def stmts_pseudo(body: list, depth: int, active_low: dict) -> list[str]:
     pad = "  " * depth
     out = []
     for node in body:
-        if isinstance(node, SetPart):
+        if isinstance(node, MatrixClear):
+            out.append(f"{pad}clear {node.part}")
+        elif isinstance(node, MatrixSetPixel):
+            x, y = expr_pseudo(node.x), expr_pseudo(node.y)
+            if node.style == "light":
+                out.append(f"{pad}light pixel {x} {y}")
+            elif node.style == "clear":
+                out.append(f"{pad}clear pixel {x} {y}")
+            elif node.style in ("on", "off"):
+                out.append(f"{pad}set pixel {x} {y} to {node.style}")
+            else:
+                out.append(f"{pad}set pixel {x} {y} brightness "
+                           f"{expr_pseudo(node.level)}")
+        elif isinstance(node, MatrixDrawRow):
+            out.append(f"{pad}draw row {expr_pseudo(node.y)} = "
+                       f"{expr_pseudo(node.bits)}")
+        elif isinstance(node, MatrixImage):
+            out.append(f"{pad}show image {node.table} on {node.part}")
+        elif isinstance(node, MatrixScroll):
+            out.append(f"{pad}scroll {node.part} {node.direction}")
+        elif isinstance(node, MatrixBrightness):
+            out.append(f"{pad}set {node.part} brightness {expr_pseudo(node.level)}")
+        elif isinstance(node, SetPart):
             out.append(f"{pad}set {node.part} to {expr_pseudo(node.value)}")
         elif isinstance(node, SetPort):
             out.append(f"{pad}set {node.port} to {expr_pseudo(node.value)}")
@@ -2656,6 +4211,101 @@ def stmts_pseudo(body: list, depth: int, active_low: dict) -> list[str]:
         elif isinstance(node, Call):
             args = ", ".join(expr_pseudo(a) for a in node.args)
             out.append(f"{pad}{node.name}{' ' + args if args else ''}")
+        elif isinstance(node, ShowNumber):
+            out.append(f"{pad}show number {expr_pseudo(node.value)} on {node.display}")
+        elif isinstance(node, ShowDigit):
+            out.append(f"{pad}show digit {expr_pseudo(node.digit)} = value "
+                       f"{expr_pseudo(node.value)} on {node.display}")
+        elif isinstance(node, SetDigitSegments):
+            out.append(f"{pad}set digit {expr_pseudo(node.digit)} to segments "
+                       f"{expr_pseudo(node.segments)} on {node.display}")
+        elif isinstance(node, ClearDisplay):
+            out.append(f"{pad}clear {node.display}")
+        elif isinstance(node, TurnOnLed):
+            out.append(f"{pad}turn on led {expr_pseudo(node.index)} on {node.bank}")
+        elif isinstance(node, TurnOffLed):
+            out.append(f"{pad}turn off led {expr_pseudo(node.index)} on {node.bank}")
+        elif isinstance(node, SetLeds):
+            out.append(f"{pad}set leds to {expr_pseudo(node.value)} on {node.bank}")
+        elif isinstance(node, LightOnlyLed):
+            out.append(f"{pad}light only led {expr_pseudo(node.index)} on {node.bank}")
+        elif isinstance(node, ArcadeCreate):
+            out.append(f"{pad}arcade create {node.sprite} kind {node.kind}")
+        elif isinstance(node, ArcadePlace):
+            out.append(f"{pad}arcade place {node.sprite} x {expr_pseudo(node.x)} "
+                       f"y {expr_pseudo(node.y)}")
+        elif isinstance(node, ArcadeMove):
+            out.append(f"{pad}arcade move {node.sprite} vx {expr_pseudo(node.vx)} "
+                       f"vy {expr_pseudo(node.vy)}")
+        elif isinstance(node, ArcadeSetFlag):
+            flag = "stay in screen" if node.flag == "stayinscreen" else "destroy on wall"
+            out.append(f"{pad}arcade set {node.sprite} {flag}")
+        elif isinstance(node, ArcadeScore):
+            out.append(f"{pad}arcade score add {expr_pseudo(node.delta)}")
+        elif isinstance(node, ArcadeGameOver):
+            out.append(f"{pad}arcade game over {'win' if node.win else 'lose'}")
+        elif isinstance(node, ArcadeOnOverlap):
+            out.append(f"{pad}ARCADE ON OVERLAP {node.kind_a} {node.kind_b}:")
+            out += stmts_pseudo(node.body, depth + 1, active_low)
+        elif isinstance(node, ArcadeTilemap):
+            out.append(f"{pad}arcade tilemap {node.name} cols "
+                       f"{expr_pseudo(node.cols)} rows {expr_pseudo(node.rows)} "
+                       f"tile {expr_pseudo(node.tile_size)}")
+        elif isinstance(node, ArcadeSetTile):
+            out.append(f"{pad}arcade set tile {node.tilemap} col "
+                       f"{expr_pseudo(node.col)} row {expr_pseudo(node.row)} "
+                       f"to {expr_pseudo(node.tile_index)}")
+        elif isinstance(node, ArcadeTileWall):
+            out.append(f"{pad}arcade set wall {node.tilemap} tile "
+                       f"{expr_pseudo(node.tile_index)}")
+        elif isinstance(node, ArcadeSetFrame):
+            out.append(f"{pad}arcade set frame {node.sprite} to "
+                       f"{expr_pseudo(node.frame)}")
+        elif isinstance(node, LcdPrint):
+            if node.text is not None:
+                out.append(f'{pad}lcd print "{node.text}" on {node.display}')
+            else:
+                out.append(f"{pad}lcd print {expr_pseudo(node.value)} on {node.display}")
+        elif isinstance(node, LcdCursor):
+            out.append(f"{pad}lcd set cursor {expr_pseudo(node.row)} "
+                       f"{expr_pseudo(node.col)} on {node.display}")
+        elif isinstance(node, LcdClear):
+            out.append(f"{pad}lcd clear {node.display}")
+        elif isinstance(node, TftPixel):
+            out.append(f"{pad}tft pixel {expr_pseudo(node.x)} {expr_pseudo(node.y)} "
+                       f"R {expr_pseudo(node.r)} G {expr_pseudo(node.g)} "
+                       f"B {expr_pseudo(node.b)} on {node.display}")
+        elif isinstance(node, TftFill):
+            out.append(f"{pad}tft fill {expr_pseudo(node.x)} {expr_pseudo(node.y)} "
+                       f"{expr_pseudo(node.w)} {expr_pseudo(node.h)} "
+                       f"R {expr_pseudo(node.r)} G {expr_pseudo(node.g)} "
+                       f"B {expr_pseudo(node.b)} on {node.display}")
+        elif isinstance(node, TftClear):
+            out.append(f"{pad}tft clear {node.display}")
+        elif isinstance(node, TftPrint):
+            if node.text is not None:
+                out.append(f'{pad}tft print "{node.text}" on {node.display}')
+            else:
+                out.append(f"{pad}tft print {expr_pseudo(node.value)} on {node.display}")
+        elif isinstance(node, TftCursor):
+            out.append(f"{pad}tft set cursor {expr_pseudo(node.row)} "
+                       f"{expr_pseudo(node.col)} on {node.display}")
+        elif isinstance(node, OledPixel):
+            out.append(f"{pad}oled pixel {expr_pseudo(node.x)} {expr_pseudo(node.y)} "
+                       f"{expr_pseudo(node.value)} on {node.display}")
+        elif isinstance(node, OledClear):
+            out.append(f"{pad}oled clear {node.display}")
+        elif isinstance(node, OledPrint):
+            if node.text is not None:
+                out.append(f'{pad}oled print "{node.text}" on {node.display}')
+            else:
+                out.append(f"{pad}oled print {expr_pseudo(node.value)} on {node.display}")
+        elif isinstance(node, OledCursor):
+            out.append(f"{pad}oled set cursor {expr_pseudo(node.row)} "
+                       f"{expr_pseudo(node.col)} on {node.display}")
+        elif isinstance(node, RgbSet):
+            out.append(f"{pad}set {node.led} colour to R {expr_pseudo(node.r)} "
+                       f"G {expr_pseudo(node.g)} B {expr_pseudo(node.b)}")
         elif isinstance(node, Stop):
             out.append(f"{pad}stop")
         else:
@@ -2683,6 +4333,28 @@ def emit_pseudocode(program: Program) -> str:
     if program.parts:
         out.append("")
         for part in program.parts.values():
+            if isinstance(part, KeypadPart):
+                rows = " ".join(p.where for p in part.rows)
+                cols = " ".join(p.where for p in part.cols)
+                out.append(f"  PART {part.name} = KEYPAD4X4 "
+                           f"ROWS {rows} COLS {cols}")
+                continue
+            if isinstance(part, MatrixPart):
+                out.append(f"  PART {part.name} = MATRIX8X8 ROWS 74HC595 "
+                           f"DATA {part.data.where} CLOCK {part.clock.where} "
+                           f"LATCH {part.latch.where} COLUMNS {part.col_port.label}")
+                continue
+            if isinstance(part, SevenSegPart):
+                common = " COMMON ANODE" if part.common_anode else ""
+                sel_str = " ".join(pin.where for pin in part.sel_pins)
+                out.append(f"  PART {part.name} = SEVENSEG8 SEGMENTS "
+                           f"P{part.seg_port} SELECT {sel_str}{common}")
+                continue
+            if isinstance(part, LedBankPart):
+                polarity = " ACTIVE LOW" if part.active_low else ""
+                out.append(f"  PART {part.name} = LEDBANK8 ON "
+                           f"{part.led_port_where}{polarity}")
+                continue
             polarity = " ACTIVE LOW" if part.active_low else ""
             out.append(f"  PART {part.name} = 74HC595 "
                        f"DATA {part.data.where} CLOCK {part.clock.where} "
@@ -2706,7 +4378,12 @@ def emit_pseudocode(program: Program) -> str:
         out += stmts_pseudo(procedure.body, 2, active_low)
     for number, block in enumerate(program.whens):
         hat = program.when_hats[number] if number < len(program.when_hats) else None
-        header = "  WHEN started:" if hat is None else f"  WHEN {hat[0]} {hat[1]}:"
+        if hat is None:
+            header = "  WHEN started:"
+        elif len(hat) == 3:
+            header = f"  WHEN key {hat[2]} {hat[1]}:"
+        else:
+            header = f"  WHEN {hat[0]} {hat[1]}:"
         out += ["", header]
         out += stmts_pseudo(block, 2, active_low)
     return "\n".join(out) + "\n"
@@ -2760,6 +4437,11 @@ def expr_c(node: Expr, ctx: Emit, parent_level: int = -1) -> str:
         if pin.direction == "analog":
             return ctx.target.read_analog(pin)
         return ctx.target.read_pin(pin)
+    if isinstance(node, KeypadRef):
+        return f"bw_part_{node.part}_read()"
+    if isinstance(node, MatrixPixelRef):
+        return (f"(bw_scr_{node.part}_getpx((unsigned char)({expr_c(node.x, ctx)}), "
+                f"(unsigned char)({expr_c(node.y, ctx)})) != 0)")
     if isinstance(node, Unary):
         inner = expr_c(node.operand, ctx, UNARY_LEVEL)
         return f"!({inner})" if node.op == "not" else f"-({inner})"
@@ -2835,11 +4517,76 @@ def _const_value(node: Expr) -> float | None:
     return None
 
 
+def matrix_stmt_c(node: Stmt, pad: str, ctx: Emit) -> list[str] | None:
+    """Lower a MATRIX8X8 drawing verb to a frame-buffer call, or None if `node`
+    is not one. Shared by the straight-line and cooperative back ends, which
+    emit these identically -- every verb is a plain RAM write, never a yield."""
+    if isinstance(node, MatrixClear):
+        return [f"{pad}bw_scr_{node.part}_clear();"]
+    if isinstance(node, MatrixSetPixel):
+        x, y = expr_c(node.x, ctx), expr_c(node.y, ctx)
+        if node.style in ("light", "on"):
+            level = "MATRIX_LEVELS - 1"
+        elif node.style in ("clear", "off"):
+            level = "0"
+        else:                                   # "brightness"
+            level = f"bw_scr_level({expr_c(node.level, ctx)})"
+        return [f"{pad}bw_scr_{node.part}_setpx((unsigned char)({x}), "
+                f"(unsigned char)({y}), (unsigned char)({level}));"]
+    if isinstance(node, MatrixDrawRow):
+        return [f"{pad}bw_scr_{node.part}_row((unsigned char)({expr_c(node.y, ctx)}), "
+                f"(unsigned char)({expr_c(node.bits, ctx)}));"]
+    if isinstance(node, MatrixImage):
+        return [f"{pad}bw_scr_{node.part}_image(bw_tab_{node.table});"]
+    if isinstance(node, MatrixScroll):
+        code = {"left": 0, "right": 1, "up": 2, "down": 3}[node.direction]
+        return [f"{pad}bw_scr_{node.part}_scroll({code});   /* {node.direction} */"]
+    if isinstance(node, MatrixBrightness):
+        return [f"{pad}bw_scr_{node.part}_dim = bw_scr_level({expr_c(node.level, ctx)});"]
+    return None
+
+
+def a2_stmt_c(node: Stmt, pad: str, ctx: Emit) -> list[str] | None:
+    """Lower SEVENSEG8 and LEDBANK8 verbs to C, or None if not one."""
+    if isinstance(node, ShowNumber):
+        return [f"{pad}bw_{node.display}_show_number({expr_c(node.value, ctx)});"]
+    if isinstance(node, ShowDigit):
+        return [f"{pad}bw_{node.display}_show_digit("
+                f"(unsigned char)({expr_c(node.digit, ctx)}), "
+                f"(unsigned char)({expr_c(node.value, ctx)}));"]
+    if isinstance(node, SetDigitSegments):
+        return [f"{pad}bw_{node.display}_set_segments("
+                f"(unsigned char)({expr_c(node.digit, ctx)}), "
+                f"(unsigned char)({expr_c(node.segments, ctx)}));"]
+    if isinstance(node, ClearDisplay):
+        return [f"{pad}bw_{node.display}_clear();"]
+    if isinstance(node, TurnOnLed):
+        return [f"{pad}bw_{node.bank}_on("
+                f"(unsigned char)({expr_c(node.index, ctx)}));"]
+    if isinstance(node, TurnOffLed):
+        return [f"{pad}bw_{node.bank}_off("
+                f"(unsigned char)({expr_c(node.index, ctx)}));"]
+    if isinstance(node, SetLeds):
+        return [f"{pad}bw_{node.bank}_set("
+                f"(unsigned char)({expr_c(node.value, ctx)}));"]
+    if isinstance(node, LightOnlyLed):
+        return [f"{pad}bw_{node.bank}_only("
+                f"(unsigned char)({expr_c(node.index, ctx)}));"]
+    return None
+
+
 def stmts_c(body: list, depth: int, ctx: Emit) -> list[str]:
     pad = "    " * depth
     out = []
     for node in body:
-        if isinstance(node, SetPin):
+        drawn = matrix_stmt_c(node, pad, ctx)
+        if drawn is not None:
+            out += drawn
+            continue
+        drawn = a2_stmt_c(node, pad, ctx)
+        if drawn is not None:
+            out += drawn
+        elif isinstance(node, SetPin):
             out.append(pad + ctx.target.write_pin(ctx.pins[node.pin], node.high))
         elif isinstance(node, SetPwm):
             out.append(pad + ctx.target.write_pwm(ctx.pins[node.pin],
@@ -2909,6 +4656,55 @@ def stmts_c(body: list, depth: int, ctx: Emit) -> list[str]:
         elif isinstance(node, Call):
             args = ", ".join(expr_c(a, ctx) for a in node.args)
             out.append(f"{pad}{ctx.procs[node.name.lower()].c_name}({args});")
+        elif isinstance(node, LcdPrint):
+            if node.text is not None:
+                out.append(f'{pad}bw_lcd_print_s({node.display}, "{_c_string(node.text)}");')
+            else:
+                out.append(f"{pad}bw_lcd_print_n({node.display}, {expr_c(node.value, ctx)});")
+        elif isinstance(node, LcdCursor):
+            out.append(f"{pad}bw_lcd_cursor({node.display}, "
+                       f"{expr_c(node.row, ctx)}, {expr_c(node.col, ctx)});")
+        elif isinstance(node, LcdClear):
+            out.append(f"{pad}bw_lcd_clear({node.display});")
+        elif isinstance(node, TftPixel):
+            out.append(f"{pad}bw_tft_pixel({node.display}, "
+                       f"{expr_c(node.x, ctx)}, {expr_c(node.y, ctx)}, "
+                       f"{expr_c(node.r, ctx)}, {expr_c(node.g, ctx)}, "
+                       f"{expr_c(node.b, ctx)});")
+        elif isinstance(node, TftFill):
+            out.append(f"{pad}bw_tft_fill({node.display}, "
+                       f"{expr_c(node.x, ctx)}, {expr_c(node.y, ctx)}, "
+                       f"{expr_c(node.w, ctx)}, {expr_c(node.h, ctx)}, "
+                       f"{expr_c(node.r, ctx)}, {expr_c(node.g, ctx)}, "
+                       f"{expr_c(node.b, ctx)});")
+        elif isinstance(node, TftClear):
+            out.append(f"{pad}bw_tft_clear({node.display});")
+        elif isinstance(node, TftPrint):
+            if node.text is not None:
+                out.append(f'{pad}bw_tft_print_s({node.display}, "{_c_string(node.text)}");')
+            else:
+                out.append(f"{pad}bw_tft_print_n({node.display}, {expr_c(node.value, ctx)});")
+        elif isinstance(node, TftCursor):
+            out.append(f"{pad}bw_tft_cursor({node.display}, "
+                       f"{expr_c(node.row, ctx)}, {expr_c(node.col, ctx)});")
+        elif isinstance(node, OledPixel):
+            out.append(f"{pad}bw_oled_pixel({node.display}, "
+                       f"{expr_c(node.x, ctx)}, {expr_c(node.y, ctx)}, "
+                       f"{expr_c(node.value, ctx)});")
+        elif isinstance(node, OledClear):
+            out.append(f"{pad}bw_oled_clear({node.display});")
+        elif isinstance(node, OledPrint):
+            if node.text is not None:
+                out.append(f'{pad}bw_oled_print_s({node.display}, "{_c_string(node.text)}");')
+            else:
+                out.append(f"{pad}bw_oled_print_n({node.display}, {expr_c(node.value, ctx)});")
+        elif isinstance(node, OledCursor):
+            out.append(f"{pad}bw_oled_cursor({node.display}, "
+                       f"{expr_c(node.row, ctx)}, {expr_c(node.col, ctx)});")
+        elif isinstance(node, RgbSet):
+            out.append(f"{pad}bw_rgb_set({node.led}, "
+                       f"{expr_c(node.r, ctx)}, {expr_c(node.g, ctx)}, "
+                       f"{expr_c(node.b, ctx)});")
         elif isinstance(node, Stop):
             out.append(f"{pad}for (;;) ;   /* stop */")
         else:
@@ -2946,6 +4742,14 @@ def stmts_task(body: list, depth: int, ctx: Emit,
         return states[0]
 
     for node in body:
+        drawn = matrix_stmt_c(node, pad, ctx)
+        if drawn is not None:
+            out += drawn
+            continue
+        drawn = a2_stmt_c(node, pad, ctx)
+        if drawn is not None:
+            out += drawn
+            continue
         if isinstance(node, SetPin):
             out.append(pad + ctx.target.write_pin(ctx.pins[node.pin], node.high))
         elif isinstance(node, SetPwm):
@@ -3031,6 +4835,55 @@ def stmts_task(body: list, depth: int, ctx: Emit,
         elif isinstance(node, Call):
             args = ", ".join(expr_c(a, ctx) for a in node.args)
             out.append(f"{pad}{ctx.procs[node.name.lower()].c_name}({args});")
+        elif isinstance(node, LcdPrint):
+            if node.text is not None:
+                out.append(f'{pad}bw_lcd_print_s({node.display}, "{_c_string(node.text)}");')
+            else:
+                out.append(f"{pad}bw_lcd_print_n({node.display}, {expr_c(node.value, ctx)});")
+        elif isinstance(node, LcdCursor):
+            out.append(f"{pad}bw_lcd_cursor({node.display}, "
+                       f"{expr_c(node.row, ctx)}, {expr_c(node.col, ctx)});")
+        elif isinstance(node, LcdClear):
+            out.append(f"{pad}bw_lcd_clear({node.display});")
+        elif isinstance(node, TftPixel):
+            out.append(f"{pad}bw_tft_pixel({node.display}, "
+                       f"{expr_c(node.x, ctx)}, {expr_c(node.y, ctx)}, "
+                       f"{expr_c(node.r, ctx)}, {expr_c(node.g, ctx)}, "
+                       f"{expr_c(node.b, ctx)});")
+        elif isinstance(node, TftFill):
+            out.append(f"{pad}bw_tft_fill({node.display}, "
+                       f"{expr_c(node.x, ctx)}, {expr_c(node.y, ctx)}, "
+                       f"{expr_c(node.w, ctx)}, {expr_c(node.h, ctx)}, "
+                       f"{expr_c(node.r, ctx)}, {expr_c(node.g, ctx)}, "
+                       f"{expr_c(node.b, ctx)});")
+        elif isinstance(node, TftClear):
+            out.append(f"{pad}bw_tft_clear({node.display});")
+        elif isinstance(node, TftPrint):
+            if node.text is not None:
+                out.append(f'{pad}bw_tft_print_s({node.display}, "{_c_string(node.text)}");')
+            else:
+                out.append(f"{pad}bw_tft_print_n({node.display}, {expr_c(node.value, ctx)});")
+        elif isinstance(node, TftCursor):
+            out.append(f"{pad}bw_tft_cursor({node.display}, "
+                       f"{expr_c(node.row, ctx)}, {expr_c(node.col, ctx)});")
+        elif isinstance(node, OledPixel):
+            out.append(f"{pad}bw_oled_pixel({node.display}, "
+                       f"{expr_c(node.x, ctx)}, {expr_c(node.y, ctx)}, "
+                       f"{expr_c(node.value, ctx)});")
+        elif isinstance(node, OledClear):
+            out.append(f"{pad}bw_oled_clear({node.display});")
+        elif isinstance(node, OledPrint):
+            if node.text is not None:
+                out.append(f'{pad}bw_oled_print_s({node.display}, "{_c_string(node.text)}");')
+            else:
+                out.append(f"{pad}bw_oled_print_n({node.display}, {expr_c(node.value, ctx)});")
+        elif isinstance(node, OledCursor):
+            out.append(f"{pad}bw_oled_cursor({node.display}, "
+                       f"{expr_c(node.row, ctx)}, {expr_c(node.col, ctx)});")
+        elif isinstance(node, RgbSet):
+            out.append(f"{pad}bw_rgb_set({node.led}, "
+                       f"{expr_c(node.r, ctx)}, {expr_c(node.g, ctx)}, "
+                       f"{expr_c(node.b, ctx)});")
         elif isinstance(node, Stop):
             out += [f"{pad}{task}_state = 0xFFFF;   /* stop this script */",
                     f"{pad}return;"]
@@ -3049,8 +4902,11 @@ def emit_c(program: Program) -> str:
     ctx = Emit(target, {pin.name: pin for pin in program.pins.values()},
                program.procedures, program)
     # A pin hat must be sampled every tick, so it forces the cooperative
-    # scheduler even when it is the only script in the program.
-    tasks = len(program.whens) > 1 or any(program.when_hats)
+    # scheduler even when it is the only script in the program. A MATRIX8X8
+    # forces it for the same reason: its refresh lives in the Timer-0 ISR, which
+    # only the scheduler path emits.
+    tasks = (len(program.whens) > 1 or any(program.when_hats)
+             or program.has_matrix)
 
     # This said "Hand edits will be lost; change the pseudocode instead." The
     # first half is still true. The second stopped being true when BrickWright's
@@ -3087,6 +4943,38 @@ def emit_c(program: Program) -> str:
     if tasks:
         task_lines: list[str] = []
         statics: list[str] = []
+
+        # `WHEN key N` hats share one debounced scan per keypad: a poll task
+        # (dispatched before the hats) reads the matrix at most every 5 ms and
+        # a key only becomes current after two agreeing reads, so a scan
+        # mid-bounce -- which reads -1 or a neighbour for one pass -- cannot
+        # fire a hat. The hats then edge-detect on the debounced value exactly
+        # the way pin hats edge-detect on a level.
+        key_pads = []
+        for hat in program.when_hats:
+            if hat is not None and len(hat) == 3 and hat[0] not in key_pads:
+                key_pads.append(hat[0])
+        tt = target.time_type
+        now = target.now()
+        for pad in key_pads:
+            task_lines += [
+                f"/* {pad}: debounced key state shared by the `WHEN key N` hats. */",
+                f"static signed char bw_kp_{pad}_raw = -1;",
+                f"static signed char bw_kp_{pad}_key = -1;",
+                f"static {tt} bw_kp_{pad}_t;",
+                f"static void bw_kp_{pad}_poll(void)",
+                "{",
+                "    signed char r;",
+                f"    if (({tt})({now} - bw_kp_{pad}_t) < 5)",
+                "        return;                     /* scan every 5 ms */",
+                f"    bw_kp_{pad}_t = {now};",
+                f"    r = bw_part_{pad}_read();",
+                f"    if (r == bw_kp_{pad}_raw)",
+                f"        bw_kp_{pad}_key = r;",
+                f"    bw_kp_{pad}_raw = r;",
+                "}", ""]
+            task_names.append(f"bw_kp_{pad}_poll")
+
         for number, block in enumerate(program.whens):
             task = f"bw_task{number}"
             task_names.append(task)
@@ -3109,6 +4997,36 @@ def emit_c(program: Program) -> str:
                                "    }",
                                f"    {task}_state = 0xFFFF;   /* ran to the end */",
                                "}", ""]
+                continue
+
+            if len(hat) == 3:
+                pad, edge, key_n = hat
+                test = (f"now && !{task}_prev" if edge == "pressed"
+                        else f"!now && {task}_prev")
+                head.append(f"static unsigned char {task}_prev;")
+                task_lines += head
+                task_lines += [
+                    f"/* WHEN key {key_n} {edge}: (script {number + 1})",
+                    " *",
+                    " * Edge-triggered on the DEBOUNCED key from the shared poll task: a",
+                    " * held key runs the body once, and a bouncing contact cannot fire",
+                    " * twice, because the poll only updates after two agreeing scans. */",
+                    f"static void {task}(void)",
+                    "{",
+                    f"    unsigned char now = (bw_kp_{pad}_key == {key_n}) ? 1 : 0;",
+                    f"    unsigned char fired = ({test}) ? 1 : 0;",
+                    f"    {task}_prev = now;",
+                    "",
+                    f"    switch ({task}_state) {{",
+                    "    case 0:",
+                    "        if (!fired)",
+                    "            return;",
+                    f"        {task}_state = 1;",
+                    "    case 1:",
+                    *body,
+                    "    }",
+                    f"    {task}_state = 0;   /* ready for the next edge */",
+                    "}", ""]
                 continue
 
             pin_name, edge = hat
@@ -3221,3 +5139,25 @@ TARGETS["microbit"] = MicrobitTarget()
 TARGETS["micro-bit"] = TARGETS["microbit"]
 TARGETS["pico"] = PicoTarget()
 TARGETS["rp2040"] = TARGETS["pico"]
+
+# Arduino Mega 2560: 54 digital + 16 analog, same core as Uno.
+TARGETS["arduino-mega"] = ArduinoTarget("arduino-mega", "Arduino Mega", 53, 15)
+
+# ATtiny family: bare AVR (no Arduino core), port/bit pin names.
+TARGETS["attiny88"] = PortBitAvrTarget(
+    "attiny88", "ATtiny88", "attiny88", 8192, ports="ABCD", default_clock=8000000)
+TARGETS["attiny85"] = PortBitAvrTarget(
+    "attiny85", "ATtiny85", "attiny85", 8192, ports="AB", default_clock=8000000)
+
+# STC15W408AS: same register layout as STC15F2K, but no Timer 1.
+TARGETS["stc15w408as"] = _stc(
+    "stc15w408as", "STC15W408AS", "stc12.h", True, True, True, True, p5=True)
+
+# EATER6502: the pseudocode parser accepts the device. The compile
+# service routes it to cc65 (a different backend than SDCC). Pin names
+# are PA0-PA7 / PB0-PB6 (the VIA ports).
+TARGETS["eater6502"] = PortBitAvrTarget(
+    "eater6502", "Eater 6502", "eater6502", 32768, ports="AB", default_clock=1000000)
+
+from bw_arcade import ArcadeTarget  # noqa: E402
+TARGETS["arcade"] = ArcadeTarget()
