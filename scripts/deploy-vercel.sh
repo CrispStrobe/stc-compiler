@@ -38,7 +38,9 @@ fi
 # Headless hardening (kerotakis lesson): the CLI crashes on uv_tty_init
 # from a background shell — starve it of a TTY and take ITS exit code,
 # then also refuse the exit-0-but-"Error:" shape (the rate-limit cap).
-LOG="$(mktemp /tmp/stc-vercel-deploy.XXXXXX.log)"
+# macOS mktemp treats a suffix after the Xs as LITERAL - the first run
+# creates exactly stc-vercel-deploy.XXXXXX.log and the second collides.
+LOG="$(mktemp /tmp/stc-vercel-deploy.XXXXXX)"
 set +e
 TERM=dumb CI=1 vercel deploy ${TOKEN_ARGS[@]+"${TOKEN_ARGS[@]}"} --scope "$SCOPE" --yes $PROD \
     </dev/null >"$LOG" 2>&1
