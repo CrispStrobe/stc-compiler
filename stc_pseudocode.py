@@ -3915,9 +3915,10 @@ def parse(source: str) -> Program:
                         if getattr(sp, "port", None) == led_port.port:
                             import sys
                             print(f"WARNING: {name} on {port_tok.upper()} shares a port "
-                                  f"with {ss.name}'s select pins; the ISR scan will "
-                                  f"flicker the LEDs during digit multiplexing. "
-                                  f"LED writes go through the shadow byte.",
+                                  f"with {ss.name}'s select pins; the 74HC138 address "
+                                  f"visibly drives those LEDs, and a whole-port LED "
+                                  f"write overwrites the digit address. Use separate "
+                                  f"modes/examples.",
                                   file=sys.stderr)
                             break
             program.parts[name] = LedBankPart(
