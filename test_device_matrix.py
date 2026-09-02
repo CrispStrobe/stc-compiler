@@ -76,12 +76,12 @@ EXPECTED = {
     "atmega168p": Case("D13", 16000000, BUILDS),
 
     # ---- bare AVR, the tiny parts ----
-    "attiny85": Case("PB3", 8000000, KNOWN_GAP,
-                     gap="the AVR generator emits ATmega timer registers "
-                         "(TIMSK0); the ATtiny85 names them TIMSK/TCCR0A "
-                         "differently. language='arduino' works for this chip."),
-    "attiny88": Case("PB0", 8000000, KNOWN_GAP,
-                     gap="as attiny85: WGM01 and TIMSK0 are ATmega spellings."),
+    # Both were KNOWN_GAP until 2026-09-02: the generator emitted ATmega
+    # Timer-0 spellings. The ATtiny85 names the mask register TIMSK, and the
+    # ATtiny48/88 has no TCCR0B or WGM01 at all -- one TCCR0A carries the
+    # prescaler and CTC0 together. Timer 0 is now a target fact.
+    "attiny85": Case("PB3", 8000000, BUILDS),
+    "attiny88": Case("PB0", 8000000, BUILDS),
 
     # ---- Arduino core: transpiles here, built by the IDE ----
     "arduino-uno":  Case("D13", 16000000, TRANSPILE_ONLY, toolchain="arduino-cli"),

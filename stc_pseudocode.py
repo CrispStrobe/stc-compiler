@@ -2286,6 +2286,41 @@ class AvrTarget(Target):
     time_type = "unsigned long"
     time_signed = "long"
 
+    # ---- Timer 0, which is NOT the same register set across the family -----
+    #
+    # Every wait in a generated program is measured against Timer 0 in CTC
+    # mode at 1 kHz, so getting these names wrong does not degrade -- it
+    # fails to compile, or worse, on a part where the name happens to exist
+    # at a different address, it silently programs the wrong thing.
+    #
+    #   ATmega328P/168P   TCCR0A/WGM01 + TCCR0B/prescaler, mask in TIMSK0
+    #   ATtiny85          identical, except the mask register is TIMSK
+    #   ATtiny88          no TCCR0B and no WGM01 at all: the ATtiny48/88
+    #                     Timer 0 puts the prescaler AND the CTC enable
+    #                     (CTC0, bit 3) in the single TCCR0A
+    #
+    # Verified against the vendored avr-libc headers (avr/io<part>.h), which
+    # are the same ones the compile will use.
+    timsk = "TIMSK0"        # ATtiny85 spells it TIMSK
+    tick_ctc_bit = "WGM01"  # ATtiny88 spells it CTC0
+    tick_split = True       # False: one TCCR0A holds prescaler and CTC both
+
+    def tick_setup(self, compare: int, prescaler_bits: str) -> list[str]:
+        """Timer 0 in CTC mode at exactly 1 kHz, spelled for this part."""
+        pad = " " * max(1, 20 - len(str(compare)))
+        if self.tick_split:
+            return [f"    TCCR0A = _BV({self.tick_ctc_bit});           /* CTC */",
+                    f"    OCR0A  = {compare};{pad}/* 1 kHz */",
+                    f"    {self.timsk} = _BV(OCIE0A);",
+                    f"    TCCR0B = {prescaler_bits};"]
+        # One register for both. Order matters: loading OCR0A and unmasking
+        # before the clock select starts the timer means the first compare
+        # cannot be missed.
+        return [f"    OCR0A  = {compare};{pad}/* 1 kHz */",
+                f"    {self.timsk} = _BV(OCIE0A);",
+                f"    TCCR0A = _BV({self.tick_ctc_bit}) | {prescaler_bits};"
+                f"   /* CTC + prescaler, one register */"]
+
     def __init__(self, key: str, display: str, mcu: str, flash: int):
         self.key = key
         self.display = display
@@ -2653,13 +2688,7 @@ class AvrTarget(Target):
                     "    ADCSRA = _BV(ADEN) | _BV(ADPS2) | _BV(ADPS1) | _BV(ADPS0);"]
 
         compare, bits, _divisor = self._tick(program)
-        out += ["",
-                "    TCCR0A = _BV(WGM01);           /* CTC */",
-                f"    OCR0A  = {compare};" + " " * max(1, 20 - len(str(compare)))
-                + "/* 1 kHz */",
-                "    TIMSK0 = _BV(OCIE0A);",
-                f"    TCCR0B = {bits};",
-                "    sei();"]
+        out += ["", *self.tick_setup(compare, bits), "    sei();"]
         return out
 
     def start_scheduler(self, task_names):
@@ -2694,10 +2723,24 @@ class PortBitAvrTarget(AvrTarget):
     """
 
     def __init__(self, key: str, display: str, mcu: str, flash: int,
-                 ports: str = "ABCD", default_clock: int = 8000000):
+                 ports: str = "ABCD", default_clock: int = 8000000,
+                 timsk: str = "TIMSK0", tick_ctc_bit: str = "WGM01",
+                 tick_split: bool = True, uart: bool = True):
         super().__init__(key, display, mcu, flash)
         self._ports = frozenset(ports.upper())
         self.default_clock = default_clock
+        # See AvrTarget's Timer-0 note: the tiny parts diverge here, and the
+        # divergence is a compile error rather than a wrong number, which is
+        # the only reason it stayed hidden as long as it did.
+        self.timsk = timsk
+        self.tick_ctc_bit = tick_ctc_bit
+        self.tick_split = tick_split
+        # No USART on the tiny parts, so `print` has nothing to write to.
+        # Dropping the claim makes it a parse error naming the board, which
+        # is what every other unsupported feature here does -- rather than
+        # an avr-gcc error about UCSR0A, which reads as our bug.
+        if not uart:
+            self.supports = self.supports - {"print"}
 
     def resolve_pin(self, program, name, where, direction, active_low, line):
         match = AVR_PIN_RE.match(where)
@@ -5157,10 +5200,15 @@ TARGETS["rp2040"] = TARGETS["pico"]
 TARGETS["arduino-mega"] = ArduinoTarget("arduino-mega", "Arduino Mega", 53, 15)
 
 # ATtiny family: bare AVR (no Arduino core), port/bit pin names.
+# The ATtiny48/88 Timer 0 has no TCCR0B and no WGM01: TCCR0A carries the
+# prescaler and the CTC enable (CTC0) together.
 TARGETS["attiny88"] = PortBitAvrTarget(
-    "attiny88", "ATtiny88", "attiny88", 8192, ports="ABCD", default_clock=8000000)
+    "attiny88", "ATtiny88", "attiny88", 8192, ports="ABCD", default_clock=8000000,
+    tick_ctc_bit="CTC0", tick_split=False, uart=False)
+# The ATtiny85 is an ATmega Timer 0 with one register renamed.
 TARGETS["attiny85"] = PortBitAvrTarget(
-    "attiny85", "ATtiny85", "attiny85", 8192, ports="AB", default_clock=8000000)
+    "attiny85", "ATtiny85", "attiny85", 8192, ports="AB", default_clock=8000000,
+    timsk="TIMSK", uart=False)
 
 # STC15W408AS: same register layout as STC15F2K, but no Timer 1.
 TARGETS["stc15w408as"] = _stc(

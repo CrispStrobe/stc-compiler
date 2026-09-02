@@ -27,7 +27,10 @@ class ArcadeTarget(sp.Target):
     display = "MakeCode Arcade"
     toolchain = "pxt"
     default_clock = 0       # no crystal; the game loop is the clock
-    supports = frozenset({"print", "table"})
+    # "game" is what gates the arcade verb family and the randint/controller
+    # reporters: they parse anywhere, so without a target that claims them
+    # they reach a C emitter with no case and escape as a 500.
+    supports = frozenset({"print", "table", "game"})
     source_extension = "ts"
     compile_hint = ("MakeCode Arcade TypeScript is compiled by the PXT "
                     "compiler into JS for the Arcade simulator, or into "
