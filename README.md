@@ -295,11 +295,11 @@ Nineteen `DEVICE` names across six architectures:
 |---|---|---|---|
 | STC 8051 | `stc12c5a60s2` `stc12c5a16s2` `stc15f2k60s2` `stc15w408as` `stc89c52` `stc89c52rc` | C | **yes** |
 | bare AVR | `atmega328p` `atmega168p` | C | **yes** |
-| bare AVR (tiny) | `attiny85` `attiny88` | C | see *Known gaps* |
+| bare AVR (tiny) | `attiny85` `attiny88` | C | **yes** (no `print` — no USART) |
 | Arduino core | `arduino-uno` `arduino-nano` `arduino-mega` | C++ `.ino` | no — needs `arduino-cli` |
 | MicroPython | `microbit` (`micro-bit`) | `.py` | nothing to compile |
 | MicroPython | `pico` (`rp2040`) | `.py` | nothing to compile |
-| 6502 | `eater6502` | C | see *Known gaps* |
+| 6502 | `eater6502` | — | no pseudocode generator — see *Known gaps* |
 | game engine | `arcade` | TypeScript `.ts` | no — needs PXT |
 
 `DEVICE` may be written with or without a trailing colon; `sb3-creator` writes
@@ -310,27 +310,32 @@ it without.
 Recorded here rather than left to be discovered, because a device that parses
 and emits something is easy to mistake for a device that works:
 
-- **`attiny85` / `attiny88` from pseudocode do not compile.** The generator
-  emits ATmega timer register names (`TIMSK0`, `WGM01`) that do not exist on
-  those parts. The `language: "arduino"` route for the same two chips works
-  and is covered by `scripts/test-api.py`; only the bare-AVR lane is affected.
-- **`eater6502` from pseudocode returns a 500.** The target is registered as a
-  port/bit AVR target, so `/compile` dispatches it to avr-gcc and fails to find
-  it there — and the C it generates is AVR C (`<avr/io.h>`, `ISR(...)`), not
-  6502. The 6502 lane that *does* work is hand-written C or assembly via
-  `target: "eater6502"`, which routes to cc65 correctly.
+- **`eater6502` has no pseudocode generator.** The DEVICE name is real and the
+  6502 lane works — hand-written C or assembly through cc65, via
+  `target: "eater6502"` on `/compile` or `/assemble`. What is missing is an
+  emitter: until 2026-09-02 the device was registered on the AVR generator and
+  produced `<avr/io.h>` and `ISR(TIMER0_COMPA_vect)` for a 65C02. It now
+  refuses at the `DEVICE` line and says where the working lanes are, because
+  emitting nothing beats emitting confident code for the wrong architecture.
+  Writing it is scoped rather than hidden: the pins are the 65C22 VIA's
+  (`$6000` PORTB, `$6001` PORTA, `$6002`/`$6003` the DDRs), and the open
+  question is the millisecond tick — VIA Timer 1 in free-run mode wants an IRQ
+  handler, and `crt0.s` currently points IRQ at a bare `RTI`.
 - **A `DEVICE` line does not set the SDCC size flags.** The DEVICE decides the
   toolchain, but `--code-size` still comes from the request's `target` field,
   so `DEVICE STC89C52RC` without an explicit `target` is compiled with the
   STC12's 60 KB limit rather than its own 8 KB. Pass `target` as well until
   this is wired.
-- **`randint(a, b)` and `controller dx/dy` are Arcade-only, and crash
-  elsewhere.** Both parse on every device and both round-trip, but the C
-  emitter has no case for them, so a hardware device raises a bare `TypeError`
-  and `/compile` and `/transpile` return a 500 instead of a parse error naming
-  the board. They are listed in the statement table below with that caveat.
+- **`print` is refused on the ATtinys**, which is correct: neither the ATtiny85
+  nor the ATtiny88 has a USART.
 - No `LIST`/arrays in the dialect; PWM via the PCA modules and UART output as
   pseudocode statements are still unwritten.
+
+Closed on 2026-09-02, and now held by `test_device_matrix.py`:
+`attiny85`/`attiny88` (the generator emitted ATmega Timer-0 spellings — the
+ATtiny85 names the mask register `TIMSK`, and the ATtiny48/88 has no `TCCR0B`
+or `WGM01` at all), and the arcade verbs plus `randint`/`controller` returning
+a 500 on a chip instead of a parse error naming the board.
 
 ---
 
@@ -467,7 +472,7 @@ callable across the boundary.
 | `set <v> to <e>` · `change <v> by <e>` | variables are 16-bit `int` |
 | `stop` | ends this script; the others keep running |
 | `print <e>` | UART, 9600 baud |
-| `randint(a, b)` · `controller dx/dy` | **Arcade only** — see *Known gaps* |
+| `randint(a, b)` · `controller dx/dy` | MakeCode Arcade only; refused elsewhere |
 | `+ - * / %` (`mod`), `= != < > <= >=`, `and or not` | `=` compares, as in Scratch |
 
 Procedures may be called before they are defined — the order people actually
@@ -661,9 +666,10 @@ Provenance for the API surface is MIT throughout — see `docs/ARCADE-SCOPING.md
 ### The 6502
 
 `DEVICE EATER6502:` names the composable 6502 machine from the Ben Eater
-build — 65C02, 32 KB ROM at `$8000`, VIA ports `PA0`–`PA7` / `PB0`–`PB6`. The
-**assembly and hand-written-C lanes work** through cc65 (`ca65`, `ld65`,
-`cc65` with `eater.cfg`). The pseudocode lane does not yet — see
+build — 65C02, 32 KB ROM at `$8000`, a 65C22 VIA at `$6000`, RAM below
+`$4000` (`eater.cfg`, `crt0.s`). The **assembly and hand-written-C lanes
+work** through cc65 (`ca65`, `ld65`, `cc65`). The pseudocode lane has no
+generator and refuses at the `DEVICE` line saying so — see
 [Known gaps](#known-gaps).
 
 ### What works where
