@@ -204,3 +204,40 @@ divergence: mirror note (b) said these force the ISR but not the
 scheduler — sb3-creator instead forces its scheduler path even for a
 single WHEN (the matrix precedent: its ISR only exists there). Same ISR
 bytes, different main() shell.
+
+
+## LIST — a gap closed in the direction this repo was behind (2026-09-02)
+
+The first section of this file lists verb families sb3-creator has and this
+oracle does not. `LIST` was one of them: sb3-creator carries `LIST items` plus
+`add X to L`, `delete N of L`, `delete all of L`, `insert X at N of L`,
+`replace item N of L with X` and the reporters `item N of L`, `length of L`,
+`L contains X`. This side had only `TABLE` — constants in flash, read-only.
+
+Now implemented here with sb3-creator's exact spellings, so nothing has to be
+re-litigated, and lowered to C for every C target: the STC 8051 family, bare
+AVR including the ATtinys, and the Arduino core. Round-trips as a fixed point,
+including all three declaration forms — an initialiser, `SIZE n`, and bare.
+
+**Three deliberate divergences from Scratch, forced by there being no heap.**
+They are semantics, not omissions, and a mirror has to match them or the same
+program means different things on the two sides:
+
+1. Capacity is fixed at compile time, and 128 items is the ceiling (2 bytes an
+   item against 256 bytes of IRAM).
+2. `add` to a full list is dropped rather than growing it.
+3. Indices are 1-based, as Scratch's are; a read out of range gives 0 rather
+   than the empty string, which has no representation here, and a write out of
+   range is dropped rather than running off the array.
+
+**Still open on this side:** micro:bit, Pico and MakeCode Arcade refuse a
+`LIST` by name. MicroPython and TypeScript both have real lists, so what is
+missing is the lowering in `bw_micropython` and `bw_arcade`, not the
+capability — and on those two the fixed-capacity divergences above would not
+apply, which is itself a divergence worth settling before the lowering lands
+rather than after.
+
+test_lists.py (27 tests) pins the grammar, the round trip, the selective
+helper emission, and the semantics — the last by compiling the emitted
+helpers for the host and running them, because one-based indexing and an
+inert out-of-range write are silent when wrong.

@@ -335,8 +335,11 @@ and emits something is easy to mistake for a device that works:
   handler, and `crt0.s` currently points IRQ at a bare `RTI`.
 - **`print` is refused on the ATtinys**, which is correct: neither the ATtiny85
   nor the ATtiny88 has a USART.
-- No `LIST`/arrays in the dialect; PWM via the PCA modules and UART output as
-  pseudocode statements are still unwritten.
+- **`LIST` is not lowered on micro:bit, Pico or Arcade yet.** MicroPython and
+  TypeScript both have real lists, so this is missing lowering rather than a
+  missing capability; until it exists those devices refuse a `LIST` by name.
+- PWM via the PCA modules and UART output as pseudocode statements are still
+  unwritten.
 
 Closed on 2026-09-02, and now held by `test_device_matrix.py`:
 `attiny85`/`attiny88` (the generator emitted ATmega Timer-0 spellings — the
@@ -391,6 +394,7 @@ DEVICE STC12C5A60S2:
 | `PIN <n> = D9 PWM` / `TONE` | hardware timer channels, not bit-banged |
 | `PORT <n> = P2 OUTPUT [ACTIVE LOW]` | whole-byte I/O, one store |
 | `TABLE <n> = 1, 2, 4, 8` | constants in flash, read with `name[i]` |
+| `LIST <n>` · `LIST <n> SIZE 20` · `LIST <n> = 1, 2, 3` | variables in RAM, fixed capacity |
 
 The location on the right of the `=` is whatever the `DEVICE` calls a pin, and
 the device checks it — down to the package:
@@ -483,6 +487,44 @@ callable across the boundary.
 | `print <e>` | UART, 9600 baud |
 | `randint(a, b)` · `controller dx/dy` | MakeCode Arcade only; refused elsewhere |
 | `+ - * / %` (`mod`), `= != < > <= >=`, `and or not` | `=` compares, as in Scratch |
+
+### Lists
+
+A `TABLE` is constants in flash; a `LIST` is variables in RAM, which on these
+parts is the scarce one. The verbs are Scratch's, by way of `sb3-creator`:
+
+```
+add 7 to scores                      set n to item 2 of scores
+delete 1 of scores                   set m to length of scores
+delete all of scores                 IF scores contains 9 THEN:
+insert 9 at 2 of scores
+replace item 1 of scores with 42
+```
+
+Three things follow from there being no heap, and each is a deliberate
+difference from Scratch rather than an oversight:
+
+- **Capacity is fixed at compile time.** An initialiser sizes the list,
+  `SIZE n` states it, a bare `LIST l` gets 16. Every item is a 16-bit `int`,
+  so 128 items is the ceiling — an STC12 has 256 bytes of IRAM, and without
+  a limit here the first complaint arrives from the linker, much later, about
+  something else.
+- **`add` to a full list is dropped.** Scratch grows the list; there is
+  nowhere to grow to. This is the one place the semantics genuinely differ.
+- **Indices are 1-based and out-of-range is inert.** `item 1 of l` is the
+  first, as in Scratch. A read past the end gives `0` — Scratch gives the
+  empty string, which has no analogue here — and a write past the end is
+  dropped, because the alternative is somebody else's variable.
+
+`item <n> of <list>` parses its index as an atom, so a compound index keeps
+its parentheses: `item (a + 1) of scores`. Otherwise the `of` would be read
+as part of the index.
+
+Only the helpers a program actually calls are emitted, because an unused
+`static` function is `-Wunused-function` and the AVR goldens build under
+`-Werror`. The semantics are checked by *running* the emitted C on the host,
+not by reading it: one-based indexing, an inert out-of-range write, and `add`
+stopping at capacity are all silent when wrong.
 
 Procedures may be called before they are defined — the order people actually
 write in — because headers are registered in a first pass. Parameters are
@@ -1103,7 +1145,7 @@ Everything below must pass before pushing.
 
 | suite | what it holds to account | scale |
 |---|---|---|
-| `pytest test_*.py` | the dialect, PARTs, display verbs, arcade, assembler, UF2, listings, ARM builds, the device matrix | **382** |
+| `pytest test_*.py` | the dialect, PARTs, lists, display verbs, arcade, assembler, UF2, listings, ARM builds, the device matrix | **409** |
 | `scripts/test-roundtrip.py` | `parse` and `emit_pseudocode` are inverses | **1,014** |
 | `scripts/test-api.py` | production: every endpoint, language, family, and the debug payloads | **229** |
 | `scripts/test-parity.py` | every target × every feature, both directions | 82 |

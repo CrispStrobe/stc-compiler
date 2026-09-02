@@ -101,6 +101,43 @@ class Index(Expr):
     where: Expr
 
 
+# ---- LIST: the mutable sibling of TABLE ---------------------------------
+#
+# A TABLE is constants in flash; a LIST is variables in RAM, which on these
+# parts is the scarce one. Three consequences shape all of the below:
+#
+#   Fixed capacity.  There is no heap. `LIST l = 1, 2, 3` sizes itself from
+#                    the initialiser, `LIST l SIZE 20` says so outright, and a
+#                    bare `LIST l` gets LIST_DEFAULT_CAP. `add` to a full list
+#                    is a no-op -- Scratch grows the list and we cannot, and
+#                    that is the one place the semantics genuinely differ.
+#   One-based.       Scratch's lists are 1-based and this dialect mirrors
+#                    sb3-creator's, so `item 1 of l` is the first element.
+#                    Getting this wrong is silent, so it is pinned by tests.
+#   Range-safe.      Scratch reads out of range as the empty string. There is
+#                    no such value here, so a read returns 0 and a write is
+#                    dropped. Never a wild pointer: past the end of a 16-entry
+#                    array is somebody else's variable.
+@dataclass
+class ListItem(Expr):
+    """item <where> of <list> -- 1-based, 0 when out of range."""
+    name: str
+    where: Expr
+
+
+@dataclass
+class ListLength(Expr):
+    """length of <list>."""
+    name: str
+
+
+@dataclass
+class ListContains(Expr):
+    """<list> contains <value>."""
+    name: str
+    value: Expr
+
+
 @dataclass
 class Var(Expr):
     name: str
@@ -271,6 +308,37 @@ class SetVar(Stmt):
 class ChangeVar(Stmt):
     name: str
     delta: Expr
+
+
+@dataclass
+class ListAdd(Stmt):
+    name: str
+    value: Expr
+
+
+@dataclass
+class ListDelete(Stmt):
+    name: str
+    where: Expr
+
+
+@dataclass
+class ListDeleteAll(Stmt):
+    name: str
+
+
+@dataclass
+class ListInsert(Stmt):
+    name: str
+    where: Expr
+    value: Expr
+
+
+@dataclass
+class ListReplace(Stmt):
+    name: str
+    where: Expr
+    value: Expr
 
 
 @dataclass
@@ -823,6 +891,34 @@ class Target:
     # entirely the wrong architecture.
     pseudocode_gap: str | None = None
 
+    # ---- LIST -----------------------------------------------------------
+    def list_declarations(self, program) -> list:
+        """RAM arrays plus the helpers this program actually uses.
+
+        Shared by every C target: a LIST is a plain array on all of them,
+        unlike a TABLE, which is __code on the 8051 and PROGMEM-adjacent on an
+        AVR and so is emitted three times over."""
+        if not program.lists:
+            return []
+        out = [
+            "/* LISTs are RAM, which is the scarce resource here -- 2 bytes per",
+            " * item plus a length byte. Capacity is fixed at compile time: there",
+            " * is no heap, so `add` to a full list is dropped rather than grown.",
+            " * Indices are 1-based, as Scratch's are. A read out of range gives 0",
+            " * and a write out of range is dropped, because the alternative is",
+            " * somebody else's variable. */",
+        ]
+        for name, (capacity, values) in program.lists.items():
+            init = ", ".join(str(v) for v in values) if values else "0"
+            out.append(f"static int bw_list_{name}[{capacity}] = {{ {init} }};")
+            out.append(f"static unsigned char bw_list_{name}_len = {len(values)};")
+        out.append("")
+        for key in ("get", "set", "add", "del", "ins", "has"):
+            if key in program.list_ops:
+                out += LIST_HELPERS[key]
+                out.append("")
+        return out
+
     # Which compiler turns this target's output into an image. Transpiling is
     # free; compiling is not, and the hosted service vendors SDCC only. Saying
     # so here lets the caller refuse clearly instead of handing Arduino C++ to
@@ -984,7 +1080,7 @@ class Target:
 
 
 class Stc8051Target(Target):
-    supports = frozenset({"pwm", "tone", "print", "port", "table", "part",
+    supports = frozenset({"pwm", "tone", "print", "port", "table", "part", "list",
                           "keypad", "matrix"})
 
     """The 8051 families, which differ from each other only in three flags.
@@ -1701,6 +1797,7 @@ class Stc8051Target(Target):
                 "}",
                 "",
             ]
+        out += self.list_declarations(program)
         if program.uses_uart:
             out += [
                 "/* Serial console on UART1, 8N1 at " + str(BW_BAUD) + " baud.",
@@ -1989,7 +2086,7 @@ class ArduinoTarget(Target):
     # hides behind digitalWrite, and reaching past it would give up the
     # portability that is the reason to emit core C++ at all. A PART needs
     # only three pins the core is happy to drive.
-    supports = frozenset({"pwm", "tone", "print", "table", "part"})
+    supports = frozenset({"pwm", "tone", "print", "table", "part", "list"})
     compile_hint = ("DEVICE ATMEGA328P: is the same board without the Arduino "
                     "core, and that one does compile here.")
     source_extension = "ino"
@@ -2154,6 +2251,7 @@ class ArduinoTarget(Target):
                 "}",
                 "",
             ]
+        out += self.list_declarations(program)
         if program.tone_pin is not None:
             out += [
                 "/* 0 Hz means silence, and the frequency is an expression, so",
@@ -2255,6 +2353,63 @@ AVR_PRESCALERS = [(1, "_BV(CS00)"), (8, "_BV(CS01)"),
                   (1024, "_BV(CS02) | _BV(CS00)")]
 
 
+LIST_HELPERS = {
+    'get': [
+        'static int bw_list_get(int *a, unsigned char n, int i)',
+        '{',
+        '    if (i < 1 || i > (int)n) return 0;',
+        '    return a[i - 1];',
+        '}',
+    ],
+    'set': [
+        'static void bw_list_set(int *a, unsigned char n, int i, int v)',
+        '{',
+        '    if (i < 1 || i > (int)n) return;',
+        '    a[i - 1] = v;',
+        '}',
+    ],
+    'add': [
+        'static void bw_list_add(int *a, unsigned char *n, unsigned char cap, int v)',
+        '{',
+        '    if (*n >= cap) return;',
+        '    a[(*n)++] = v;',
+        '}',
+    ],
+    'del': [
+        'static void bw_list_del(int *a, unsigned char *n, int i)',
+        '{',
+        '    unsigned char k;',
+        '    if (i < 1 || i > (int)*n) return;',
+        '    for (k = (unsigned char)i; k < *n; k++) a[k - 1] = a[k];',
+        '    (*n)--;',
+        '}',
+    ],
+    'ins': [
+        'static void bw_list_ins(int *a, unsigned char *n, unsigned char cap,',
+        '                        int i, int v)',
+        '{',
+        '    unsigned char k;',
+        '    if (*n >= cap) return;',
+        '    if (i < 1) i = 1;',
+        '    if (i > (int)*n + 1) i = (int)*n + 1;',
+        '    /* k stops at i-1 rather than counting down through 0: an',
+        '     * unsigned char decremented past zero wraps to 255. */',
+        '    for (k = *n; k > (unsigned char)(i - 1); k--) a[k] = a[k - 1];',
+        '    (*n)++;',
+        '    a[i - 1] = v;',
+        '}',
+    ],
+    'has': [
+        'static unsigned char bw_list_has(int *a, unsigned char n, int v)',
+        '{',
+        '    unsigned char k;',
+        '    for (k = 0; k < n; k++) if (a[k] == v) return 1;',
+        '    return 0;',
+        '}',
+    ],
+}
+
+
 @dataclass
 class AvrPin(Pin):
     """A port letter and a bit, plus the ADC channel where there is one."""
@@ -2286,7 +2441,7 @@ class AvrTarget(Target):
 
     # Everything the 8051 has. PORT is PORTB/PORTC/PORTD, and a PART is three
     # ordinary output pins bit-banged in the right order.
-    supports = frozenset({"pwm", "tone", "print", "table", "port", "part"})
+    supports = frozenset({"pwm", "tone", "print", "table", "port", "part", "list"})
 
     # Our own tick, so we choose the width -- but 16 bits would wrap every 65 s
     # and these deadlines are compared against a free-running counter, so it is
@@ -2541,6 +2696,7 @@ class AvrTarget(Target):
                 "}",
                 "",
             ]
+        out += self.list_declarations(program)
 
         if program.tone_pin is not None:
             out += [
@@ -2818,6 +2974,8 @@ class Program:
     procedures: dict = field(default_factory=dict)
     parts: dict = field(default_factory=dict)    # name -> ShiftPart
     tables: dict = field(default_factory=dict)   # name -> list[int], in flash
+    # name -> (capacity, initial values). RAM, mutable, fixed capacity.
+    lists: dict = field(default_factory=dict)
     ports: dict = field(default_factory=dict)    # name -> Port, whole-byte I/O
     # One entry per `WHEN started:` block. `body` mirrors whens[0] so older
     # call sites keep working; with several blocks the C back end emits a
@@ -2844,6 +3002,48 @@ class Program:
     @property
     def has_ledbank(self) -> bool:
         return any(isinstance(p, LedBankPart) for p in self.parts.values())
+
+    @property
+    def list_ops(self) -> set:
+        """Which LIST helpers this program actually calls.
+
+        Emitted selectively rather than all-at-once because an unused static
+        function is -Wunused-function, and the AVR goldens are built under
+        -Werror in CI. A feature that only breaks the build when you do not
+        use all of it is a poor trade."""
+        found = set()
+        NODES = {ListItem: "get", ListLength: None, ListContains: "has",
+                 ListAdd: "add", ListDelete: "del", ListDeleteAll: None,
+                 ListInsert: "ins", ListReplace: "set"}
+
+        def walk(node):
+            helper = NODES.get(type(node))
+            if helper:
+                found.add(helper)
+            for attr in ("body", "then", "otherwise", "value", "where",
+                         "count", "condition", "cond"):
+                inner = getattr(node, attr, None)
+                if isinstance(inner, list):
+                    for item in inner:
+                        walk(item)
+                elif inner is not None and hasattr(inner, "__dataclass_fields__"):
+                    walk(inner)
+            # Binary/Unary operands and call arguments carry reporters too.
+            for attr in ("left", "right", "operand", "args"):
+                inner = getattr(node, attr, None)
+                if isinstance(inner, list):
+                    for item in inner:
+                        walk(item)
+                elif inner is not None and hasattr(inner, "__dataclass_fields__"):
+                    walk(inner)
+
+        for body in [self.body, *self.whens]:
+            for node in body:
+                walk(node)
+        for procedure in self.procedures.values():
+            for node in getattr(procedure, "body", []):
+                walk(node)
+        return found
 
     @property
     def uses_adc(self) -> bool:
@@ -3067,6 +3267,36 @@ class ExprParser:
         if (lowered in self.program.parts
                 and isinstance(self.program.parts[lowered], KeypadPart)):
             return KeypadRef(lowered)
+        # `item <n> of <list>` -- the index is an ATOM so the trailing `of` is
+        # not swallowed into it, the same reason `pixel X Y is on` uses atoms.
+        # `item (a + 1) of l` is how you index by an expression.
+        if lowered == "item" and self.program.lists:
+            where = self.atom()
+            nxt = self.take()
+            if nxt is None or nxt.lower() != "of":
+                raise PseudocodeError(self.line, "expected 'of' after 'item <n>'")
+            name = self.take()
+            if name is None or name.lower() not in self.program.lists:
+                raise PseudocodeError(
+                    self.line, f"{name!r} is not a LIST")
+            return ListItem(name.lower(), where)
+        if lowered == "length" and self.program.lists:
+            nxt = self.take()
+            if nxt is None or nxt.lower() != "of":
+                raise PseudocodeError(self.line, "expected 'of' after 'length'")
+            name = self.take()
+            if name is None or name.lower() not in self.program.lists:
+                raise PseudocodeError(self.line, f"{name!r} is not a LIST")
+            return ListLength(name.lower())
+        if lowered in self.program.lists:
+            nxt = self.peek()
+            if nxt is not None and nxt.lower() == "contains":
+                self.take()
+                return ListContains(lowered, self.parse())
+            raise PseudocodeError(
+                self.line,
+                f"{token!r} is a LIST; read it as `item <n> of {token}`, "
+                f"`length of {token}` or `{token} contains <value>`")
         if lowered in self.program.tables:
             if self.take() != "[":
                 raise PseudocodeError(
@@ -3320,6 +3550,44 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
     drawn = matrix_statement(text, program, line)
     if drawn is not None:
         return drawn
+
+    # ---- LIST verbs. Spellings are sb3-creator's, which are Scratch's. ----
+    def a_list(name, where):
+        key = name.lower()
+        if key not in program.lists:
+            known = ", ".join(sorted(program.lists)) or "none declared"
+            raise PseudocodeError(
+                where, f"{name!r} is not a LIST (declared: {known})")
+        return key
+
+    # `delete all of L` first: `delete <n> of L` would otherwise match it with
+    # n = "all", and then fail much later inside the expression parser.
+    del_all = re.fullmatch(r"delete\s+all\s+of\s+(\w+)", text, re.I)
+    if del_all:
+        return ListDeleteAll(a_list(del_all.group(1), line))
+
+    add_to = re.fullmatch(r"add\s+(.+?)\s+to\s+(\w+)", text, re.I)
+    if add_to and add_to.group(2).lower() in program.lists:
+        return ListAdd(a_list(add_to.group(2), line),
+                       expression(add_to.group(1), program, line))
+
+    del_of = re.fullmatch(r"delete\s+(.+?)\s+of\s+(\w+)", text, re.I)
+    if del_of and del_of.group(2).lower() in program.lists:
+        return ListDelete(a_list(del_of.group(2), line),
+                          expression(del_of.group(1), program, line))
+
+    ins_at = re.fullmatch(r"insert\s+(.+?)\s+at\s+(.+?)\s+of\s+(\w+)", text, re.I)
+    if ins_at and ins_at.group(3).lower() in program.lists:
+        return ListInsert(a_list(ins_at.group(3), line),
+                          expression(ins_at.group(2), program, line),
+                          expression(ins_at.group(1), program, line))
+
+    repl = re.fullmatch(
+        r"replace\s+item\s+(.+?)\s+of\s+(\w+)\s+with\s+(.+)", text, re.I)
+    if repl and repl.group(2).lower() in program.lists:
+        return ListReplace(a_list(repl.group(2), line),
+                           expression(repl.group(1), program, line),
+                           expression(repl.group(3), program, line))
 
     # ---- Arcade game-engine verbs ----
     # One guard for the family: every one of them starts with `arcade`, so the
@@ -3726,6 +3994,11 @@ LEDBANK_RE = re.compile(
 PORT_DECL_RE = re.compile(r"port\s+(\w+)\s*=\s*(\S+)\s+(output|input)"
                           r"(?:\s+active\s+(low|high))?", re.I)
 TABLE_RE = re.compile(r"table\s+(\w+)\s*=\s*(.+)$", re.I)
+# `LIST l`, `LIST l SIZE 20`, `LIST l = 1, 2, 3`. sb3-creator spells the
+# bare form; the other two exist because a fixed capacity has to come from
+# somewhere and guessing it silently is how you overflow 256 bytes of IRAM.
+LIST_RE = re.compile(r"list\s+(\w+)\s*(?:size\s+(\d+)|=\s*(.+?))?\s*$", re.I)
+LIST_DEFAULT_CAP = 16
 CLOCK_RE = re.compile(r"clock\s+([\d_]+)\s*(hz|mhz)?", re.I)
 # Deliberately strict, and not only for tidiness: this string is handed back in
 # a Content-Disposition header and used as a filename. Letters, digits,
@@ -4053,6 +4326,56 @@ def parse(source: str) -> Program:
             index += 1
             continue
 
+        # LIST must be tried before PIN and after TABLE: `list` is a keyword
+        # only at declaration position, and the regex is permissive enough
+        # (`list <name>` alone is legal) that it would otherwise shadow.
+        listing = LIST_RE.fullmatch(text.strip())
+        if listing and not started:
+            require(program, "list", line.number, "a LIST")
+            name, size, init = listing.groups()
+            key = name.lower()
+            if key in program.lists:
+                raise PseudocodeError(line.number, f"list {name!r} declared twice")
+            if key in program.tables:
+                raise PseudocodeError(
+                    line.number,
+                    f"{name!r} is already a TABLE; a TABLE is constants in flash "
+                    f"and a LIST is variables in RAM, so one name cannot be both")
+            values = []
+            if init is not None:
+                for item in init.split(","):
+                    item = item.strip()
+                    try:
+                        values.append(int(item, 0) if not item.startswith(("0b", "0B"))
+                                      else int(item[2:], 2))
+                    except ValueError:
+                        raise PseudocodeError(
+                            line.number,
+                            f"{item!r} is not a constant; a LIST is initialised "
+                            f"with numbers and changed at run time")
+                if not values:
+                    raise PseudocodeError(line.number, f"list {name!r} is empty")
+                capacity = len(values)
+            elif size is not None:
+                capacity = int(size)
+            else:
+                capacity = LIST_DEFAULT_CAP
+            if capacity < 1:
+                raise PseudocodeError(line.number, f"list {name!r} needs room for at "
+                                                   f"least one item")
+            # Every element is a 16-bit int, so the RAM cost is 2*capacity plus
+            # a length byte. On an STC12 that is 256 bytes of IRAM total, and a
+            # program that asks for 200 items has not been told no by anything
+            # else until the linker, much later, in a different vocabulary.
+            if capacity > 128:
+                raise PseudocodeError(
+                    line.number,
+                    f"list {name!r} asks for {capacity} items, which is "
+                    f"{capacity * 2} bytes of RAM; 128 is the ceiling here")
+            program.lists[key] = (capacity, values)
+            index += 1
+            continue
+
         pin = PIN_RE.fullmatch(lowered)
         if pin and not started:
             name, where, direction, active = pin.groups()
@@ -4184,6 +4507,15 @@ def expr_pseudo(node: Expr, parent_level: int = -1) -> str:
         return node.part
     if isinstance(node, MatrixPixelRef):
         return f"pixel {expr_pseudo(node.x)} {expr_pseudo(node.y)} is on"
+    if isinstance(node, ListItem):
+        # The index re-emits at unary level: it parses as an ATOM, so anything
+        # compound must keep its parentheses or the `of` that follows would be
+        # read as part of the index on the way back in.
+        return f"item {expr_pseudo(node.where, UNARY_LEVEL)} of {node.name}"
+    if isinstance(node, ListLength):
+        return f"length of {node.name}"
+    if isinstance(node, ListContains):
+        return f"{node.name} contains {expr_pseudo(node.value)}"
     if isinstance(node, Randint):
         return f"randint({expr_pseudo(node.low)}, {expr_pseudo(node.high)})"
     if isinstance(node, ControllerAxis):
@@ -4257,6 +4589,18 @@ def stmts_pseudo(body: list, depth: int, active_low: dict) -> list[str]:
             out.append(f"{pad}set {node.name} to {expr_pseudo(node.value)}")
         elif isinstance(node, ChangeVar):
             out.append(f"{pad}change {node.name} by {expr_pseudo(node.delta)}")
+        elif isinstance(node, ListAdd):
+            out.append(f"{pad}add {expr_pseudo(node.value)} to {node.name}")
+        elif isinstance(node, ListDeleteAll):
+            out.append(f"{pad}delete all of {node.name}")
+        elif isinstance(node, ListDelete):
+            out.append(f"{pad}delete {expr_pseudo(node.where)} of {node.name}")
+        elif isinstance(node, ListInsert):
+            out.append(f"{pad}insert {expr_pseudo(node.value)} at "
+                       f"{expr_pseudo(node.where)} of {node.name}")
+        elif isinstance(node, ListReplace):
+            out.append(f"{pad}replace item {expr_pseudo(node.where)} of "
+                       f"{node.name} with {expr_pseudo(node.value)}")
         elif isinstance(node, Forever):
             out.append(f"{pad}FOREVER:")
             out += stmts_pseudo(node.body, depth + 1, active_low)
@@ -4395,6 +4739,19 @@ def emit_pseudocode(program: Program) -> str:
         out.append("")
         for name, values in program.tables.items():
             out.append(f"  TABLE {name} = " + ", ".join(f"0x{v:02X}" for v in values))
+    if program.lists:
+        out.append("")
+        for name, (capacity, values) in program.lists.items():
+            # An initialiser sizes the list, so re-emitting it re-derives the
+            # same capacity. A list with no initialiser has to say SIZE, or
+            # the capacity is lost and the round trip silently resizes it --
+            # and only a program that overflows would ever notice.
+            if values:
+                out.append(f"  LIST {name} = " + ", ".join(str(v) for v in values))
+            elif capacity == LIST_DEFAULT_CAP:
+                out.append(f"  LIST {name}")
+            else:
+                out.append(f"  LIST {name} SIZE {capacity}")
     if program.parts:
         out.append("")
         for part in program.parts.values():
@@ -4502,6 +4859,19 @@ def expr_c(node: Expr, ctx: Emit, parent_level: int = -1) -> str:
         if pin.direction == "analog":
             return ctx.target.read_analog(pin)
         return ctx.target.read_pin(pin)
+    if isinstance(node, ListItem):
+        return (f"bw_list_get(bw_list_{node.name}, bw_list_{node.name}_len, "
+                f"{expr_c(node.where, ctx)})")
+    if isinstance(node, ListLength):
+        # No cast: the length is an unsigned char and C's integer promotions
+        # already widen it in any expression it appears in. Naming a width
+        # here would be this walker deciding something that belongs to the
+        # target -- which scripts/test-golden.py forbids by reading the
+        # source, and which caught exactly this.
+        return f"bw_list_{node.name}_len"
+    if isinstance(node, ListContains):
+        return (f"bw_list_has(bw_list_{node.name}, bw_list_{node.name}_len, "
+                f"{expr_c(node.value, ctx)})")
     if isinstance(node, KeypadRef):
         return f"bw_part_{node.part}_read()"
     if isinstance(node, MatrixPixelRef):
@@ -4690,6 +5060,25 @@ def stmts_c(body: list, depth: int, ctx: Emit) -> list[str]:
             # braces say "this loop has no body" unambiguously, to the
             # compiler and to anyone reading the output.
             out.append(f"{pad}while (!({expr_c(node.cond, ctx)})) {{ }}")
+        elif isinstance(node, ListAdd):
+            out.append(f"{pad}bw_list_add(bw_list_{node.name}, "
+                       f"&bw_list_{node.name}_len, "
+                       f"{ctx.program.lists[node.name][0]}, "
+                       f"{expr_c(node.value, ctx)});")
+        elif isinstance(node, ListDeleteAll):
+            out.append(f"{pad}bw_list_{node.name}_len = 0;")
+        elif isinstance(node, ListDelete):
+            out.append(f"{pad}bw_list_del(bw_list_{node.name}, "
+                       f"&bw_list_{node.name}_len, {expr_c(node.where, ctx)});")
+        elif isinstance(node, ListInsert):
+            out.append(f"{pad}bw_list_ins(bw_list_{node.name}, "
+                       f"&bw_list_{node.name}_len, "
+                       f"{ctx.program.lists[node.name][0]}, "
+                       f"{expr_c(node.where, ctx)}, {expr_c(node.value, ctx)});")
+        elif isinstance(node, ListReplace):
+            out.append(f"{pad}bw_list_set(bw_list_{node.name}, "
+                       f"bw_list_{node.name}_len, {expr_c(node.where, ctx)}, "
+                       f"{expr_c(node.value, ctx)});")
         elif isinstance(node, SetVar):
             out.append(f"{pad}{node.name} = {expr_c(node.value, ctx)};")
         elif isinstance(node, ChangeVar):
@@ -4857,6 +5246,25 @@ def stmts_task(body: list, depth: int, ctx: Emit,
             out += [f"{pad}{task}_state = {state};",
                     f"{pad}case {state}:",
                     f"{pad}if (!({expr_c(node.cond, ctx)})) return;"]
+        elif isinstance(node, ListAdd):
+            out.append(f"{pad}bw_list_add(bw_list_{node.name}, "
+                       f"&bw_list_{node.name}_len, "
+                       f"{ctx.program.lists[node.name][0]}, "
+                       f"{expr_c(node.value, ctx)});")
+        elif isinstance(node, ListDeleteAll):
+            out.append(f"{pad}bw_list_{node.name}_len = 0;")
+        elif isinstance(node, ListDelete):
+            out.append(f"{pad}bw_list_del(bw_list_{node.name}, "
+                       f"&bw_list_{node.name}_len, {expr_c(node.where, ctx)});")
+        elif isinstance(node, ListInsert):
+            out.append(f"{pad}bw_list_ins(bw_list_{node.name}, "
+                       f"&bw_list_{node.name}_len, "
+                       f"{ctx.program.lists[node.name][0]}, "
+                       f"{expr_c(node.where, ctx)}, {expr_c(node.value, ctx)});")
+        elif isinstance(node, ListReplace):
+            out.append(f"{pad}bw_list_set(bw_list_{node.name}, "
+                       f"bw_list_{node.name}_len, {expr_c(node.where, ctx)}, "
+                       f"{expr_c(node.value, ctx)});")
         elif isinstance(node, SetVar):
             out.append(f"{pad}{node.name} = {expr_c(node.value, ctx)};")
         elif isinstance(node, ChangeVar):
