@@ -1071,7 +1071,7 @@ Everything below must pass before pushing.
 
 | suite | what it holds to account | scale |
 |---|---|---|
-| `pytest test_*.py` | the dialect, PARTs, display verbs, arcade, assembler, UF2, listings, ARM builds | **335** |
+| `pytest test_*.py` | the dialect, PARTs, display verbs, arcade, assembler, UF2, listings, ARM builds, the device matrix | **380** |
 | `scripts/test-roundtrip.py` | `parse` and `emit_pseudocode` are inverses | **1,014** |
 | `scripts/test-api.py` | production: every endpoint, language, family | **172** |
 | `scripts/test-parity.py` | every target × every feature, both directions | 82 |
@@ -1084,12 +1084,12 @@ Everything below must pass before pushing.
 | `scripts/test-pinmap.py` | what each package actually brings out | 38 |
 | `scripts/test-tables-ports.py` | flash tables and whole-port I/O | 34 |
 | `scripts/test-pages.py` | `docs/` still mirrors the transpiler | 25 |
-| `scripts/test-wiring.py` | every test runs in CI, or says why not | 23 |
+| `scripts/test-wiring.py` | every test runs in CI, or says why not | 43 |
 | `scripts/test-disasm.py` | decode agrees with `sdas8051`'s own listing | 380/380 |
 | `scripts/test-reassemble.py` | disassembly reassembles byte-identically | 39/40 |
 
 ```bash
-python3 -m pytest -q test_*.py
+python3 -m pytest -q test_*.py            # needs: pytest fastapi pydantic
 for s in roundtrip parity peripherals golden wait-floor microbit symtab \
          pinmap tables-ports pages wiring; do python3 scripts/test-$s.py; done
 node scripts/test-flash.mjs
@@ -1104,9 +1104,14 @@ need a built image from the lab repo. `test-wiring.py` enforces that anything
 *not* on that list appears in the workflow — a test that is written,
 committed, green and never executed reads as coverage and is not.
 
-**Known gap in that guard:** `test-wiring.py` only scans `scripts/`, so the
-17 root-level `test_*.py` files — 335 tests — are green locally and are not
-run by CI.
+It checks both shapes of test this project has, which it did not always. A
+standalone suite in `scripts/` is wired if its filename appears in the
+workflow; a root `test_*.py` is wired if some step's pytest invocation would
+actually *collect* it, which is verified by expanding that step's own
+arguments rather than by trusting that the word `pytest` appears somewhere.
+Until 2026-09-02 it only scanned `scripts/`, and the eighteen root files —
+380 tests, the whole dialect — had never run in CI at all. A guard with a
+blind spot is not a weaker guard; it certifies the blind spot as covered.
 
 ---
 

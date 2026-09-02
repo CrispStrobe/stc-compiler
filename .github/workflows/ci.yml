@@ -143,6 +143,29 @@ jobs:
           path: avr/
           retention-days: 14
 
+  # The pytest suite at the repository root: the dialect, every PART, the
+  # display verbs, the Arcade back end, the five assembler chains, UF2,
+  # listings, ARM builds, and the device conformance matrix.
+  #
+  # It was written, committed, green and NEVER RUN here until 2026-09-02 --
+  # seventeen files and 380 tests that read as coverage in the file listing
+  # and were not. test-wiring.py exists to catch exactly that and did not,
+  # because it only ever scanned scripts/. It scans both now.
+  #
+  # Needs the vendored toolchains, which are committed, so a plain checkout
+  # is enough; app.py stages them into /tmp on demand as it does in
+  # production.
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --quiet pytest fastapi pydantic
+      - name: The root pytest suite
+        run: python3 -m pytest -q test_*.py
+
   # The static site. It claims to run the project's own transpiler in the
   # browser rather than a JavaScript copy of it, and the only way to know
   # that is to start a browser and watch it happen.

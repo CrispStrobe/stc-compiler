@@ -8,6 +8,23 @@ nobody looks at it again. This file found exactly that on 2026-08-09 --
 `test-wait-floor.py` had been added that morning, passed locally, and was
 absent from the workflow.
 
+Then on 2026-09-02 it missed a much larger instance of the same thing, for a
+reason worth writing down: it only looked in `scripts/`. The seventeen
+`test_*.py` files at the repository root -- 380 tests, the whole dialect, every
+PART, the Arcade back end, the assembler chains -- had never run in CI at all.
+A guard with a blind spot is not a weaker guard, it is a guard that certifies
+the blind spot as covered. So it now checks BOTH shapes of test this project
+has:
+
+  scripts/test-*.py   standalone suites, each named in the workflow
+  ./test_*.py         a pytest suite, collected as a group by one step
+
+The two need different checks. A standalone suite is wired if its filename
+appears in the workflow. A pytest file is wired if some step actually runs
+pytest over a set of paths that includes it -- which is checked by expanding
+the step's own arguments, not by trusting that `pytest` appearing anywhere
+means this file is collected.
+
 The rule is deliberately not "every test file must be in the workflow",
 because three of them genuinely cannot be:
 
@@ -84,6 +101,47 @@ for name, why in EXCLUDED.items():
        f"{name} is not secretly wired as well",
        "" if name not in text else
        f"it runs in CI but is listed as excluded because it {why}")
+
+# ---------------------------------------------------------------- pytest side
+#
+# The root suite is not run file-by-file, so "the name appears in the
+# workflow" is the wrong question. The right one is whether any step's pytest
+# invocation would COLLECT each file -- so the step's own arguments are
+# expanded as globs from the repository root and compared against what is
+# actually there.
+
+import re
+
+PYTEST_FILES = sorted(p.name for p in ROOT.glob("test_*.py"))
+
+print("\nthe root pytest suite is collected by CI")
+ok(bool(PYTEST_FILES), "there are root pytest files to check",
+   f"{len(PYTEST_FILES)} files")
+
+collected: set[str] = set()
+steps = re.findall(r"^\s*run:\s*(.+?)$", text, re.M)
+steps += re.findall(r"^\s*- run:\s*(.+?)$", text, re.M)
+for command in steps:
+    if "pytest" not in command:
+        continue
+    # Everything after the pytest invocation that is not a flag is a path.
+    tail = command.split("pytest", 1)[1].split()
+    args = [a for a in tail if not a.startswith("-")]
+    if not args:
+        args = ["."]            # bare `pytest` collects the whole tree
+    for arg in args:
+        for found in ROOT.glob(arg):
+            if found.name.startswith("test_") and found.suffix == ".py":
+                collected.add(found.name)
+
+ok(bool(collected), "some CI step runs pytest over the root suite",
+   "" if collected else
+   "no `run:` step invokes pytest -- the root test_*.py files never execute")
+
+for name in PYTEST_FILES:
+    ok(name in collected, f"{name} is collected by that step",
+       "" if name in collected else
+       "written, committed, and never executed -- widen the pytest step's paths")
 
 print(f"\n  {checks - failures}/{checks} checks passed")
 sys.exit(1 if failures else 0)
