@@ -815,6 +815,14 @@ class Target:
     # is every non-8051 one -- leaves this True and the check passes.
     baud_from_brt = True
 
+    # Set when the DEVICE name is real and understood but no code generator
+    # exists for it yet -- the reason, in the words the person at the keyboard
+    # needs. A name with no generator has to refuse at the DEVICE line: the
+    # alternative is what the EATER6502 did until 2026-09-02, which was to
+    # borrow the nearest generator and emit confident, well-formed code for
+    # entirely the wrong architecture.
+    pseudocode_gap: str | None = None
+
     # Which compiler turns this target's output into an image. Transpiling is
     # free; compiling is not, and the hosted service vendors SDCC only. Saying
     # so here lets the caller refuse clearly instead of handing Arduino C++ to
@@ -3738,9 +3746,12 @@ def parse(source: str) -> Program:
     if device:
         program.part = device.group(1).lower()
         if program.part in TARGETS:
+            target = TARGETS[program.part]
+            if target.pseudocode_gap:
+                raise PseudocodeError(lines[0].number, target.pseudocode_gap)
             # The device decides what CLOCK means when the program is silent.
             # A later CLOCK line still wins.
-            program.clock = TARGETS[program.part].default_clock
+            program.clock = target.default_clock
         if program.part not in TARGETS:
             raise PseudocodeError(
                 lines[0].number,
@@ -5214,11 +5225,33 @@ TARGETS["attiny85"] = PortBitAvrTarget(
 TARGETS["stc15w408as"] = _stc(
     "stc15w408as", "STC15W408AS", "stc12.h", True, True, True, True, p5=True)
 
-# EATER6502: the pseudocode parser accepts the device. The compile
-# service routes it to cc65 (a different backend than SDCC). Pin names
-# are PA0-PA7 / PB0-PB6 (the VIA ports).
-TARGETS["eater6502"] = PortBitAvrTarget(
-    "eater6502", "Eater 6502", "eater6502", 32768, ports="AB", default_clock=1000000)
+# EATER6502 -- the composable 65C02 machine: 32 KB ROM at $8000, a 65C22
+# VIA at $6000, RAM below $4000 (eater.cfg, crt0.s).
+#
+# It was registered as a PortBitAvrTarget, which meant the pseudocode lane
+# emitted AVR C for it: <avr/io.h>, ISR(TIMER0_COMPA_vect), DDRA, _BV(). That
+# is not code the machine could run, and /compile did not even get that far --
+# PortBitAvrTarget's toolchain is "avr-gcc", so the endpoint looked the part
+# up in AVR_TARGETS, raised KeyError, and returned a 500.
+#
+# Emitting nothing is strictly better than emitting confident code for the
+# wrong architecture, so the device now refuses at the DEVICE line and says
+# where the working lanes are. Writing the generator is real work and is
+# scoped rather than hidden: the pins are the VIA's ($6000 PORTB, $6001 PORTA,
+# $6002/$6003 the DDRs), and the open question is the millisecond tick --
+# VIA Timer 1 in free-run mode wants an IRQ handler, and crt0.s currently
+# points IRQ at a bare RTI.
+class Eater6502Target(PortBitAvrTarget):
+    toolchain = "cc65"
+    pseudocode_gap = (
+        "the EATER6502 has no pseudocode generator yet -- it would emit code "
+        "for the wrong architecture. Its working lanes are hand-written C and "
+        "assembly: POST /compile or /assemble with target=\"eater6502\".")
+
+
+TARGETS["eater6502"] = Eater6502Target(
+    "eater6502", "Eater 6502", "eater6502", 32768, ports="AB",
+    default_clock=1000000)
 
 from bw_arcade import ArcadeTarget  # noqa: E402
 TARGETS["arcade"] = ArcadeTarget()

@@ -78,8 +78,17 @@ class TestDeviceParity(unittest.TestCase):
         self._check(_blink("ATTINY85", 8000000, "PB3"), "attiny85")
 
     # ---- 6502 ----
-    def test_eater6502(self):
-        self._check(_blink("EATER6502", 1000000, "PA0"), "eater6502")
+    def test_eater6502_refuses_rather_than_emitting_the_wrong_architecture(self):
+        """This device used to pass the check above -- because the check is
+        len(c) > 100, and it was registered on the AVR generator, so it
+        cheerfully produced <avr/io.h> and ISR(TIMER0_COMPA_vect) for a 65C02.
+
+        There is no 6502 generator yet, so the right behaviour is to say so at
+        the DEVICE line. See test_device_matrix.py, which holds every device
+        to an outcome it has to declare."""
+        with self.assertRaises(sp.PseudocodeError) as caught:
+            sp.parse(_blink("EATER6502", 1000000, "PA0"))
+        self.assertIn("no pseudocode generator", str(caught.exception))
 
     # ---- micro:bit + Pico ----
     def test_microbit(self):

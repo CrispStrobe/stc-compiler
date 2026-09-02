@@ -19,6 +19,9 @@ once per device, and holds each to a DECLARED outcome:
   BUILDS          a real image comes back, with bytes and a valid image
   TRANSPILE_ONLY  refused on purpose, naming the toolchain it would need,
                   and handing back the generated source anyway
+  NO_GENERATOR    the DEVICE name is real but nothing emits for it yet, and
+                  it says so at the DEVICE line rather than borrowing the
+                  nearest generator
   KNOWN_GAP       a recorded defect, with the reason written down
 
 A KNOWN_GAP is asserted to STILL BE BROKEN. That is the point: when someone
@@ -38,15 +41,18 @@ import stc_pseudocode as sp
 
 BUILDS = "builds"
 TRANSPILE_ONLY = "transpile-only"
+NO_GENERATOR = "no-generator"
 KNOWN_GAP = "known-gap"
 
 
 class Case:
     """One device: how to write a blink for it, and what should happen."""
 
-    def __init__(self, pin, clock, outcome, toolchain=None, gap=None, source=None):
+    def __init__(self, pin, clock, outcome, toolchain=None, gap=None,
+                 source=None, says=None):
         self.pin, self.clock, self.outcome = pin, clock, outcome
         self.toolchain, self.gap, self.source = toolchain, gap, source
+        self.says = says or ()          # substrings the refusal must contain
 
     def program(self, device: str) -> str:
         if self.source is not None:
@@ -95,12 +101,14 @@ EXPECTED = {
     "rp2040":    Case("GP25", None, TRANSPILE_ONLY, toolchain="uf2"),
 
     # ---- 6502 ----
-    "eater6502": Case("PA0", 1000000, KNOWN_GAP,
-                      gap="registered as PortBitAvrTarget, so toolchain is "
-                          "'avr-gcc' and /compile looks it up in AVR_TARGETS "
-                          "-> KeyError -> 500. The generated C is AVR C "
-                          "(<avr/io.h>, ISR) rather than 6502. The cc65 lane "
-                          "works via target='eater6502' with C or assembly."),
+    # Until 2026-09-02 this was registered as a PortBitAvrTarget: the
+    # pseudocode lane emitted AVR C for a 65C02, and /compile raised KeyError
+    # looking the part up in AVR_TARGETS -> 500. Emitting nothing beats
+    # emitting confident code for the wrong architecture, so it now refuses at
+    # the DEVICE line and points at the lanes that do work. The generator
+    # itself is unwritten -- see Eater6502Target for what it needs.
+    "eater6502": Case("PA0", 1000000, NO_GENERATOR,
+                      says=("no pseudocode generator", "eater6502")),
 
     # ---- a game engine, not a chip ----
     "arcade": Case(None, None, TRANSPILE_ONLY, toolchain="pxt", source=(
@@ -165,6 +173,14 @@ def test_every_known_gap_says_why():
                 f"{device} is a known gap with no reason recorded"
 
 
+def test_every_no_generator_declares_what_it_must_say():
+    for device, case in EXPECTED.items():
+        if case.outcome == NO_GENERATOR:
+            assert case.says, (
+                f"{device} has no generator but declares nothing its refusal "
+                f"must say; a refusal nobody checks decays into a bare error")
+
+
 def test_every_transpile_only_names_a_toolchain():
     for device, case in EXPECTED.items():
         if case.outcome == TRANSPILE_ONLY:
@@ -175,6 +191,7 @@ def test_every_transpile_only_names_a_toolchain():
 # ---------------------------------------------------------- the real builds
 
 BUILD_DEVICES = sorted(d for d, c in EXPECTED.items() if c.outcome == BUILDS)
+NO_GEN_DEVICES = sorted(d for d, c in EXPECTED.items() if c.outcome == NO_GENERATOR)
 REFUSE_DEVICES = sorted(d for d, c in EXPECTED.items() if c.outcome == TRANSPILE_ONLY)
 GAP_DEVICES = sorted(d for d, c in EXPECTED.items() if c.outcome == KNOWN_GAP)
 
@@ -208,6 +225,26 @@ def test_device_is_transpile_only(device):
         f"{device}: the message does not name the toolchain the caller needs"
     assert result.get("c"), f"{device}: refused without returning the source"
     assert result.get("filename"), f"{device}: refused without naming the file"
+
+
+@pytest.mark.parametrize("device", NO_GEN_DEVICES)
+def test_device_has_no_generator_and_says_so(device):
+    """Refused at the DEVICE line, with a message that names the device and
+    points at whatever does work. The failure this guards against is not a
+    crash -- it is a plausible-looking image for the wrong architecture,
+    which is the one outcome nobody downstream can detect."""
+    case = EXPECTED[device]
+    result, exc = compile_device(device, case)
+    assert exc is None, f"{device}: build() raised {type(exc).__name__}: {exc}"
+    assert result.get("success") is False, \
+        f"{device}: expected a refusal, got output"
+    message = str(result.get("error", "")).lower()
+    for fragment in case.says:
+        assert fragment.lower() in message, \
+            f"{device}: refusal does not mention {fragment!r}: {message[:200]}"
+    # It must fail in the front end, not three layers into a compiler.
+    assert result.get("stage") == "transpile", \
+        f"{device}: refused at stage {result.get('stage')!r}, expected 'transpile'"
 
 
 @pytest.mark.parametrize("device", GAP_DEVICES)
