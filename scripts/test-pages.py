@@ -19,7 +19,7 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs"
-MIRRORED = ["stc_pseudocode.py", "bw_micropython.py"]
+MIRRORED = ["stc_pseudocode.py", "bw_micropython.py", "bw_arcade.py"]
 
 passed = failed = 0
 

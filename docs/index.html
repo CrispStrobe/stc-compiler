@@ -290,7 +290,7 @@ async function boot() {
     py = await loadPyodide();
     setStatus('loading the transpiler…');
     py.FS.mkdirTree('/app');
-    for (const name of ['stc_pseudocode.py', 'bw_micropython.py']) {
+    for (const name of ['stc_pseudocode.py', 'bw_micropython.py', 'bw_arcade.py']) {
       const response = await fetch(name + '?v=1');
       if (!response.ok) throw new Error(name + ': HTTP ' + response.status);
       py.FS.writeFile('/app/' + name, await response.text());
