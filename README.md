@@ -836,7 +836,14 @@ CPython compiled to WebAssembly and imports **this repository's own
 JavaScript reimplementation, so there is no second implementation that can
 drift from what the API and the test suites use. `docs/` keeps its own copy of
 the three modules because Pages serves that directory and nothing above it;
-`scripts/test-pages.py` fails the moment a copy and its original disagree.
+`scripts/test-pages.py` fails the moment a copy and its original disagree —
+and it works out *which* modules must be mirrored by walking the entry
+module's local imports, rather than from a list. That distinction cost the
+page once: `stc_pseudocode.py` grew an `import bw_arcade`, the list did not
+know, and the hosted transpiler died on `ModuleNotFoundError` while the gate
+reported every file it knew about as present and fresh. A list can only check
+the copies it knows about; it cannot check that the set is complete, because
+it *is* the set.
 
 That covers more than it sounds like: a micro:bit needs no compiler
 (MicroPython is interpreted on the device) and an Arduino sketch is built by
@@ -1108,7 +1115,7 @@ Everything below must pass before pushing.
 | `scripts/test-flash.mjs` | eight protocols against simulated devices | 39 |
 | `scripts/test-pinmap.py` | what each package actually brings out | 38 |
 | `scripts/test-tables-ports.py` | flash tables and whole-port I/O | 34 |
-| `scripts/test-pages.py` | `docs/` still mirrors the transpiler | 25 |
+| `scripts/test-pages.py` | `docs/` still mirrors the transpiler | 26 |
 | `scripts/test-wiring.py` | every test runs in CI, or says why not | 43 |
 | `scripts/test-disasm.py` | decode agrees with `sdas8051`'s own listing | 380/380 |
 | `scripts/test-reassemble.py` | disassembly reassembles byte-identically | 39/40 |

@@ -10,6 +10,7 @@ The point of the page is that it runs stc_pseudocode.py itself rather than a
 JavaScript reimplementation. A stale copy would quietly undo that.
 """
 
+import ast
 import hashlib
 import pathlib
 import re
@@ -19,7 +20,49 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs"
-MIRRORED = ["stc_pseudocode.py", "bw_micropython.py", "bw_arcade.py"]
+
+# The set of modules docs/ must mirror is DERIVED, not restated.
+#
+# It used to be a hand-written list, and on 2026-09-01 that cost the page
+# everything: stc_pseudocode.py had grown an `import bw_arcade`, the list did
+# not know, and the hosted transpiler died on ModuleNotFoundError while this
+# gate reported every file it knew about as present and fresh. A list checks
+# that the copies it KNOWS ABOUT are current; it cannot check that the set is
+# complete, because it IS the set.
+#
+# So the expectation comes from the thing that actually runs: start at the
+# module the page imports and walk its local imports transitively. Add a
+# fourth module tomorrow and this notices by itself.
+ENTRY = "stc_pseudocode"
+
+
+def _local_imports(module: str, available: set) -> set:
+    """The repo-level modules `module` imports directly."""
+    tree = ast.parse((ROOT / f"{module}.py").read_text(encoding="utf-8"))
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found |= {a.name.split(".")[0] for a in node.names}
+        # `level` > 0 is a relative import; this project has none, and a
+        # relative import would not resolve in Pyodide's flat /app anyway.
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            found.add(node.module.split(".")[0])
+    return {m for m in found if m in available}
+
+
+def _required_mirrors() -> list:
+    available = {q.stem for q in ROOT.glob("*.py")}
+    seen, stack = set(), [ENTRY]
+    while stack:
+        module = stack.pop()
+        if module in seen:
+            continue
+        seen.add(module)
+        stack.extend(_local_imports(module, available))
+    return sorted(f"{m}.py" for m in seen)
+
+
+MIRRORED = _required_mirrors()
 
 passed = failed = 0
 
@@ -36,6 +79,10 @@ def check(name, ok, detail=""):
 
 
 print("github pages\n")
+
+check("the mirror set was derived from the import graph, not a list",
+      len(MIRRORED) >= 2 and f"{ENTRY}.py" in MIRRORED,
+      ", ".join(MIRRORED))
 
 for name in MIRRORED:
     original, copy = ROOT / name, DOCS / name
