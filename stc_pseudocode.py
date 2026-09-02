@@ -2984,6 +2984,7 @@ class ExprParser:
                 return Unary("not", ref) if state.lower() == "off" else ref
             return ref
         if token.lower() == "randint" and self.peek() == "(":
+            require(self.program, "game", self.line, "randint(...)")
             self.take()  # consume '('
             low = self.parse()
             if self.peek() == ",":
@@ -2993,6 +2994,7 @@ class ExprParser:
                 raise PseudocodeError(self.line, "missing ')' after randint")
             return Randint(low, high)
         if token.lower() == "controller" and self.peek() is not None and self.peek().lower() in ("dx", "dy"):
+            require(self.program, "game", self.line, "the controller reporter")
             axis = self.take().lower()
             return ControllerAxis(axis)
         if re.fullmatch(r"0[xX][0-9A-Fa-f]+", token):
@@ -3086,6 +3088,7 @@ def parse_block(lines: list[Line], index: int, parent_indent: int,
         arc_overlap = re.fullmatch(
             r"arcade\s+on\s+overlap\s+(\w+)\s+(\w+)\s*:", text, re.I)
         if arc_overlap:
+            require(program, "game", line.number, "ARCADE ON OVERLAP")
             inner, index = parse_block(lines, index + 1, indent, program)
             body.append(ArcadeOnOverlap(arc_overlap.group(1),
                                          arc_overlap.group(2), inner))
@@ -3268,6 +3271,14 @@ def simple_statement(text: str, program: Program, line: int) -> Stmt:
         return drawn
 
     # ---- Arcade game-engine verbs ----
+    # One guard for the family: every one of them starts with `arcade`, so the
+    # refusal belongs here rather than repeated at ten parse sites. Without it
+    # they parse on a chip, reach an emitter with no case for them, and escape
+    # as a bare TypeError -- a 500 where every other unsupported feature gives
+    # a line number and names the board.
+    if re.match(r"arcade\s", text, re.I):
+        require(program, "game", line, "an arcade verb")
+
     arc_create = re.fullmatch(r"arcade\s+create\s+(\w+)\s+kind\s+(\w+)", text, re.I)
     if arc_create:
         return ArcadeCreate(arc_create.group(1).lower(), arc_create.group(2))
@@ -4450,7 +4461,9 @@ def expr_c(node: Expr, ctx: Emit, parent_level: int = -1) -> str:
         text = (f"{expr_c(node.left, ctx, level)} {TO_C[node.op]} "
                 f"{expr_c(node.right, ctx, level + 1)}")
         return f"({text})" if level < parent_level else text
-    raise TypeError(node)
+    raise PseudocodeError(
+        0, f"{type(node).__name__} has no C form on the {ctx.target.display}; "
+           f"this is a gap in the emitter, not in your program")
 
 
 def ms_of(node: Wait, ctx: Emit) -> str:

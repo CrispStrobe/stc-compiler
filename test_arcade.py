@@ -731,3 +731,63 @@ class TestArcadeErrors:
     def test_unknown_device(self):
         with pytest.raises(sp.PseudocodeError, match="unknown device"):
             sp.parse("DEVICE FOOBAR\nWHEN started:\n  set x to 1")
+
+
+# ---- the arcade verbs are refused off the arcade -----------------------------
+
+class TestArcadeVerbsAreArcadeOnly:
+    """The whole family parses out of a bare regex, so without a guard it
+    parses on a chip too, reaches a C emitter with no case for it, and
+    escapes as a TypeError -- a 500, where every other unsupported feature
+    gives a line number and names the board.
+
+    Found 2026-09-02 by sweeping every DEVICE through the real compile path.
+    """
+
+    CHIP = "DEVICE STC12C5A60S2:\n  CLOCK 11059200\n\n  WHEN started:\n"
+
+    @pytest.mark.parametrize("verb", [
+        "arcade create hero kind Player",
+        "arcade place hero x 1 y 2",
+        "arcade move hero vx 1 vy 0",
+        "arcade set hero stay in screen",
+        "arcade score add 1",
+        "arcade game over lose",
+        "arcade tilemap lvl cols 4 rows 4 tile 16",
+        "arcade set tile lvl col 0 row 0 to 2",
+        "arcade set wall lvl tile 2",
+        "arcade set frame hero to 1",
+    ])
+    def test_statement_refused_on_a_chip(self, verb):
+        with pytest.raises(sp.PseudocodeError) as caught:
+            sp.parse(self.CHIP + f"    {verb}\n")
+        # The refusal has to be useful: which line, which board, and where
+        # the feature does exist.
+        assert "line 5" in str(caught.value)
+        assert "STC12C5A60S2" in str(caught.value)
+        assert "MakeCode Arcade" in str(caught.value)
+
+    @pytest.mark.parametrize("reporter,name", [
+        ("randint(1, 6)", "randint"),
+        ("controller dx", "controller"),
+        ("controller dy", "controller"),
+    ])
+    def test_reporter_refused_on_a_chip(self, reporter, name):
+        with pytest.raises(sp.PseudocodeError) as caught:
+            sp.parse(self.CHIP + f"    set x to {reporter}\n")
+        assert name in str(caught.value)
+        assert "MakeCode Arcade" in str(caught.value)
+
+    def test_overlap_block_refused_on_a_chip(self):
+        with pytest.raises(sp.PseudocodeError, match="ARCADE ON OVERLAP"):
+            sp.parse(self.CHIP + "    ARCADE ON OVERLAP Player Enemy:\n      stop\n")
+
+    def test_still_accepted_on_the_arcade(self):
+        """The guard must not cost the target the verbs belong to."""
+        program = sp.parse(
+            "DEVICE ARCADE\n\nWHEN started:\n"
+            "  arcade create hero kind Player\n"
+            "  set x to randint(1, 6)\n"
+            "  arcade place hero x x y 60\n"
+            "  arcade move hero vx (controller dx) vy 0\n")
+        assert "sprites.create(" in sp.emit(program)
