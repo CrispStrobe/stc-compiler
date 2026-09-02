@@ -138,6 +138,23 @@ TARGETS = {
                   "--code-size", "61440"],
         "description": "STC15F2K60S2 — 60 KB flash, 256 B IRAM, 1792 B XRAM, 1T",
     },
+    # Both of these are DEVICE names the pseudocode front end knows, and
+    # neither had an entry here -- so a `DEVICE STC89C52RC:` program was
+    # compiled with whatever `target` the request happened to carry, which
+    # defaults to the STC12's 60 KB. An 8 KB part does not tell you it
+    # overflowed; the linker does, and only if it is asked.
+    "stc89c52": {
+        "flags": ["--iram-size", "256", "--xram-size", "256",
+                  "--code-size", "8192"],
+        "description": "STC89C52 — 8 KB flash, 256 B IRAM, 256 B XRAM, 12T",
+    },
+    # STC15W408AS: 8 KB flash and 512 B SRAM, NOT the STC15F2K60S2's 60 KB
+    # and 1792 B. Same register layout, an order of magnitude less of it.
+    "stc15w408as": {
+        "flags": ["--iram-size", "256", "--xram-size", "256",
+                  "--code-size", "8192"],
+        "description": "STC15W408AS — 8 KB flash, 256 B IRAM, 256 B XRAM, 1T",
+    },
     # Escape hatch: no size limits, caller supplies everything via `options`.
     "mcs51": {
         "flags": [],
@@ -1262,6 +1279,14 @@ def build(req: CompileReq) -> dict:
             return build_avr(req, AVR_TARGETS[chip.key], generated_c, None, stem)
         if chip.toolchain == "arm-none-eabi-gcc":
             return build_arm(req, ARM_TARGETS[chip.key], generated_c, stem)
+        if chip.toolchain == "sdcc-mcs51" and chip.key in TARGETS:
+            # The comment above is only half-true until this line exists. The
+            # DEVICE picked the toolchain, but the SIZE LIMITS were still
+            # coming from the request's `target` field, which defaults to the
+            # STC12C5A60S2 -- so `DEVICE STC89C52RC:` linked against a 60 KB
+            # code-size ceiling on a part with 8 KB of flash, and an image
+            # that outgrew the chip linked cleanly and was handed back.
+            req = req.model_copy(update={"target": chip.key})
         if chip.toolchain != "sdcc-mcs51":
             return {"success": False, "stage": "compile",
                     "error": f"{chip.display} transpiles here, but building it "

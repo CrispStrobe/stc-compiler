@@ -263,8 +263,9 @@ end** knows, which the service can **compile**, and which a browser can
 |---|---|---|
 | `stc12c5a60s2` | sdcc `-mmcs51` | `--iram-size 256 --xram-size 1024 --code-size 61440` |
 | `stc12c5a16s2` | sdcc | as above, `--code-size 16384` |
-| `stc89c52rc` | sdcc | `--iram-size 256 --xram-size 256 --code-size 8192` (12T) |
+| `stc89c52` `stc89c52rc` | sdcc | `--iram-size 256 --xram-size 256 --code-size 8192` (12T) |
 | `stc15f2k60s2` | sdcc | `--iram-size 256 --xram-size 1792 --code-size 61440` (1T) |
+| `stc15w408as` | sdcc | `--iram-size 256 --xram-size 256 --code-size 8192` (1T) |
 | `mcs51` | sdcc | none — bring your own via `options` |
 | `atmega328p` | avr-gcc | `-mmcu=atmega328p`, 32 KB |
 | `atmega168p` | avr-gcc | 16 KB |
@@ -275,7 +276,9 @@ end** knows, which the service can **compile**, and which a browser can
 | `eater6502` | cc65 | 65C02, 32 KB ROM at `$8000` (`eater.cfg`) |
 
 The 8051 targets compile `-mmcs51 --std-c99`; adding a part is three lines in
-`TARGETS` in [`app.py`](app.py). Keil translation is 8051-only by definition
+`TARGETS` in [`app.py`](app.py). **For a pseudocode program the `DEVICE` line
+selects these limits**, not the request's `target` field — so an image that
+outgrows an STC89's 8 KB is refused by the linker instead of being handed back. Keil translation is 8051-only by definition
 and is refused for any other target rather than silently miscompiled.
 
 `language: "arduino"` is a fifth route: an Arduino-API sketch compiled against
@@ -321,11 +324,6 @@ and emits something is easy to mistake for a device that works:
   (`$6000` PORTB, `$6001` PORTA, `$6002`/`$6003` the DDRs), and the open
   question is the millisecond tick — VIA Timer 1 in free-run mode wants an IRQ
   handler, and `crt0.s` currently points IRQ at a bare `RTI`.
-- **A `DEVICE` line does not set the SDCC size flags.** The DEVICE decides the
-  toolchain, but `--code-size` still comes from the request's `target` field,
-  so `DEVICE STC89C52RC` without an explicit `target` is compiled with the
-  STC12's 60 KB limit rather than its own 8 KB. Pass `target` as well until
-  this is wired.
 - **`print` is refused on the ATtinys**, which is correct: neither the ATtiny85
   nor the ATtiny88 has a USART.
 - No `LIST`/arrays in the dialect; PWM via the PCA modules and UART output as
@@ -334,8 +332,10 @@ and emits something is easy to mistake for a device that works:
 Closed on 2026-09-02, and now held by `test_device_matrix.py`:
 `attiny85`/`attiny88` (the generator emitted ATmega Timer-0 spellings — the
 ATtiny85 names the mask register `TIMSK`, and the ATtiny48/88 has no `TCCR0B`
-or `WGM01` at all), and the arcade verbs plus `randint`/`controller` returning
-a 500 on a chip instead of a parse error naming the board.
+or `WGM01` at all); the arcade verbs plus `randint`/`controller` returning a
+500 on a chip instead of a parse error naming the board; and a `DEVICE` line
+not selecting the SDCC size flags, which meant an image too big for an
+STC89's 8 KB linked cleanly against the STC12's 60 KB ceiling and came back.
 
 ---
 

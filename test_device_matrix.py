@@ -259,3 +259,82 @@ def test_known_gap_is_still_broken(device):
         f"{device} now builds -- the gap is closed. Update EXPECTED in this "
         f"file and the README's Known gaps section. Recorded reason was: "
         f"{case.gap}")
+
+
+# ------------------------------------------- the DEVICE picks the size limits
+
+# The parts the front end knows, with the flash each one actually has. An 8051
+# DEVICE with no entry in app.TARGETS used to be compiled against whatever the
+# request's `target` field said, which defaults to the STC12C5A60S2 -- so an
+# image too big for an STC89's 8 KB linked cleanly and came back.
+FLASH_KB = {
+    "stc12c5a60s2": 60, "stc12c5a16s2": 16, "stc15f2k60s2": 60,
+    "stc89c52": 8, "stc89c52rc": 8, "stc15w408as": 8,
+}
+
+
+def test_every_8051_device_has_size_limits():
+    """A DEVICE the front end accepts but app.TARGETS has never heard of is
+    silently compiled with someone else's ceiling."""
+    sdcc = {k for k, t in sp.TARGETS.items() if t.toolchain == "sdcc-mcs51"}
+    missing = sorted(sdcc - set(app.TARGETS))
+    assert not missing, (
+        f"8051 devices with no entry in app.TARGETS: {missing}. Without one "
+        f"they inherit the request's target -- by default the STC12's 60 KB.")
+    assert sdcc == set(FLASH_KB), \
+        f"FLASH_KB is out of step with the front end: {sdcc ^ set(FLASH_KB)}"
+
+
+def test_code_size_flag_matches_the_part():
+    for device, kb in FLASH_KB.items():
+        flags = app.TARGETS[device]["flags"]
+        size = int(flags[flags.index("--code-size") + 1])
+        assert size == kb * 1024, \
+            f"{device}: --code-size {size}, but the part has {kb} KB"
+
+
+@pytest.mark.parametrize("device", ["stc89c52rc", "stc15w408as"])
+def test_an_image_too_big_for_the_part_is_refused(device):
+    """The ceiling has to BITE, not merely be passed. A flash table of 12 KB
+    fits an STC12 and cannot fit an 8 KB part; before the DEVICE selected the
+    target this linked for every one of them.
+    """
+    blob = ", ".join(str(i % 256) for i in range(12000))
+    source = (f"DEVICE {device.upper()}:\n  CLOCK 11059200\n"
+              f"  TABLE blob = {blob}\n"
+              f"  PIN led = P1.0 OUTPUT\n\n"
+              f"  WHEN started:\n    set x to blob[1]\n    turn on led\n")
+    result = app.build(app.CompileReq(code=source, language="pseudocode"))
+    assert result.get("success") is False, \
+        f"{device}: a {12000}-byte table linked into an 8 KB part"
+    assert "Insufficient ROM" in str(result.get("error")), \
+        f"{device}: refused, but not for running out of flash: " \
+        f"{str(result.get('error'))[:200]}"
+
+
+def test_the_same_image_still_fits_the_stc12():
+    """The other half of the claim: the refusal above is about the part, not
+    about the program being unbuildable."""
+    blob = ", ".join(str(i % 256) for i in range(12000))
+    source = ("DEVICE STC12C5A60S2:\n  CLOCK 11059200\n"
+              f"  TABLE blob = {blob}\n"
+              "  PIN led = P1.0 OUTPUT\n\n"
+              "  WHEN started:\n    set x to blob[1]\n    turn on led\n")
+    result = app.build(app.CompileReq(code=source, language="pseudocode"))
+    assert result.get("success"), str(result.get("error"))[:300]
+
+
+def test_the_device_beats_the_request_field():
+    """`target` is what a caller sends when there is no DEVICE line to read.
+    When there is one, it wins -- otherwise a front end that always sends
+    target='stc12c5a60s2' (the default) silently unsets every other part's
+    ceiling."""
+    blob = ", ".join(str(i % 256) for i in range(12000))
+    source = ("DEVICE STC89C52RC:\n  CLOCK 11059200\n"
+              f"  TABLE blob = {blob}\n"
+              "  PIN led = P1.0 OUTPUT\n\n"
+              "  WHEN started:\n    set x to blob[1]\n    turn on led\n")
+    result = app.build(app.CompileReq(code=source, language="pseudocode",
+                                      target="stc12c5a60s2"))
+    assert result.get("success") is False, \
+        "the request's target overrode the DEVICE line"
