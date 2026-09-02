@@ -928,7 +928,7 @@ keil-shim/             our replacements for Keil-only headers
   generate-compat.py   REGENERATES keil-compat.h — never hand-edit that file
 bin/ share/            vendored SDCC        (~8 MB)
 avr/                   vendored avr-gcc     (39 MB)
-arm/                   vendored arm-none-eabi-gcc (82 MB)
+arm/                   vendored arm-none-eabi-gcc (43 MB)
 cc65/                  vendored cc65        (3.7 MB)
 arduino-core/          minimal ATTinyCore subset (LGPL, server-side only)
 docs/                  the GitHub Pages app + mirrored modules
@@ -974,6 +974,10 @@ wrong silently turns every `sbit LED = P1^0;` into an unresolved one, so
 **`vercel.json` uses the legacy `builds` config on purpose.** It includes the
 whole project directory in the function bundle. The newer config traces Python
 imports only and would silently omit `bin/`, `share/`, `avr/`, `arm/`, `cc65/`.
+The consequence is that *everything* in the tree counts against Vercel's
+250 MB function limit — there is no `.vercelignore` — so a toolchain lane's
+size is a deployment fact, not just a checkout cost. The deployed tree is
+currently **95 MB**.
 
 ---
 
@@ -982,7 +986,7 @@ imports only and would silently omit `bin/`, `share/`, `avr/`, `arm/`, `cc65/`.
 ```bash
 ./scripts/fetch-sdcc.sh       # ~8 MB: sdcc, sdcpp, sdas8051, sdld, packihx, makebin
 ./scripts/fetch-avr-gcc.sh    # ~39 MB: avr-gcc, binutils, avr-libc (avr5 only)
-./scripts/fetch-arm-gcc.sh    # ~82 MB: arm-none-eabi-gcc, v6-m multilib only
+./scripts/fetch-arm-gcc.sh    # ~43 MB: arm-none-eabi-gcc, v6-m multilib only
 ./scripts/verify-avr.sh       # MUST run on Linux — see below
 ```
 
@@ -999,6 +1003,18 @@ strings bin/sdas8051 | grep -oE 'GLIBC_2\.[0-9]+' | sort -V | tail -1
 
 SourceForge is blocked from the development sandbox, which is why the vendored
 SDCC comes from `deb.debian.org`.
+
+**The static libraries are stripped of DWARF.** Debian ships `libgcc.a` with
+full debug info — 21.9 MB, of which 20.6 MB describes the internals of
+`__aeabi_uidiv` and its neighbours — and it is carried twice, for the default
+and v6-m multilibs. Nothing consumes it: a debugger steps the user's code, and
+the symbol tables this project produces come from its own `.cdb` and `objdump`
+paths. Every byte of it otherwise rides into the Vercel function bundle, which
+is measured against a 250 MB ceiling for the whole project directory.
+`--strip-debug`, never `--strip-all`: the symbol table is what the linker
+resolves against, and an archive stripped of it links to nothing. Measured:
+21.9 MB → 1.3 MB each, `arm/` 82 MB → 43 MB, deployed tree 135 MB → 95 MB,
+with every ARM build test still passing.
 
 The bundles are Linux x86_64, so **building one on macOS does not verify it** —
 and that gap is not theoretical. Four separate failures got through a

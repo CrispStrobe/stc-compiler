@@ -166,6 +166,29 @@ fi
 # multilib, the symptom is a link failure (missing libgcc), and the fix is
 # to add the right multilib here — not to carry them all.
 
+# Strip DWARF out of the static libraries. Debian ships libgcc.a with full
+# debug info: 21.9 MB, of which 20.6 MB is .debug_* sections describing the
+# internals of __aeabi_uidiv and its neighbours. Nothing here consumes that —
+# a debugger steps the user's code, and the symbol tables this project
+# produces come from its own .cdb/objdump paths — while every byte of it
+# rides into the Vercel function bundle, which has a 250 MB ceiling the whole
+# project directory is measured against.
+#
+# --strip-debug, NOT --strip-all: the symbol table is what the linker
+# resolves against, and stripping it leaves an archive that links to nothing.
+# Measured 2026-09-02: 21.9 MB -> 1.3 MB each, arm/ 82 MB -> 43 MB, and every
+# ARM build test still passes.
+say "Stripping DWARF from the static libraries ..."
+STRIP="$(command -v arm-none-eabi-strip || command -v strip || true)"
+if [ -n "$STRIP" ]; then
+  before=$(du -sk "$DST" | cut -f1)
+  find "$DST" -name '*.a' -exec "$STRIP" --strip-debug {} + 2>/dev/null || true
+  after=$(du -sk "$DST" | cut -f1)
+  echo "  ${before} KB -> ${after} KB"
+else
+  echo "  WARNING: no strip found; the bundle will be ~39 MB larger" >&2
+fi
+
 # The shared libraries cc1 and the binutils need.
 mkdir -p "$ROOT/arm/lib-deps"
 for so in "$WORK"/x/usr/lib/x86_64-linux-gnu/lib*.so.*; do
