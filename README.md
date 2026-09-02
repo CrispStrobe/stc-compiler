@@ -1289,10 +1289,14 @@ stcgal -P stc12 -p /dev/cu.usbserial-XXXX -l 2400 -b 115200 main.hex
 - **This wrapper** — MIT, see [`LICENSE`](LICENSE).
 - **SDCC** — GPL-2.0-or-later. Its runtime libraries and headers carry a
   linking exception, so binaries you compile with it are unencumbered.
-- **avr-gcc / arm-none-eabi-gcc** — GPL, with the GCC Runtime Library
-  Exception on the runtime; **avr-libc** BSD-3-Clause; **cc65** zlib.
+- **avr-gcc / arm-none-eabi-gcc** — GPL-3.0-or-later, with the GCC Runtime
+  Library Exception on the runtime; **avr-libc** BSD-3-Clause; **cc65** zlib.
 - **ATTinyCore** — LGPL-2.1, vendored as a minimal subset, compiled
   server-side only.
+- Every vendored bundle records its provenance and how to obtain the
+  corresponding source in `vendor/<name>/`. Three come from Debian bullseye
+  `.deb`s unmodified; cc65 alone was built from upstream source, and
+  `vendor/cc65/VERSION` names the commit rather than a package.
 - **Keil C51 is proprietary** (Arm), Windows-only, redistribution prohibited.
   It can never be vendored. The translator was written from *published
   documentation* and third-party Keil *source*, never from its compiler source.

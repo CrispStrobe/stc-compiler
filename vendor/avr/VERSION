@@ -7,5 +7,10 @@ corresponding source: apt-get source gcc-avr binutils-avr avr-libc
 
 gcc-avr and binutils-avr are GPL-3.0-or-later. The GCC Runtime Library
 Exception covers libgcc, so images compiled with this bundle are unencumbered.
-avr-libc is BSD-3-Clause. The Arduino core (LGPL-2.1) is NOT vendored and is
-not linked into anything this service returns.
+avr-libc is BSD-3-Clause.
+
+The full Arduino core is NOT vendored. A minimal ATTinyCore subset (LGPL-2.1)
+IS, in arduino-core/, for the `language: "arduino"` route on the ATtiny85 and
+ATtiny88 only -- it is compiled server-side and never shipped to a client. The
+posture is argued in NOTICE.md; this line used to say no core was vendored at
+all, which stopped being true when that route landed.

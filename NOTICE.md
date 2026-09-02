@@ -12,12 +12,36 @@ their own upstream licenses.
 |---|---|---|
 | `bin/sdcc`, `bin/sdcpp`, `bin/sdas8051`, `bin/sdld`, `bin/packihx`, `bin/makebin` | [SDCC — Small Device C Compiler](https://sdcc.sourceforge.net/) | **GPL-2.0-or-later** |
 | `share/sdcc/include/**`, `share/sdcc/lib/**` | SDCC runtime headers and libraries | **GPL-2.0-or-later with a linking exception** (see below) |
+| `avr/bin/**`, `avr/lib/gcc/**`, `avr/libexec/**` | [GCC](https://gcc.gnu.org/) for AVR + GNU binutils | **GPL-3.0-or-later**, runtime under the **GCC Runtime Library Exception** |
+| `avr/lib/avr/include/**`, `avr/lib/avr/lib*/**` | [avr-libc](https://github.com/avrdudes/avr-libc) | **BSD-3-Clause** |
+| `arm/bin/**`, `arm/lib/gcc/**`, `arm/libexec/**` | GCC for `arm-none-eabi` + GNU binutils | **GPL-3.0-or-later**, runtime under the **GCC Runtime Library Exception** |
+| `avr/lib-deps/**`, `arm/lib-deps/**` | the shared libraries those compilers link (GMP, MPFR, MPC, zlib, …) | LGPL-3.0-or-later / zlib, as each upstream states |
+| `cc65/bin/**`, `cc65/lib/**`, `cc65/include/**`, `cc65/asminc/**` | [cc65](https://github.com/cc65/cc65) | **zlib** (Debian: BSD-3-zlib) |
 | `arduino-core/cores/tiny/**`, `arduino-core/variants/**` | [ATTinyCore](https://github.com/SpenceKonde/ATTinyCore) by Spence Konde | **LGPL-2.1** (see below) |
 
-Binaries were taken unmodified from Debian's `sdcc` and `sdcc-libraries`
-packages, version `4.0.0+dfsg-2`. `scripts/fetch-sdcc.sh` reproduces the
-bundle exactly; `vendor/sdcc/VERSION` records the provenance and
-`vendor/sdcc/copyright` carries Debian's assembled copyright file.
+### Provenance
+
+Every bundle records where it came from and how to get its corresponding
+source, in `vendor/<name>/`:
+
+| bundle | source | provenance |
+|---|---|---|
+| SDCC | Debian bullseye `sdcc` + `sdcc-libraries` `4.0.0+dfsg-2`, unmodified | `vendor/sdcc/VERSION`, `vendor/sdcc/copyright` |
+| avr-gcc | Debian bullseye `gcc-avr`, `binutils-avr`, `avr-libc`, unmodified | `vendor/avr/VERSION` + three `.copyright` files |
+| arm-none-eabi | Debian bullseye `gcc-arm-none-eabi`, `binutils-arm-none-eabi`, unmodified | `vendor/arm/VERSION` + two `.copyright` files |
+| cc65 | **built from upstream source**, commit `547d923` — not a Debian package | `vendor/cc65/VERSION`, `vendor/cc65/LICENSE` |
+
+`scripts/fetch-sdcc.sh`, `scripts/fetch-avr-gcc.sh` and
+`scripts/fetch-arm-gcc.sh` reproduce the first three bundles exactly. The
+fetch scripts strip the bundles down — to one target, one multilib, and
+without DWARF — which is a *subset*, not a modification: no binary is patched,
+and the corresponding source for each is the upstream Debian source package.
+
+cc65 is the exception in every sense: it was compiled rather than repackaged,
+so `vendor/cc65/VERSION` names the upstream commit instead of a `.deb`. Its
+licence carries no copyleft and no linking condition, but its third condition
+requires the notice to travel with a source distribution — which is what
+`vendor/cc65/LICENSE` is for.
 
 ## What the GPL does and does not reach here
 

@@ -1,0 +1,21 @@
+cc65  ca65 / ld65 / cc65, "V2.19 - Git 547d923"
+
+upstream: https://github.com/cc65/cc65  (commit 547d923)
+corresponding source: git clone https://github.com/cc65/cc65 && git checkout 547d923
+
+Unlike the SDCC, AVR and ARM bundles, these binaries were NOT lifted out of a
+Debian .deb -- they were built from upstream source. The binaries themselves
+record it: `strings cc65/bin/ca65` reports the upstream version string
+"Git 547d923" rather than a Debian revision, and a build compiler of
+"GCC: (Ubuntu 13.3.0-6ubuntu2~24.04.1)". The exact build host is not recorded
+here; the commit is, and that is what reproduces them.
+
+What is vendored: the ca65 assembler, the ld65 linker, the cc65 C compiler,
+asminc/ (assembler includes), include/ (C headers) and lib/none.lib. The
+target-specific libraries for the dozens of machines cc65 supports are not.
+
+cc65 is under the zlib licence (Debian classifies it BSD-3-zlib; the terms are
+the zlib ones). See LICENSE in this directory for the full text. It carries no
+copyleft and no linking condition, so images built with it are unencumbered --
+but condition 3 requires the notice to travel with any source distribution,
+which is why this directory exists.
