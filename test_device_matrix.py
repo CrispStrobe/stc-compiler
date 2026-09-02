@@ -1,0 +1,224 @@
+"""test_device_matrix — every advertised device is built, not merely emitted.
+
+`test_device_parity.py` proves each DEVICE parses and produces some C. That
+is a weaker claim than it looks: on 2026-09-02 a sweep of all nineteen
+devices through the real compile path found three that emit plausible source
+and cannot be built —
+
+  attiny85/attiny88   the AVR generator emits ATmega timer register names
+                      (TIMSK0, WGM01), which do not exist on those parts
+  eater6502           registered as a port/bit AVR target, so /compile
+                      dispatched it to avr-gcc and raised KeyError -> HTTP 500,
+                      and the C it generated was AVR C for a 6502
+
+All three passed parity, because parity asserts len(c) > 100.
+
+So this file drives `app.build()` — the same function the endpoint calls —
+once per device, and holds each to a DECLARED outcome:
+
+  BUILDS          a real image comes back, with bytes and a valid image
+  TRANSPILE_ONLY  refused on purpose, naming the toolchain it would need,
+                  and handing back the generated source anyway
+  KNOWN_GAP       a recorded defect, with the reason written down
+
+A KNOWN_GAP is asserted to STILL BE BROKEN. That is the point: when someone
+fixes one, this test fails and forces the table — and the README's "Known
+gaps" section — to be updated in the same commit. A gap list nobody is made
+to maintain silently becomes a lie.
+
+Every device in stc_pseudocode.TARGETS must appear in EXPECTED, so a new
+device cannot be added without saying which of the three it is.
+"""
+from __future__ import annotations
+
+import pytest
+
+import app
+import stc_pseudocode as sp
+
+BUILDS = "builds"
+TRANSPILE_ONLY = "transpile-only"
+KNOWN_GAP = "known-gap"
+
+
+class Case:
+    """One device: how to write a blink for it, and what should happen."""
+
+    def __init__(self, pin, clock, outcome, toolchain=None, gap=None, source=None):
+        self.pin, self.clock, self.outcome = pin, clock, outcome
+        self.toolchain, self.gap, self.source = toolchain, gap, source
+
+    def program(self, device: str) -> str:
+        if self.source is not None:
+            return self.source
+        clock = f"  CLOCK {self.clock}\n" if self.clock else ""
+        return (f"DEVICE {device.upper()}:\n{clock}"
+                f"  PIN led = {self.pin} OUTPUT\n\n"
+                f"  WHEN started:\n"
+                f"    FOREVER:\n"
+                f"      toggle led\n"
+                f"      wait 500 ms\n")
+
+
+# The toolchain string is the one the refusal must name -- it is what tells a
+# caller which program to install, so a wrong one is worse than none.
+EXPECTED = {
+    # ---- 8051: SDCC, hosted here ----
+    "stc12c5a60s2": Case("P1.0", 11059200, BUILDS),
+    "stc12c5a16s2": Case("P1.0", 11059200, BUILDS),
+    "stc15f2k60s2": Case("P1.0", 11059200, BUILDS),
+    "stc15w408as":  Case("P1.0", 11059200, BUILDS),
+    "stc89c52":     Case("P1.0", 11059200, BUILDS),
+    "stc89c52rc":   Case("P1.0", 11059200, BUILDS),
+
+    # ---- bare AVR: avr-gcc, hosted here ----
+    "atmega328p": Case("D13", 16000000, BUILDS),
+    "atmega168p": Case("D13", 16000000, BUILDS),
+
+    # ---- bare AVR, the tiny parts ----
+    "attiny85": Case("PB3", 8000000, KNOWN_GAP,
+                     gap="the AVR generator emits ATmega timer registers "
+                         "(TIMSK0); the ATtiny85 names them TIMSK/TCCR0A "
+                         "differently. language='arduino' works for this chip."),
+    "attiny88": Case("PB0", 8000000, KNOWN_GAP,
+                     gap="as attiny85: WGM01 and TIMSK0 are ATmega spellings."),
+
+    # ---- Arduino core: transpiles here, built by the IDE ----
+    "arduino-uno":  Case("D13", 16000000, TRANSPILE_ONLY, toolchain="arduino-cli"),
+    "arduino-nano": Case("D13", 16000000, TRANSPILE_ONLY, toolchain="arduino-cli"),
+    "arduino-mega": Case("D13", 16000000, TRANSPILE_ONLY, toolchain="arduino-cli"),
+
+    # ---- MicroPython: interpreted on the device, nothing to compile ----
+    "microbit":  Case("P0", None, TRANSPILE_ONLY, toolchain="uflash"),
+    "micro-bit": Case("P0", None, TRANSPILE_ONLY, toolchain="uflash"),
+    "pico":      Case("GP25", None, TRANSPILE_ONLY, toolchain="uf2"),
+    "rp2040":    Case("GP25", None, TRANSPILE_ONLY, toolchain="uf2"),
+
+    # ---- 6502 ----
+    "eater6502": Case("PA0", 1000000, KNOWN_GAP,
+                      gap="registered as PortBitAvrTarget, so toolchain is "
+                          "'avr-gcc' and /compile looks it up in AVR_TARGETS "
+                          "-> KeyError -> 500. The generated C is AVR C "
+                          "(<avr/io.h>, ISR) rather than 6502. The cc65 lane "
+                          "works via target='eater6502' with C or assembly."),
+
+    # ---- a game engine, not a chip ----
+    "arcade": Case(None, None, TRANSPILE_ONLY, toolchain="pxt", source=(
+        "DEVICE ARCADE\n\n"
+        "WHEN started:\n"
+        "  arcade create hero kind Player\n"
+        "  arcade place hero x 80 y 60\n"
+        "  FOREVER:\n"
+        "    arcade score add 1\n"
+        "    wait 1 seconds\n")),
+}
+
+
+def compile_device(device: str, case: Case):
+    """Drive the real endpoint function. Returns (result, exception)."""
+    req = app.CompileReq(code=case.program(device), language="pseudocode")
+    try:
+        return app.build(req), None
+    except Exception as exc:                        # noqa: BLE001 -- that IS the finding
+        return None, exc
+
+
+def valid_intel_hex(text: str) -> bool:
+    """Every record's checksum agrees. A truncated or corrupt image is
+    exactly what a 'success' with bytes would otherwise hide."""
+    saw = False
+    for raw in text.splitlines():
+        record = raw.strip()
+        if not record:
+            continue
+        if record[0] != ":" or len(record) < 11 or len(record) % 2 == 0:
+            return False
+        octets = [int(record[i:i + 2], 16) for i in range(1, len(record), 2)]
+        if sum(octets) & 0xFF:
+            return False
+        saw = True
+    return saw
+
+
+# --------------------------------------------------------------- the table
+
+def test_every_device_is_accounted_for():
+    """A device may not be added to the front end without declaring here
+    whether it builds, is transpile-only, or is a recorded gap."""
+    missing = sorted(set(sp.TARGETS) - set(EXPECTED))
+    assert not missing, (
+        f"devices with no declared outcome: {missing}. Add each to EXPECTED "
+        f"in this file (and to the README's device table).")
+
+
+def test_the_table_has_not_rotted():
+    """The reverse: an entry here for a device that no longer exists means
+    the table is describing something that is gone."""
+    extra = sorted(set(EXPECTED) - set(sp.TARGETS))
+    assert not extra, f"EXPECTED names devices the front end does not know: {extra}"
+
+
+def test_every_known_gap_says_why():
+    for device, case in EXPECTED.items():
+        if case.outcome == KNOWN_GAP:
+            assert case.gap and case.gap.strip(), \
+                f"{device} is a known gap with no reason recorded"
+
+
+def test_every_transpile_only_names_a_toolchain():
+    for device, case in EXPECTED.items():
+        if case.outcome == TRANSPILE_ONLY:
+            assert case.toolchain, \
+                f"{device} is transpile-only but does not say which toolchain"
+
+
+# ---------------------------------------------------------- the real builds
+
+BUILD_DEVICES = sorted(d for d, c in EXPECTED.items() if c.outcome == BUILDS)
+REFUSE_DEVICES = sorted(d for d, c in EXPECTED.items() if c.outcome == TRANSPILE_ONLY)
+GAP_DEVICES = sorted(d for d, c in EXPECTED.items() if c.outcome == KNOWN_GAP)
+
+
+@pytest.mark.parametrize("device", BUILD_DEVICES)
+def test_device_builds(device):
+    """A real image, with real bytes, that is a real Intel HEX file."""
+    case = EXPECTED[device]
+    result, exc = compile_device(device, case)
+    assert exc is None, f"{device}: build() raised {type(exc).__name__}: {exc}"
+    assert result.get("success"), \
+        f"{device}: {str(result.get('error'))[:400]}"
+    assert result["bytes"] > 0, f"{device}: an empty image"
+    import base64
+    image = base64.b64decode(result["base64"]).decode("ascii", "replace")
+    assert valid_intel_hex(image), f"{device}: image is not valid Intel HEX"
+
+
+@pytest.mark.parametrize("device", REFUSE_DEVICES)
+def test_device_is_transpile_only(device):
+    """Refused on purpose: names the toolchain, and hands back the source
+    anyway. Returning nothing would make the refusal useless."""
+    case = EXPECTED[device]
+    result, exc = compile_device(device, case)
+    assert exc is None, f"{device}: build() raised {type(exc).__name__}: {exc}"
+    assert result.get("success") is False, \
+        f"{device}: expected a transpile-only refusal, got an image"
+    assert result.get("toolchain") == case.toolchain, \
+        f"{device}: refusal names {result.get('toolchain')!r}, expected {case.toolchain!r}"
+    assert case.toolchain in str(result.get("error")), \
+        f"{device}: the message does not name the toolchain the caller needs"
+    assert result.get("c"), f"{device}: refused without returning the source"
+    assert result.get("filename"), f"{device}: refused without naming the file"
+
+
+@pytest.mark.parametrize("device", GAP_DEVICES)
+def test_known_gap_is_still_broken(device):
+    """Asserted broken on purpose. When this fails, the gap is fixed: move
+    the device to BUILDS here and delete its entry from the README's
+    'Known gaps'. A gap list nobody maintains becomes a lie."""
+    case = EXPECTED[device]
+    result, exc = compile_device(device, case)
+    broken = exc is not None or not result.get("success")
+    assert broken, (
+        f"{device} now builds -- the gap is closed. Update EXPECTED in this "
+        f"file and the README's Known gaps section. Recorded reason was: "
+        f"{case.gap}")
