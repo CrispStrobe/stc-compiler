@@ -3,6 +3,7 @@
 Per toolchain: a valid blink assembles with listing; a syntax error
 yields a line-accurate error.
 """
+import os
 import unittest
 
 import assemble
@@ -25,25 +26,42 @@ BAD_8051 = "bad instruction here"
 
 
 class Test8051Assemble(unittest.TestCase):
+    """Against the VENDORED sdas8051, not whatever is on PATH.
+
+    These called assemble_8051(src) with no bin_dir, which falls back to the
+    bare name and therefore to the developer's system SDCC. Green on a machine
+    with `brew install sdcc`, FileNotFoundError on a CI runner, and -- the part
+    that matters -- never once exercising the binaries the service actually
+    ships. Surfaced 2026-09-02, the first time this suite ran in CI.
+    """
+
+    def _bin(self):
+        from app import stage_toolchain, sdcc_bin_dir
+        stage_toolchain()
+        bin_dir = sdcc_bin_dir()
+        if not bin_dir or not os.path.exists(os.path.join(bin_dir, "sdas8051")):
+            self.skipTest("no vendored SDCC")
+        return bin_dir
+
     def test_blink_assembles(self):
-        r = assemble.assemble_8051(BLINK_8051)
+        r = assemble.assemble_8051(BLINK_8051, self._bin())
         self.assertTrue(r["success"], r.get("log") or r.get("errors"))
 
     def test_listing_present(self):
-        r = assemble.assemble_8051(BLINK_8051)
+        r = assemble.assemble_8051(BLINK_8051, self._bin())
         self.assertIsNotNone(r.get("listing"))
         self.assertEqual(r["listing"]["v"], 1)
 
     def test_listing_contains_start(self):
-        r = assemble.assemble_8051(BLINK_8051)
+        r = assemble.assemble_8051(BLINK_8051, self._bin())
         self.assertIn("start", r["listing"]["asm"])
 
     def test_hex_nonempty(self):
-        r = assemble.assemble_8051(BLINK_8051)
+        r = assemble.assemble_8051(BLINK_8051, self._bin())
         self.assertGreater(r["bytes"], 0)
 
     def test_syntax_error_line_accurate(self):
-        r = assemble.assemble_8051(BAD_8051)
+        r = assemble.assemble_8051(BAD_8051, self._bin())
         self.assertFalse(r["success"])
         self.assertGreater(len(r["errors"]), 0)
         self.assertEqual(r["errors"][0]["line"], 1)
@@ -72,38 +90,46 @@ BAD_6502 = "bad instruction here"
 
 
 class Test6502Assemble(unittest.TestCase):
+    """Against the VENDORED ca65/ld65 -- see the note on Test8051Assemble."""
+
     def _cfg(self):
-        import os
         return os.path.join(os.path.dirname(__file__), "eater.cfg")
 
+    def _bin(self):
+        from app import stage_cc65
+        bin_dir = stage_cc65()
+        if not bin_dir or not os.path.exists(os.path.join(bin_dir, "ca65")):
+            self.skipTest("no vendored cc65")
+        return bin_dir
+
     def test_blink_assembles(self):
-        r = assemble.assemble_6502(BLINK_6502, self._cfg())
+        r = assemble.assemble_6502(BLINK_6502, self._cfg(), bin_dir=self._bin())
         self.assertTrue(r["success"], r.get("log") or r.get("errors"))
 
     def test_listing_present(self):
-        r = assemble.assemble_6502(BLINK_6502, self._cfg())
+        r = assemble.assemble_6502(BLINK_6502, self._cfg(), bin_dir=self._bin())
         self.assertIsNotNone(r.get("listing"))
         self.assertEqual(r["listing"]["v"], 1)
 
     def test_listing_contains_main(self):
-        r = assemble.assemble_6502(BLINK_6502, self._cfg())
+        r = assemble.assemble_6502(BLINK_6502, self._cfg(), bin_dir=self._bin())
         self.assertIn("main", r["listing"]["asm"])
 
     def test_linemap_nonempty(self):
-        r = assemble.assemble_6502(BLINK_6502, self._cfg())
+        r = assemble.assemble_6502(BLINK_6502, self._cfg(), bin_dir=self._bin())
         self.assertGreater(len(r["listing"]["lineMap"]), 0)
 
     def test_labels_present(self):
-        r = assemble.assemble_6502(BLINK_6502, self._cfg())
+        r = assemble.assemble_6502(BLINK_6502, self._cfg(), bin_dir=self._bin())
         self.assertIsNotNone(r.get("labels"))
         self.assertIn("al ", r["labels"])
 
     def test_binary_nonempty(self):
-        r = assemble.assemble_6502(BLINK_6502, self._cfg())
+        r = assemble.assemble_6502(BLINK_6502, self._cfg(), bin_dir=self._bin())
         self.assertGreater(r["bytes"], 0)
 
     def test_syntax_error_line_accurate(self):
-        r = assemble.assemble_6502(BAD_6502, self._cfg())
+        r = assemble.assemble_6502(BAD_6502, self._cfg(), bin_dir=self._bin())
         self.assertFalse(r["success"])
         self.assertGreater(len(r["errors"]), 0)
         self.assertEqual(r["errors"][0]["line"], 1)

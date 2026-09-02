@@ -156,6 +156,15 @@ gets its own parser over its own output format ([`stages.py`](stages.py)), so
 an assembler lane in a front end can show tokens and symbols without
 reimplementing five assemblers.
 
+The symbols come from the *assembler's* own symbol file — sdas's `.sym` for
+the 8051 and Z80, `nm` for the gcc chains — and both of those are read from
+the **vendored** toolchain. That is not a detail: until 2026-09-02 the 8051
+path was handed the listing instead of the `.sym` (which has no symbol table
+in it), and the gcc paths fell through to the developer's system `nm`, which
+does not exist on a deployment. Production returned `passes: []` for every
+chain, and the tests agreed with it because they ran against whatever the
+developer had on `PATH`.
+
 ### `POST /uf2`
 
 A raw binary and an origin address in, a **UF2 container** out — the format an
@@ -1087,7 +1096,7 @@ Everything below must pass before pushing.
 
 | suite | what it holds to account | scale |
 |---|---|---|
-| `pytest test_*.py` | the dialect, PARTs, display verbs, arcade, assembler, UF2, listings, ARM builds, the device matrix | **380** |
+| `pytest test_*.py` | the dialect, PARTs, display verbs, arcade, assembler, UF2, listings, ARM builds, the device matrix | **382** |
 | `scripts/test-roundtrip.py` | `parse` and `emit_pseudocode` are inverses | **1,014** |
 | `scripts/test-api.py` | production: every endpoint, language, family | **172** |
 | `scripts/test-parity.py` | every target × every feature, both directions | 82 |
@@ -1106,6 +1115,7 @@ Everything below must pass before pushing.
 
 ```bash
 python3 -m pytest -q test_*.py            # needs: pytest fastapi pydantic
+                                          # uses the VENDORED toolchains, not PATH
 for s in roundtrip parity peripherals golden wait-floor microbit symtab \
          pinmap tables-ports pages wiring; do python3 scripts/test-$s.py; done
 node scripts/test-flash.mjs

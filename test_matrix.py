@@ -221,18 +221,27 @@ class TestMatrix(unittest.TestCase):
         self.assertIn("bw_scr_screen_dim = bw_scr_level(", c)
 
     def test_builds_under_sdcc_if_present(self):
+        """Against the VENDORED sdcc, so this runs everywhere rather than only
+        on a developer's box -- and so it exercises the 4.0.0 the service
+        ships, not whatever `brew install sdcc` last put on PATH."""
         import shutil
         import subprocess
         import tempfile
         import os
-        if not shutil.which("sdcc"):
-            self.skipTest("sdcc not installed")
+        from app import stage_toolchain, sdcc_bin_dir
+        stage_toolchain()
+        bin_dir = sdcc_bin_dir()
+        sdcc = os.path.join(bin_dir, "sdcc") if bin_dir else None
+        if not (sdcc and os.path.exists(sdcc)):
+            sdcc = shutil.which("sdcc")
+        if not sdcc:
+            self.skipTest("no vendored or system sdcc")
         c, _ = sp.transpile(SRC)
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "m.c")
             with open(path, "w") as f:
                 f.write(c)
-            r = subprocess.run(["sdcc", "-mmcs51", "--std-c99", path],
+            r = subprocess.run([sdcc, "-mmcs51", "--std-c99", path],
                                cwd=d, capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertTrue(os.path.exists(os.path.join(d, "m.ihx")))

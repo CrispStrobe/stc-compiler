@@ -198,27 +198,75 @@ def parse_sdas_listing(listing_text: str) -> list[dict]:
     return entries
 
 
-def parse_sdas_symbols(listing_text: str) -> dict:
-    """Extract symbols from sdas listing's symbol table section."""
+# One symbol as sdas writes it. Two forms share the table:
+#
+#     P1      =  000090 L       an equate -- the built-in SFR names, and any
+#                               the source defines with `=`
+#   3 start      000100 R       an area-relative label: area index, name,
+#                               offset, R for relocatable
+#
+# Six hex digits (the header says "Hexadecimal [24-Bits]"), and up to three
+# of these packed per line separated by `|`.
+_SDAS_SYMBOL = re.compile(
+    r"^\s*(?:(\d+)\s+)?"          # optional area index (relocatable symbols)
+    r"([A-Za-z_.$][\w.$]*)\s*"     # name
+    r"(=)?\s+"                     # `=` marks an equate
+    r"([0-9A-Fa-f]{4,8})\s+"       # value
+    r"([A-Za-z])\s*$"              # L local / G global / R relocatable
+)
+
+
+def parse_sdas_symbols(sym_text: str) -> dict:
+    """Extract symbols from an sdas `.sym` file.
+
+    This wants the .sym, NOT the .lst. sdas writes the symbol table into its
+    own file (the `s` in -plosgff asks for it) and the listing has no such
+    section at all -- so feeding this the listing, which is what happened
+    until 2026-09-02, always returned {} and the /assemble stages payload
+    shipped `passes: []` for every 8051 and Z80 request in production.
+
+    Nothing caught it because the 8051 and Z80 stage tests asserted on tokens
+    and on the listing, never on the symbols.
+    """
     symbols = {}
     in_symbols = False
-    for line in listing_text.splitlines():
-        if "Symbol Table" in line or "Area Table" in line:
-            in_symbols = "Symbol" in line
+    for line in sym_text.splitlines():
+        if "Symbol Table" in line:
+            in_symbols = True
             continue
-        if in_symbols:
-            # Symbol lines: name followed by value
-            m = re.match(r'^\s+(\S+)\s+([0-9A-Fa-f]{4})\s', line)
-            if m:
-                name = m.group(1)
-                value = int(m.group(2), 16)
-                symbols[name] = {"value": value, "resolved": True}
+        if "Area Table" in line:
+            in_symbols = False
+            continue
+        if not in_symbols:
+            continue
+        # Up to three symbols per line, `|`-separated.
+        for column in line.split("|"):
+            m = _SDAS_SYMBOL.match(column)
+            if not m:
+                continue
+            area, name, equate, value, scope = m.groups()
+            symbols[name] = {
+                "value": int(value, 16),
+                "resolved": True,
+                # An equate is absolute; an area-relative label is only final
+                # after the linker has placed its area, and the offset here is
+                # within that area.
+                "kind": "equate" if equate else "label",
+                "scope": {"G": "global", "L": "local"}.get(scope, "relocatable"),
+            }
+            if area is not None:
+                symbols[name]["area"] = int(area)
     return symbols
 
 
-def stages_8051(source: str, listing_text: str) -> dict:
-    """Build the stages payload for an 8051/sdas assembly."""
-    symbols = parse_sdas_symbols(listing_text)
+def stages_8051(source: str, listing_text: str, sym_text: str = "") -> dict:
+    """Build the stages payload for an 8051/sdas assembly.
+
+    `sym_text` is the .sym file. It is a separate argument because the
+    symbols are in a separate FILE -- passing the listing twice is what the
+    original did, in effect, and it silently produced no symbols at all.
+    """
+    symbols = parse_sdas_symbols(sym_text)
     return {
         "tokens": tokenize_asm(source),
         "passes": [{"symbols": symbols}] if symbols else [],
@@ -226,10 +274,10 @@ def stages_8051(source: str, listing_text: str) -> dict:
     }
 
 
-def stages_z80(source: str, listing_text: str) -> dict:
+def stages_z80(source: str, listing_text: str, sym_text: str = "") -> dict:
     """Build the stages payload for a Z80/sdasz80 assembly.
-    Same listing format as 8051 (both are SDCC sdas family)."""
-    return stages_8051(source, listing_text)
+    Same listing and .sym format as 8051 (both are SDCC sdas family)."""
+    return stages_8051(source, listing_text, sym_text)
 
 
 # ---- gcc family (AVR, ARM) ----

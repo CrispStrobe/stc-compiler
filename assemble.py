@@ -36,12 +36,27 @@ def _parse_sdas_errors(text: str, src_basename: str) -> list[dict]:
     return errors
 
 
+# ca65 has TWO diagnostic formats, and which one you get depends on the build:
+#
+#   Debian's 2.19-1 (older upstream)   main.s(1): Error: ':' expected
+#   upstream Git 547d923 (vendored)    main.s:1: Error: Expected ':' after ...
+#
+# The vendored one is the newer, GCC-style form -- and it is the one this
+# service runs. Matching only the parenthesised form meant every 6502 syntax
+# error in production came back as line 0 with the raw stderr as its message,
+# while the tests passed against a developer's Debian ca65. Found 2026-09-02
+# by pointing the tests at the vendored binaries.
+_CA65_DIAGNOSTIC = re.compile(
+    r"^(.+?)(?:\((\d+)\)|:(\d+)):\s*(?:Error|Warning):\s*(.+)", re.M)
+
+
 def _parse_ca65_errors(text: str, src_basename: str) -> list[dict]:
-    """ca65: file(line): Error: message"""
+    """ca65: `file(line): Error: message` or `file:line: Error: message`."""
     errors = []
-    for m in re.finditer(r"^(.+?)\((\d+)\):\s*(?:Error|Warning):\s*(.+)", text, re.M):
+    for m in _CA65_DIAGNOSTIC.finditer(text):
         if src_basename in m.group(1):
-            errors.append({"line": int(m.group(2)), "message": m.group(3).strip()})
+            line = m.group(2) or m.group(3)
+            errors.append({"line": int(line), "message": m.group(4).strip()})
     # ld65 errors (skip the harmless STARTUP segment warning)
     for m in re.finditer(r"^ld65:\s*(?:Error|Warning):\s*(.+)", text, re.M):
         msg = m.group(1).strip()
@@ -61,6 +76,37 @@ def _parse_gas_errors(text: str, src_basename: str) -> list[dict]:
 
 
 # ---- per-toolchain assemble functions ---------------------------------------
+
+def _find_tool(bin_dir: str, *candidates: str) -> str | None:
+    """Locate a toolchain binary, preferring the VENDORED copy.
+
+    The bundles do not put every tool in one place. GCC's driver directory
+    (avr/bin, arm/bin) carries the prefixed names it execs directly, while
+    binutils' own internal directory (avr/lib/avr/bin, arm/lib/arm-none-eabi/bin)
+    carries the unprefixed ones the driver reaches through. `nm` lives only in
+    the second, so looking in the first and then falling back to shutil.which()
+    found the DEVELOPER'S system nm and nothing at all on a deployment.
+
+    That is a silent failure, not a loud one: no nm means empty output, and an
+    empty symbol table is a valid-looking `stages` payload with the symbols
+    missing. Production served exactly that for AVR and ARM until 2026-09-02.
+
+    So: every vendored location first, the system only as a last resort.
+    """
+    for candidate in candidates:
+        if os.path.isabs(candidate):
+            if os.path.exists(candidate):
+                return candidate
+            continue
+        found = os.path.join(bin_dir, candidate)
+        if os.path.exists(found):
+            return found
+    for candidate in candidates:
+        found = shutil.which(os.path.basename(candidate))
+        if found:
+            return found
+    return None
+
 
 def assemble_8051(source: str, bin_dir: str | None = None,
                    debug: bool = False) -> dict:
@@ -119,7 +165,14 @@ def assemble_8051(source: str, bin_dir: str | None = None,
             if os.path.exists(lst):
                 with open(lst, encoding="utf-8", errors="replace") as f:
                     lst_text = f.read()
-            stages_payload = stages_mod.stages_8051(source, lst_text)
+            # The symbols are in the .sym, which is why -plosgff asks for
+            # one. Reading only the .lst here is what made `passes` empty.
+            sym_text = ""
+            sym_path = os.path.splitext(lst)[0] + ".sym"
+            if os.path.exists(sym_path):
+                with open(sym_path, encoding="utf-8", errors="replace") as f:
+                    sym_text = f.read()
+            stages_payload = stages_mod.stages_8051(source, lst_text, sym_text)
 
         return {"success": True,
                 "base64": base64.b64encode(blob).decode("ascii"),
@@ -210,7 +263,14 @@ def assemble_z80(source: str, bin_dir: str | None = None,
             if os.path.exists(lst):
                 with open(lst, encoding="utf-8", errors="replace") as f:
                     lst_text = f.read()
-            stages_payload = stages_mod.stages_z80(source, lst_text)
+            # The symbols are in the .sym, which is why -plosgff asks for
+            # one. Reading only the .lst here is what made `passes` empty.
+            sym_text = ""
+            sym_path = os.path.splitext(lst)[0] + ".sym"
+            if os.path.exists(sym_path):
+                with open(sym_path, encoding="utf-8", errors="replace") as f:
+                    sym_text = f.read()
+            stages_payload = stages_mod.stages_z80(source, lst_text, sym_text)
 
         return {"success": True,
                 "base64": base64.b64encode(blob).decode("ascii"),
@@ -394,9 +454,11 @@ def assemble_avr(source: str, mcu: str, bin_dir: str, env: dict,
         stages_payload = None
         if debug:
             import stages as stages_mod
-            nm = os.path.join(bin_dir, "avr-nm")
-            if not os.path.exists(nm):
-                nm = shutil.which("avr-nm")
+            # avr-nm is not in avr/bin; binutils' own nm is in
+            # avr/lib/avr/bin/nm, and that one ships. See _find_tool.
+            nm = _find_tool(bin_dir, "avr-nm",
+                            os.path.join(os.path.dirname(bin_dir),
+                                         "lib", "avr", "bin", "nm"))
             nm_text = ""
             if nm:
                 try:
@@ -504,9 +566,9 @@ def assemble_arm(source: str, mcu: str, bin_dir: str, env: dict,
         stages_payload = None
         if debug:
             import stages as stages_mod
-            nm = os.path.join(bin_dir, "arm-none-eabi-nm")
-            if not os.path.exists(nm):
-                nm = shutil.which("arm-none-eabi-nm")
+            nm = _find_tool(bin_dir, "arm-none-eabi-nm",
+                            os.path.join(os.path.dirname(bin_dir),
+                                         "lib", "arm-none-eabi", "bin", "nm"))
             nm_text = ""
             if nm:
                 try:

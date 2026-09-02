@@ -147,6 +147,25 @@ class Test8051Stages(unittest.TestCase):
         labels = [t for t in tokens if t["type"] == "label"]
         self.assertTrue(any(t["text"] == "start" for t in labels))
 
+    def test_stages_has_symbols(self):
+        """The blind spot that hid it: the 8051 and Z80 stage tests asserted
+        on tokens and on the listing, never on the symbols -- so `passes: []`
+        shipped in every production response for both chains and nothing said
+        a word. Verified live on 2026-09-02 before it was fixed."""
+        r = self._assemble(debug=True)
+        passes = r["stages"]["passes"]
+        self.assertGreater(len(passes), 0, "no symbol pass -- the .sym was not read")
+        symbols = passes[0]["symbols"]
+        self.assertIn("start", symbols)
+        self.assertTrue(symbols["start"]["resolved"])
+        self.assertEqual(symbols["start"]["kind"], "label")
+        # A built-in equate too, to prove the other row form parses: the
+        # .sym packs three columns per line and mixes `name = value` equates
+        # with `area name value` relocatable labels.
+        self.assertIn("P1", symbols)
+        self.assertEqual(symbols["P1"]["value"], 0x90)
+        self.assertEqual(symbols["P1"]["kind"], "equate")
+
     def test_stages_has_listing(self):
         r = self._assemble(debug=True)
         listing = r["stages"]["listing"]
@@ -187,6 +206,19 @@ class TestZ80Stages(unittest.TestCase):
         tokens = r["stages"]["tokens"]
         labels = [t for t in tokens if t["type"] == "label"]
         self.assertTrue(any(t["text"] == "start" for t in labels))
+
+    def test_stages_has_symbols(self):
+        """The blind spot that hid it: the 8051 and Z80 stage tests asserted
+        on tokens and on the listing, never on the symbols -- so `passes: []`
+        shipped in every production response for both chains and nothing said
+        a word. Verified live on 2026-09-02 before it was fixed."""
+        r = self._assemble(debug=True)
+        passes = r["stages"]["passes"]
+        self.assertGreater(len(passes), 0, "no symbol pass -- the .sym was not read")
+        symbols = passes[0]["symbols"]
+        self.assertIn("start", symbols)
+        self.assertTrue(symbols["start"]["resolved"])
+        self.assertEqual(symbols["start"]["kind"], "label")
 
     def test_stages_has_listing(self):
         r = self._assemble(debug=True)

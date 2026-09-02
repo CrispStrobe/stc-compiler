@@ -110,7 +110,13 @@ done
 # Debian packaging's oddest decision). A symlink arm/arm-none-eabi ->
 # lib/arm-none-eabi covers the standard prefix layout.
 mkdir -p "$ROOT/arm/lib/arm-none-eabi/bin"
-for b in as ld ar ranlib objcopy objdump; do
+# nm is here for a reason worth stating: /assemble's debug payload reads the
+# symbol table with it, and it lives ONLY in this unprefixed binutils
+# directory -- not in arm/bin. Omitting it does not fail, it silently returns
+# an empty symbol table, because assemble.py's lookup fell through to the
+# developer's system nm. Production served `passes: []` for every ARM request
+# until 2026-09-02.
+for b in as ld ar ranlib objcopy objdump nm; do
   src="$WORK/x/usr/lib/arm-none-eabi/bin/$b"
   if [ -f "$src" ]; then
     cp "$src" "$ROOT/arm/lib/arm-none-eabi/bin/$b"
