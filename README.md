@@ -1105,7 +1105,7 @@ Everything below must pass before pushing.
 |---|---|---|
 | `pytest test_*.py` | the dialect, PARTs, display verbs, arcade, assembler, UF2, listings, ARM builds, the device matrix | **382** |
 | `scripts/test-roundtrip.py` | `parse` and `emit_pseudocode` are inverses | **1,014** |
-| `scripts/test-api.py` | production: every endpoint, language, family | **172** |
+| `scripts/test-api.py` | production: every endpoint, language, family, and the debug payloads | **229** |
 | `scripts/test-parity.py` | every target × every feature, both directions | 82 |
 | `scripts/test-peripherals.py` | PWM, tone, print | 62 |
 | `scripts/test-golden.py` | what the emitter emits, byte for byte | 57 |
@@ -1130,6 +1130,19 @@ node scripts/test-flash.mjs
 ./scripts/test-disasm.py ../stc/build/01-blink
 ./scripts/test-reassemble.py ../stc/build/01-blink/main.ihx
 ```
+
+`test-api.py` asserts **floors** on the introspection payloads, not their
+presence. That distinction is the whole reason the section exists: `/assemble`
+with `debug: true` returned `passes: []` on every chain for as long as the
+endpoint had existed, and this file was 172 green checks against the live
+service throughout, because it mentioned `symbols` zero times and `debug`
+never. The floors did exist — `test-symtab.py` validates every scheduler
+address against the linker's own `.map` — but it runs locally. So the gate
+with the floor never ran against production, and the gate that ran against
+production had no floor. Neither file looks negligent on its own, which is
+why it survived. Verified the new checks bite by running them against the
+pre-fix service with no system toolchains on `PATH`: 14 failures, against 0
+on the fixed one.
 
 Three suites are excluded from CI with reasons that are themselves checked:
 `test-api.py` needs a deployment, `test-disasm.py` and `test-reassemble.py`

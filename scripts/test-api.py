@@ -806,5 +806,215 @@ try:
 except Exception as exc:
     check("stm32f030 target compiles", False, str(exc))
 
+
+# ---------------------------------------------------------------------------
+# The introspection payloads: /compile symbols and /assemble debug.
+#
+# These exist because of what happened on 2026-09-02. POST /assemble with
+# debug:true had been returning `passes: []` -- no symbol table at all -- for
+# every target, for as long as the endpoint had existed. This file was 172
+# green checks against the live service throughout, and it never noticed,
+# because it mentioned `symbols` zero times and `debug` never.
+#
+# The floors DID exist: test-symtab.py validates every scheduler address
+# against the linker's own .map. It just runs locally. So the gate with the
+# floor never ran against production, and the gate that ran against production
+# had no floor. That is the failure shape, and it is not "somebody forgot to
+# assert" -- both files look conscientious on their own.
+#
+# So: every check below has to FAIL if the payload comes back empty. Presence
+# is not a check. `assertIn("stages", result)` would have passed all week.
+#
+# And emptiness is only a signal against a fixture chosen so that a working
+# implementation cannot produce it: the pseudocode has two WHEN blocks, so a
+# working scheduler MUST report two tasks with yield points, and each assembly
+# fixture defines a label whose name is then demanded by name.
+
+print("\ndebug symbol table (/compile symbols:true)")
+
+SCHEDULER_BW = """DEVICE STC12C5A60S2:
+  CLOCK 11059200
+  PIN led = P1.0 OUTPUT ACTIVE LOW
+
+  WHEN started:
+    FOREVER:
+      toggle led
+      wait 500 ms
+
+  WHEN started:
+    FOREVER:
+      wait 100 ms
+"""
+
+try:
+    result, _ = post({"code": SCHEDULER_BW, "language": "pseudocode",
+                      "symbols": True})
+    ok = result.get("success") is True
+    check("a two-script program compiles with symbols", ok,
+          result.get("error", ""))
+    if ok:
+        check("no symbol-table error", result.get("symbols_error") is None,
+              str(result.get("symbols_error"))[:70])
+        symbols = result.get("symbols") or {}
+        check("symbols names the device",
+              symbols.get("device") == "stc12c5a60s2", str(symbols.get("device")))
+        check("symbols carries the clock the DEVICE asked for",
+              symbols.get("fosc") == 11059200, str(symbols.get("fosc")))
+
+        scheduler = symbols.get("scheduler") or {}
+        bw_ms = scheduler.get("bw_ms") or {}
+        check("the millisecond tick has a real address",
+              isinstance(bw_ms.get("addr"), int) and bw_ms["addr"] > 0,
+              f"bw_ms @ {bw_ms.get('addr')}")
+
+        tasks = scheduler.get("tasks") or []
+        # Two WHEN blocks in, two state machines out. A count, not a
+        # truthiness test: an empty list is the bug being guarded against.
+        check("both scripts became tasks", len(tasks) == 2, f"{len(tasks)} tasks")
+
+        image, _errors = code_bytes(base64.b64decode(result["base64"]).decode())
+        top = max(image) if image else 0
+
+        for task in tasks:
+            name = task.get("name", "?")
+            check(f"{name} has an entry point",
+                  isinstance(task.get("func_addr"), int) and task["func_addr"] > 0,
+                  f"@ {task.get('func_addr')}")
+            state, until = task.get("state") or {}, task.get("until") or {}
+            check(f"{name} state and deadline are separate variables",
+                  isinstance(state.get("addr"), int)
+                  and isinstance(until.get("addr"), int)
+                  and state["addr"] > 0 and until["addr"] > 0
+                  and state["addr"] != until["addr"],
+                  f"state @ {state.get('addr')}, until @ {until.get('addr')}")
+
+            yields = task.get("yields") or []
+            # A task that yields nowhere would starve every other script, so
+            # an empty list here is a real defect and not merely a thin payload.
+            check(f"{name} reports its yield points", len(yields) >= 2,
+                  f"{len(yields)} yields")
+            addrs = [y.get("addr") for y in yields]
+            check(f"{name} yield addresses are all real",
+                  bool(addrs) and all(isinstance(a, int) and a > 0 for a in addrs),
+                  str(addrs))
+            check(f"{name} yield addresses are distinct",
+                  len(set(addrs)) == len(addrs), str(addrs))
+            # A yield point outside the image cannot be a code address, which
+            # is how a plausible-looking but wrongly-based table would read.
+            check(f"{name} yield addresses land inside the image",
+                  bool(addrs) and all(0 < a <= top for a in addrs),
+                  f"max yield {max(addrs) if addrs else None} vs image top {top}")
+
+
+except Exception as exc:
+    check("a two-script program compiles with symbols", False, str(exc))
+
+
+print("\nassembler stages (/assemble debug:true)")
+
+# One fixture per chain, each defining a label the check then demands by name.
+# The symbol dicts are NOT the same shape across toolchains -- sdas reports
+# kind/scope/area, ld65 reports type/scope, nm reports type -- so only `value`
+# and `resolved` are common ground and only those are asserted.
+STAGE_CHAINS = [
+    ("stc12c5a60s2", "start",
+     ".module blink\n.area CODE (ABS)\n.org 0x0000\n    ljmp start\n"
+     ".org 0x0100\nstart:\n    clr 0x90\n    setb 0x90\n    sjmp start\n"),
+    ("z80", "start",
+     ".module z80halt\n.area CODE (ABS)\n.org 0x0000\nstart:\n"
+     "    ld a, #0x55\n    halt\n"),
+    ("eater6502", "main",
+     '.segment "CODE"\n.proc main\n    lda #5\n    sta $6000\nloop:\n'
+     '    dex\n    bne loop\n    rts\n.endproc\n'
+     '.segment "VECTORS"\n.word $0000\n.word main\n.word $0000\n'),
+    ("atmega328p", "main",
+     ".global main\nmain:\n    sbi 0x04, 5\n    sbi 0x05, 5\nloop:\n"
+     "    rjmp loop\n"),
+    ("nrf52833", "Reset_Handler",
+     ".syntax unified\n.cpu cortex-m4\n.thumb\n"
+     '.section .vectors, "a"\n.word 0x20020000\n.word Reset_Handler\n'
+     ".text\n.global Reset_Handler\n.type Reset_Handler, %function\n"
+     "Reset_Handler:\n    b .\n"),
+]
+
+for target, label, asm in STAGE_CHAINS:
+    try:
+        request = urllib.request.Request(
+            f"{BASE}/assemble",
+            json.dumps({"asm": asm, "target": target, "debug": True}).encode(),
+            {"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=120) as response:
+            result = json.load(response)
+        ok = result.get("success") is True
+        check(f"{target} assembles", ok,
+              str(result.get("error") or result.get("errors"))[:70])
+        if not ok:
+            continue
+
+        stages = result.get("stages") or {}
+        check(f"{target} stages: the source was lexed",
+              len(stages.get("tokens") or []) > 0,
+              f"{len(stages.get('tokens') or [])} tokens")
+        check(f"{target} stages: a native listing came back",
+              len(stages.get("listing") or "") > 0,
+              f"{len(stages.get('listing') or '')} chars")
+
+        # THE regression this section exists for. `passes` was [] on every
+        # chain in production and nothing said a word.
+        passes = stages.get("passes") or []
+        check(f"{target} stages: a symbol pass came back", len(passes) > 0,
+              f"{len(passes)} passes")
+        if not passes:
+            continue
+
+        symbols = passes[0].get("symbols") or {}
+        check(f"{target} stages: the table is not empty", len(symbols) > 0,
+              f"{len(symbols)} symbols")
+        entry = symbols.get(label)
+        check(f"{target} stages: the program's own label {label!r} is in it",
+              entry is not None, ", ".join(sorted(symbols)[:6]))
+        if entry is not None:
+            check(f"{target} stages: {label!r} resolved to an address",
+                  entry.get("resolved") is True
+                  and isinstance(entry.get("value"), int),
+                  f"value {entry.get('value')}")
+    except Exception as exc:
+        check(f"{target} assembles", False, str(exc))
+
+
+
+# The fourth defect of that day, and the only one not about an empty payload:
+# ca65 has two diagnostic formats and the VENDORED build uses the newer
+# GCC-style `file:1:` where Debian's uses `file(1):`. The parser knew only the
+# second, so a 6502 syntax error came back as line 0 with raw stderr attached
+# -- correct-looking JSON with the one field a caller needs zeroed out. The
+# floor is that the line is the line the mistake is actually on.
+try:
+    request = urllib.request.Request(
+        f"{BASE}/assemble",
+        json.dumps({"asm": "    lda #1\nbad instruction here\n",
+                    "target": "eater6502"}).encode(),
+        {"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=120) as response:
+        result = json.load(response)
+    check("a 6502 syntax error is refused", result.get("success") is False)
+    errors = result.get("errors") or []
+    check("the refusal carries an error", len(errors) > 0, str(errors)[:70])
+    if errors:
+        check("it names the line the mistake is on",
+              errors[0].get("line") == 2, f"line {errors[0].get('line')}")
+        # The fallback path attaches raw stderr, which still READS fine --
+        # it is one line and it does mention the problem. What gives it away
+        # is that it is the whole diagnostic, filename and line prefix and
+        # all, rather than the message the parser was supposed to lift out.
+        message = errors[0].get("message") or ""
+        check("it carries a parsed message, not raw stderr",
+              bool(message.strip()) and "main.s" not in message
+              and not message.lstrip().startswith("Error:"),
+              message[:60])
+except Exception as exc:
+    check("a 6502 syntax error is refused", False, str(exc))
+
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
