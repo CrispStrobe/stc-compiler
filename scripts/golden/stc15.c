@@ -4,6 +4,23 @@
  * it cannot represent. stc-compiler itself only goes forwards. */
 #include <stc12.h>
 
+/* STC15 supplement -- registers stc12.h lacks (STC15-PERIPHERAL-MODEL.md) */
+__sbit __at (0xCC) P5_4;      /* DIP-40 pin 17, RST-shared */
+__sbit __at (0xCD) P5_5;      /* DIP-40 pin 19 */
+__sbit __at (0xCE) P5_6;      /* not bonded on DIP-40 */
+__sbit __at (0xCF) P5_7;      /* not bonded on DIP-40 */
+__sfr  __at (0xD6) T2H;       /* Timer 2 -- the UART1 baud source */
+__sfr  __at (0xD7) T2L;
+__sfr  __at (0xBA) P_SW2;     /* peripheral pin switch 2 */
+__sfr  __at (0xAA) WKTCL;     /* wake-up timer */
+__sfr  __at (0xAB) WKTCH;
+__sfr  __at (0xDC) CCAPM2;    /* third PCA/CCP channel */
+__sfr  __at (0xEC) CCAP2L;
+__sfr  __at (0xFC) CCAP2H;
+__sfr  __at (0xF4) PCA_PWM2;
+#define P_SW1    AUXR1        /* STC15 name for 0xA2 */
+#define INT_CLKO WAKE_CLKO    /* STC15 name for 0x8F */
+
 #define FOSC_HZ 11059200UL
 
 /* Timer 0, mode 1, clocked at FOSC/12 -- accuracy depends only on

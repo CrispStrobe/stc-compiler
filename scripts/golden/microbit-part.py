@@ -30,4 +30,9 @@ def bw_script():
         bw_part_sr((85) & 0xFF)
         sleep(100)
 
+# P6, P7 are wired to the 5x5 LED matrix. The display driver
+# scans those pins continuously and would fight anything
+# else driving them, so it is switched off.
+display.off()
+
 bw_script()
