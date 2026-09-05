@@ -1600,17 +1600,23 @@ ASSEMBLE_TARGETS = {
     "atmega328p": "avr", "atmega168p": "avr", "atmega2560": "avr",
     "attiny85": "avr", "attiny88": "avr",
     # ARM → arm-none-eabi-gcc
-    "nrf52833": "arm",
+    "nrf52833": "arm", "rp2040": "arm", "stm32f030": "arm",
     # Z80 → sdasz80+sdldz80
     "z80": "z80",
 }
 
 ARM_MCU_FOR_TARGET = {
     "nrf52833": "cortex-m4",
+    "rp2040": "cortex-m0plus",   # Raspberry Pi Pico
+    "stm32f030": "cortex-m0",    # STM32F0 value line
 }
 
 ARM_LD_FOR_TARGET = {
     "nrf52833": os.path.join(BASE_DIR, "nrf52833.ld"),
+    # Same scripts the C-compile ARM chain uses: pico is SRAM-only (rp2040js
+    # jumps to 0x20000000), the F030 is a real flash image at 0x08000000.
+    "rp2040": os.path.join(BASE_DIR, "pico-sram.ld"),
+    "stm32f030": os.path.join(BASE_DIR, "stm32f030-flash.ld"),
 }
 
 AVR_MCU_FOR_TARGET = {
