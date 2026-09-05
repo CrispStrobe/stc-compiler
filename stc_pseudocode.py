@@ -5661,5 +5661,32 @@ TARGETS["eater6502"] = Eater6502Target(
     "eater6502", "Eater 6502", "eater6502", 32768, ports="AB",
     default_clock=1000000)
 
+
+# Z80 -- the composable Z80 breadboard machine (74HC374 OUT latch + 74HC244
+# IN buffer on I/O port 0; ROM $0000-$7FFF, RAM $8000-$FFFF).
+#
+# The C lane for it is REAL as of this change: `sdcc -mz80` through
+# /compile with target="z80" (see build_z80 in app.py). What is missing is
+# the same thing the 6502 is missing -- a pseudocode GENERATOR. sb3-creator
+# has one (its `_core === 'z80'` emission is what build_z80 was proven
+# against); this reference implementation does not, and borrowing the
+# nearest one would emit 8051 or AVR C for a Z80.
+#
+# So the DEVICE name becomes REAL and REFUSES, which is strictly better than
+# "unknown device": a caller learns the machine is known here and which lane
+# carries it. Registered exactly as eater6502 is, and held to the same
+# declared outcome by test_device_matrix.py.
+class Z80Target(Eater6502Target):
+    toolchain = "sdcc-z80"
+    pseudocode_gap = (
+        "the Z80 bench has no pseudocode generator here yet -- it would emit "
+        "code for the wrong architecture. Its working lanes are hand-written "
+        "C and assembly: POST /compile or /assemble with target=\"z80\". "
+        "sb3-creator's own Z80 emitter produces C this service compiles.")
+
+
+TARGETS["z80"] = Z80Target(
+    "z80", "Z80 bench", "z80", 32768, ports="AB", default_clock=7372800)
+
 from bw_arcade import ArcadeTarget  # noqa: E402
 TARGETS["arcade"] = ArcadeTarget()

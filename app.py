@@ -257,6 +257,43 @@ EATER_TARGETS = {
     },
 }
 
+# Z80 compile target: the composable Z80 breadboard machine. The assemble
+# path (sdasz80+sdldz80, /assemble target "z80") landed first; build_z80
+# completes the C story out of the SAME vendored SDCC bundle the 8051 uses
+# -- sdcc has the z80 port compiled in (`sdcc --version` lists it), it only
+# ever lacked share/sdcc/lib/z80, which scripts/fetch-sdcc.sh now copies.
+#
+# THE MEMORY MAP IS NOT INVENTED HERE. It is what bw-board's
+# extractZ80Machine reads off the bench wiring, asserted by
+# brickwright-lite's examples/z80-pd-bench/check-extract.mjs and written
+# out in that example's EXPECTED.md:
+#
+#     MAP ROM $0000-$7FFF
+#     MAP RAM $8000-$FFFF
+#
+# so --data-loc is the first byte of RAM and the image lives in the low
+# 32 KB. --code-loc clears SDCC's own absolute areas, which are fixed by
+# the Z80 itself and by crt0: the RST vectors at $00-$3B, the NMI at $66,
+# and crt0's init block at $0100. $0200 is the first round address above
+# all of them.
+#
+# SDCC's stock z80 crt0 SUITS this bench and is used unmodified rather
+# than replaced: it puts `jp init` at $0000 (which is the Z80's reset
+# vector), sets SP to $0000 -- so the first push lands at $FFFE, the top
+# of the bench's RAM -- runs gsinit to copy initialised data down from
+# ROM, and calls _main. A hand-written crt0 would have to do exactly that
+# and would only add a second thing to keep in step with SDCC's areas.
+Z80_TARGETS = {
+    "z80": {
+        "mcu": "z80", "rom": 32768,
+        "code_loc": 0x0200, "data_loc": 0x8000,
+        "description": "Z80 bench — 32 KB ROM at 0x0000, 32 KB RAM at 0x8000",
+    },
+}
+# The device id the Code tab sends is `z80`; `z80-bench` is the name the
+# gallery example carries, and callers reach for it. Same machine.
+Z80_TARGETS["z80-bench"] = Z80_TARGETS["z80"]
+
 # ---- cc65 toolchain (6502 assembler/linker) ---------------------------------
 SRC_CC65 = os.path.join(BASE_DIR, "cc65")
 CC65_STAGE = "/tmp/cc65"
@@ -268,20 +305,34 @@ app.add_middleware(
 )
 
 
+# What a COMPLETE stage looks like, so a stale one can be told from a good
+# one. bin/ has been checked for sdcc since the partial-copy bug; share/ was
+# never checked at all, and on 2026-09-05 that bit: adding lib/z80 to the
+# repo did nothing for a process whose /tmp/sdcc/share was copied before it
+# existed, so `sdcc -mz80` linked against /usr/share/sdcc instead -- a
+# directory Vercel does not have. The z80 crt0 is the sentinel because it is
+# the newest thing in the bundle; anything older cannot prove freshness.
+STAGE_BIN_SENTINEL = os.path.join(STAGE_BIN, "sdcc")
+STAGE_SHARE_SENTINEL = os.path.join(STAGE_SHARE, "sdcc", "lib", "z80", "crt0.rel")
+
+
 def stage_toolchain():
     """Copy the toolchain into /tmp on cold start. Cheap and idempotent.
     A PARTIAL stage (interrupted copy: bin/ exists, sdcc missing) used to
     stick forever — the copy was skipped because the dir existed. Heal it
-    by wiping and recopying."""
-    if os.path.isdir(STAGE_BIN) and os.path.exists(os.path.join(STAGE_BIN, "sdcc")):
+    by wiping and recopying; heal a STALE share/ by overlaying the missing
+    files rather than wiping, because another request may be reading it."""
+    bin_ok = os.path.isdir(STAGE_BIN) and os.path.exists(STAGE_BIN_SENTINEL)
+    share_ok = os.path.exists(STAGE_SHARE_SENTINEL)
+    if bin_ok and share_ok:
         return
     os.makedirs(STAGE, exist_ok=True)
-    if os.path.isdir(STAGE_BIN) and not os.path.exists(os.path.join(STAGE_BIN, "sdcc")):
+    if os.path.isdir(STAGE_BIN) and not bin_ok:
         shutil.rmtree(STAGE_BIN, ignore_errors=True)
     if not os.path.isdir(STAGE_BIN):
         shutil.copytree(SRC_BIN, STAGE_BIN)
-    if not os.path.isdir(STAGE_SHARE):
-        shutil.copytree(SRC_SHARE, STAGE_SHARE)
+    if not share_ok:
+        shutil.copytree(SRC_SHARE, STAGE_SHARE, dirs_exist_ok=True)
     for name in os.listdir(STAGE_BIN):
         path = os.path.join(STAGE_BIN, name)
         os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -1233,6 +1284,196 @@ def build_6502(req: CompileReq, generated_c: str | None,
         shutil.rmtree(work, ignore_errors=True)
 
 
+_Z80_MAP_SYMBOL = re.compile(r"^\s+([0-9A-Fa-f]{8})\s+(\S+)\s+\S+\s*$")
+
+
+def _parse_z80_map_symbols(text: str) -> dict:
+    """Final addresses out of sdldz80's .map.
+
+    The .sym next to it carries RELOCATABLE offsets (`_main = 000026 GR`),
+    which is a different number from the one a debugger needs. The .map's
+    per-area "Value / Global / Global Defined In Module" blocks carry the
+    linked addresses, so those are what is read here.
+    """
+    symbols = {}
+    for row in text.splitlines():
+        m = _Z80_MAP_SYMBOL.match(row)
+        if not m:
+            continue
+        name = m.group(2)
+        if name.startswith("."):
+            continue
+        symbols[name] = int(m.group(1), 16)
+    return symbols
+
+
+def _parse_sdcc_errors(text: str, src_basename: str) -> list[dict]:
+    """sdcc's own diagnostics: `main.c:12: error 20: message`.
+
+    Same shape as assemble.py's `_parse_sdas_errors` output ({line, message})
+    so a caller reads one error format across every chain. Linker complaints
+    (`?ASlink-Error-Undefined Global '_x'`) have no line and come back as 0,
+    which is exactly how the sdas path reports them.
+    """
+    errors = []
+    for m in re.finditer(r"^(.+?):(\d+):\s*(?:error|warning|syntax error)\b[^:]*:?\s*(.*)$",
+                         text, re.M | re.I):
+        if src_basename not in m.group(1):
+            continue
+        errors.append({"line": int(m.group(2)),
+                       "message": (m.group(3) or "").strip() or m.group(0).strip()})
+    for m in re.finditer(r"^\?ASlink-\w+-.+", text, re.M):
+        errors.append({"line": 0, "message": m.group(0).strip()})
+    return errors
+
+
+def build_z80(req: CompileReq, spec: dict, generated_c: str | None,
+              stem: str = "main") -> dict:
+    """Compile C for the Z80 bench with `sdcc -mz80` and return the ROM.
+
+    One toolchain call: sdcc drives sdcpp, its z80 backend, sdasz80 and
+    sdldz80 itself, so unlike the cc65 path there is nothing to sequence
+    here. What this function owns is the MEMORY MAP (see Z80_TARGETS) and
+    the response shape, which is the 6502 path's: base64 image, filename,
+    bytes, origin, log -- plus `hex`, because sdldz80's native output IS
+    Intel HEX and handing back a re-encoded copy of it would be silly.
+
+    `listing` and `stages` are gated behind `disassemble`, as on the 8051
+    path, and both come from the EXISTING z80 parsers (listing.from_sdcc_rst
+    over the .lst, stages.stages_z80 over the .lst + .sym) rather than a
+    second copy of them.
+    """
+    refusal = reject_path_options(req.options)
+    if refusal:
+        return refusal
+    if req.format not in ("ihx", "hex", "bin"):
+        return {"success": False, "error": "format must be ihx, hex or bin",
+                "c": generated_c}
+
+    stage_toolchain()
+    sdcc_dir = sdcc_bin_dir()
+    sdcc = os.path.join(sdcc_dir, "sdcc")
+    if not os.path.exists(sdcc) and not shutil.which("sdcc"):
+        return {"success": False, "stage": "compile",
+                "error": "no sdcc available for the z80 target",
+                "c": generated_c}
+
+    work = os.path.join(tempfile.gettempdir(), f"build-{uuid.uuid4().hex}")
+    os.makedirs(work, exist_ok=True)
+    src = os.path.join(work, "main.c")
+    with open(src, "w", encoding="utf-8") as handle:
+        handle.write(req.code)
+
+    cmd = [sdcc, "-mz80", "--std-c99",
+           "--code-loc", f"0x{spec['code_loc']:04x}",
+           "--data-loc", f"0x{spec['data_loc']:04x}"]
+    if req.fosc:
+        cmd.append(f"-DFOSC_HZ={int(req.fosc)}UL")
+    for name, value in req.defines.items():
+        if not name.replace("_", "").isalnum():
+            shutil.rmtree(work, ignore_errors=True)
+            return {"success": False, "error": f"bad define name: {name!r}"}
+        cmd.append(f"-D{name}" if value is None else f"-D{name}={value}")
+    for index, opt in enumerate(req.options):
+        opt = str(opt)
+        if opt.startswith("-"):
+            cmd.append(opt)
+            continue
+        if index == 0 or not VALUE_RE.fullmatch(opt):
+            shutil.rmtree(work, ignore_errors=True)
+            return {"success": False,
+                    "error": f"options must be flags, or plain values following "
+                             f"a flag; rejected {opt!r}"}
+        cmd.append(opt)
+    cmd += ["-o", os.path.join(work, "main.ihx"), src]
+
+    env = dict(os.environ, PATH=sdcc_dir + os.pathsep + os.environ.get("PATH", ""))
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=COMPILE_TIMEOUT, cwd=work, env=env)
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(work, ignore_errors=True)
+        return {"success": False,
+                "error": f"compile timed out after {COMPILE_TIMEOUT}s",
+                "c": generated_c}
+
+    log = ((result.stdout or "") + (result.stderr or "")).replace(work + os.sep, "")
+    ihx = os.path.join(work, "main.ihx")
+    try:
+        if result.returncode != 0 or not os.path.exists(ihx):
+            return {"success": False, "stage": "compile",
+                    "errors": _parse_sdcc_errors(log, "main.c") or
+                              [{"line": 0, "message": log.strip()
+                                or "sdcc -mz80 failed"}],
+                    "error": log.strip() or "sdcc -mz80 failed",
+                    "log": log, "c": generated_c}
+
+        with open(ihx, encoding="utf-8") as handle:
+            hex_text = handle.read()
+
+        if req.format == "ihx":
+            blob, name = hex_text.encode(), f"{stem}.ihx"
+        elif req.format == "hex":
+            packed = subprocess.run([os.path.join(sdcc_dir, "packihx"), ihx],
+                                    capture_output=True, text=True, timeout=10)
+            hex_text = packed.stdout or hex_text
+            blob, name = hex_text.encode(), f"{stem}.hex"
+        else:
+            # makebin -s 32768: the bench's ROM is a 32 KB part and the
+            # burner wants the whole window, exactly as assemble_z80 does it.
+            made = subprocess.run(
+                [os.path.join(sdcc_dir, "makebin"), "-s", str(spec["rom"]), ihx],
+                capture_output=True, timeout=10)
+            blob, name = made.stdout, f"{stem}.bin"
+
+        symbols = None
+        map_path = os.path.join(work, "main.map")
+        if req.symbols and os.path.exists(map_path):
+            with open(map_path, encoding="utf-8", errors="replace") as handle:
+                symbols = _parse_z80_map_symbols(handle.read())
+
+        listing_artifact = None
+        stages_payload = None
+        lst_path = os.path.join(work, "main.lst")
+        if req.disassemble:
+            import listing as listing_mod
+            import stages as stages_mod
+            listing_artifact = listing_mod.from_sdcc_rst(lst_path)
+            lst_text = sym_text = ""
+            if os.path.exists(lst_path):
+                with open(lst_path, encoding="utf-8", errors="replace") as handle:
+                    lst_text = handle.read()
+            sym_path = os.path.join(work, "main.sym")
+            if os.path.exists(sym_path):
+                with open(sym_path, encoding="utf-8", errors="replace") as handle:
+                    sym_text = handle.read()
+            asm_path = os.path.join(work, "main.asm")
+            asm_text = ""
+            if os.path.exists(asm_path):
+                with open(asm_path, encoding="utf-8", errors="replace") as handle:
+                    asm_text = handle.read()
+            stages_payload = stages_mod.stages_z80(asm_text, lst_text, sym_text)
+
+        return {
+            "success": True,
+            "c": generated_c,
+            "hex": hex_text if req.format != "bin" else None,
+            "base64": base64.b64encode(blob).decode("ascii"),
+            "filename": name,
+            "bytes": len(blob),
+            "origin": 0x0000,
+            "errors": _parse_sdcc_errors(log, "main.c"),
+            "listing": listing_artifact,
+            "symbols": symbols,
+            "log": log,
+            "toolchain": "sdcc-z80",
+            "mcu": spec["mcu"],
+            **({"stages": stages_payload} if stages_payload else {}),
+        }
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def _fosc_from_source(code: str) -> int | None:
     """The clock, read back out of the source.
 
@@ -1351,10 +1592,18 @@ def build(req: CompileReq) -> dict:
                              "compiled for the 6502"}
         return build_6502(req, generated_c, stem)
 
+    z80 = Z80_TARGETS.get(req.target.lower())
+    if z80 is not None:
+        if keil_changes:
+            return {"success": False,
+                    "error": "the Keil C51 dialect is 8051-only; it cannot be "
+                             "compiled for the Z80"}
+        return build_z80(req, z80, generated_c, stem)
+
     target = TARGETS.get(req.target.lower())
     if target is None:
         known = sorted(list(TARGETS) + list(AVR_TARGETS) + list(ARM_TARGETS)
-                       + list(EATER_TARGETS))
+                       + list(EATER_TARGETS) + list(Z80_TARGETS))
         return {"success": False,
                 "error": f"unknown target '{req.target}'; known: {', '.join(known)}"}
 
@@ -2334,6 +2583,14 @@ async def health():
                             if avr_bin and os.path.isdir(SRC_ARDUINO_CORE) else {}),
         "arm_targets": ({name: cfg["description"] for name, cfg in ARM_TARGETS.items()}
                         if arm_bin else {}),
+        # The two retro chains. eater6502 needs the cc65 bundle; the Z80 rides
+        # the SAME sdcc the 8051 does, so it is reported whenever sdcc is --
+        # there is no separate bundle that can be missing, only
+        # share/sdcc/lib/z80, whose absence would fail the link loudly.
+        "eater_targets": ({name: cfg["description"]
+                           for name, cfg in EATER_TARGETS.items()}
+                          if cc65_bin else {}),
+        "z80_targets": {name: cfg["description"] for name, cfg in Z80_TARGETS.items()},
         "devices": sorted(stc_pseudocode.TARGETS),
         "assemble_targets": sorted(ASSEMBLE_TARGETS.keys()),
     }

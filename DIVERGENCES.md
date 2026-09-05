@@ -241,3 +241,36 @@ test_lists.py (27 tests) pins the grammar, the round trip, the selective
 helper emission, and the semantics — the last by compiling the emitted
 helpers for the host and running them, because one-based indexing and an
 inert out-of-range write are silent when wrong.
+
+## Z80 — the toolchain closed, the generator still one-sided (2026-09-05)
+
+`DEVICE Z80` is a device sb3-creator emits for and this oracle does not.
+sb3-creator's `generateC()` has a `_core === 'z80'` path that lowers pins onto
+the bench's silicon — a 74HC374 write latch and a 74HC244 read buffer sharing
+I/O port 0 — as `__sfr __at 0x00` declarations, a shadow byte (the latch is
+write-only; reading the port reads the BUFFER, so the last value written has
+to be remembered in RAM), and a busy-loop `delay_ms` because the machine has
+no timer. This side has no Z80 emitter at all.
+
+**What closed here** is the other half: `/compile` now builds that C.
+`target: "z80"` (alias `z80-bench`) runs `sdcc -mz80` out of the same vendored
+SDCC bundle the 8051 uses, with the bench's real memory map —
+`--code-loc 0x0200 --data-loc 0x8000`, from `MAP ROM $0000-$7FFF` /
+`MAP RAM $8000-$FFFF`, which is what bw-board's `extractZ80Machine` reads off
+the bench wiring (brickwright-lite `examples/z80-pd-bench/EXPECTED.md` and its
+`check-extract.mjs`). SDCC's stock z80 crt0 is used unmodified: it already
+puts `jp init` at the Z80's reset vector, sets SP so the first push lands at
+the top of the bench's RAM, and calls `_main`.
+
+So the product path is whole — blocks → sb3-creator's C → this service →
+image — and the divergence is confined to this repo's own front end, where
+`DEVICE Z80` refuses at the DEVICE line and names the lane that works.
+Closing it means writing a Z80 generator here to mirror sb3-creator's, and
+the mirror's contract is already pinned by `test_z80_build.py`, whose source
+fixture IS that generator's output.
+
+`test_z80_build.py` (19 tests) holds the toolchain half: the reset vector at
+`$0000` is a `JP` whose target calls `_main`, the shadow-byte store lands in
+bench RAM at `$8000`, `BW_PORT_OUT = x` becomes `out (0),a` in both the
+listing and the image bytes, and the link uses the VENDORED crt0 rather than
+whatever `/usr/share/sdcc` a developer happens to have.

@@ -110,6 +110,15 @@ EXPECTED = {
     "eater6502": Case("PA0", 1000000, NO_GENERATOR,
                       says=("no pseudocode generator", "eater6502")),
 
+    # ---- Z80 ----
+    # Same shape as the 6502 and for the same reason: the C lane is real
+    # (sdcc -mz80 through /compile, target="z80" -- see build_z80 and
+    # test_z80_build.py), the pseudocode GENERATOR is not. sb3-creator has
+    # one; this reference implementation does not, and borrowing the 8051's
+    # would emit SFR writes for a machine whose pins are an I/O-port latch.
+    "z80": Case("OUT0", 7372800, NO_GENERATOR,
+                says=("no pseudocode generator", "z80")),
+
     # ---- a game engine, not a chip ----
     "arcade": Case(None, None, TRANSPILE_ONLY, toolchain="pxt", source=(
         "DEVICE ARCADE\n\n"

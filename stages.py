@@ -204,6 +204,13 @@ def parse_sdas_listing(listing_text: str) -> list[dict]:
 #                               the source defines with `=`
 #   3 start      000100 R       an area-relative label: area index, name,
 #                               offset, R for relocatable
+#   0 _main      000026 GR      BOTH: exported (G) and area-relative (R)
+#
+# The flags are a SET, not one letter. Reading only one letter dropped every
+# `GR` symbol on the floor -- which is to say every exported function, the
+# ones a debugger actually wants, while keeping the file-static helpers next
+# to them. Measured 2026-09-05 on `sdcc -mz80` output, where `_main` was
+# missing from the stages payload and `_delay_ms` was present.
 #
 # Six hex digits (the header says "Hexadecimal [24-Bits]"), and up to three
 # of these packed per line separated by `|`.
@@ -212,7 +219,7 @@ _SDAS_SYMBOL = re.compile(
     r"([A-Za-z_.$][\w.$]*)\s*"     # name
     r"(=)?\s+"                     # `=` marks an equate
     r"([0-9A-Fa-f]{4,8})\s+"       # value
-    r"([A-Za-z])\s*$"              # L local / G global / R relocatable
+    r"([A-Za-z]{1,2})\s*$"         # flags: G global, L local, R relocatable
 )
 
 
@@ -252,7 +259,11 @@ def parse_sdas_symbols(sym_text: str) -> dict:
                 # after the linker has placed its area, and the offset here is
                 # within that area.
                 "kind": "equate" if equate else "label",
-                "scope": {"G": "global", "L": "local"}.get(scope, "relocatable"),
+                # G wins over R when both are set: "global" is the fact a
+                # caller acts on, and `area` below already says relocatable.
+                "scope": ("global" if "G" in scope
+                          else "local" if "L" in scope
+                          else "relocatable"),
             }
             if area is not None:
                 symbols[name]["area"] = int(area)

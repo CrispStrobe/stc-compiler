@@ -40,7 +40,7 @@ reason to entangle the two.
 Three lanes, which is worth holding in mind because the endpoints follow it:
 
 ```
-                     ┌─ emit_c ────────▶ C ──▶ sdcc / avr-gcc / arm-gcc / cc65 ──▶ image
+                     ┌─ emit_c ────────▶ C ──▶ sdcc (mcs51|z80) / avr-gcc / arm-gcc / cc65 ──▶ image
 pseudocode ─parse─▶ AST ─ emit (MicroPython) ─▶ .py   (interpreted on the device)
                      ├─ emit (Arduino C++) ──▶ .ino  (built by the IDE)
                      ├─ emit (TypeScript) ───▶ .ts   (built by PXT / MakeCode)
@@ -283,6 +283,7 @@ end** knows, which the service can **compile**, and which a browser can
 | `rp2040` | arm-none-eabi-gcc | Cortex-M0+, SRAM image (`pico-sram.ld`) |
 | `stm32f030` | arm-none-eabi-gcc | Cortex-M0, real flash image at `0x08000000` (`stm32f030-flash.ld`) |
 | `eater6502` | cc65 | 65C02, 32 KB ROM at `$8000` (`eater.cfg`) |
+| `z80` (`z80-bench`) | sdcc `-mz80` | Z80 bench, ROM `$0000-$7FFF`, RAM `$8000-$FFFF` (`--code-loc 0x0200 --data-loc 0x8000`) |
 
 The 8051 targets compile `-mmcs51 --std-c99`; adding a part is three lines in
 `TARGETS` in [`app.py`](app.py). **For a pseudocode program the `DEVICE` line
@@ -301,7 +302,7 @@ what makes it bootable and what `scripts/test-api.py` asserts about it.
 
 ### Known to the pseudocode front end
 
-Nineteen `DEVICE` names across six architectures:
+Twenty `DEVICE` names across seven architectures:
 
 | family | `DEVICE` | emits | built here |
 |---|---|---|---|
@@ -312,6 +313,7 @@ Nineteen `DEVICE` names across six architectures:
 | MicroPython | `microbit` (`micro-bit`) | `.py` | nothing to compile |
 | MicroPython | `pico` (`rp2040`) | `.py` | nothing to compile |
 | 6502 | `eater6502` | — | no pseudocode generator — see *Known gaps* |
+| Z80 | `z80` | — | no pseudocode generator — see *Known gaps* |
 | game engine | `arcade` | TypeScript `.ts` | no — needs PXT |
 
 `DEVICE` may be written with or without a trailing colon; `sb3-creator` writes
@@ -333,6 +335,17 @@ and emits something is easy to mistake for a device that works:
   (`$6000` PORTB, `$6001` PORTA, `$6002`/`$6003` the DDRs), and the open
   question is the millisecond tick — VIA Timer 1 in free-run mode wants an IRQ
   handler, and `crt0.s` currently points IRQ at a bare `RTI`.
+- **`z80` has no pseudocode generator either**, and for the same reason. The
+  DEVICE name is real and both Z80 lanes work — hand-written C through
+  `sdcc -mz80` and assembly through `sdasz80`, via `target: "z80"` on
+  `/compile` or `/assemble`. What is missing here is an emitter. Note the
+  asymmetry with the 6502: **`sb3-creator` HAS a Z80 emitter** (its
+  `_core === 'z80'` path: an OUT latch and IN buffer on I/O port 0, a shadow
+  byte for the write-only latch, a busy-loop `delay_ms` because the bench has
+  no timer), and `build_z80` was proven against that generator's output — so
+  a browser client gets the whole pseudocode→image path today. It is this
+  reference implementation that lags, which is a `DIVERGENCES.md` entry
+  rather than a hole in the product.
 - **`print` is refused on the ATtinys**, which is correct: neither the ATtiny85
   nor the ATtiny88 has a USART.
 - **`LIST` is not lowered on micro:bit, Pico or Arcade yet.** MicroPython and
