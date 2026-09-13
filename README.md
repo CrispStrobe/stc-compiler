@@ -48,12 +48,13 @@ When adopting a change downstream, update the applicable receipt or pin and run
 the consumer gate; do not substitute the latest branch name for either kind of
 evidence.
 
-One current exception is explicit rather than hidden: Brickwright Lite's
-`flasher.js` says it was vendored from this repository, but its downstream copy
-also contains Lite-only nRF52833/DAPLink code and has no recorded
-`stc-compiler-flasher` pin. It is not an exact vendored copy today. Until that
-code is upstreamed here or declared as a downstream divergence, neither tree
-should claim byte identity for it.
+Brickwright Lite's `flasher.js` is now an exact, path-scoped generated copy of
+this repository's `docs/flash.js`, pinned to the full source commit as
+`stc-compiler-flasher`. Its sync and CI gates require that commit's checkout,
+canonical origin, source body and both shipped mirrors to agree before writes
+or release. The scope matters: other stc-compiler consumers may legitimately
+name different source, deployed-service or generated-artifact revisions under
+the authority split above.
 
 It is a separate deployment from `legacy-lego-compiler` on purpose. SDCC is
 GPL-2.0-or-later; that repository's story is MIT plus MPL/BSD, and there is no
