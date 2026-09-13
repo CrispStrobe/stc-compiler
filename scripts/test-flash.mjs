@@ -14,7 +14,8 @@
 //   node scripts/test-flash.mjs
 //
 import { parseIntelHex, Stk500, flashAvr, flashMicroPython, flashStc, stcPacket,
-         stcBaud, stcStatus, pythonBytes, STK, flashStm32, flashEeprom, flashAvrMega, flashUsbasp, flashSwdStm32 } from '../docs/flash.js';
+         stcBaud, stcStatus, pythonBytes, STK, flashStm32, flashEeprom, flashAvrMega, flashUsbasp, flashSwdStm32,
+         flashDaplinkMicrobit } from '../docs/flash.js';
 
 let passed = 0, failed = 0;
 const ok = (name, cond, detail = '') => {
@@ -845,6 +846,120 @@ function mockDapStm32() {
   let same = true;
   for (let i = 0; i < image.length; i++) if (dev.flash[i] !== image[i]) { same = false; break; }
   ok('SWD: MEM-AP + FPEC wrote the image byte-for-byte', same);
+}
+
+// --- micro:bit V2 over SWD (CMSIS-DAP/DAPLink) -----------------------------
+// Exercise the public flasher through a fake USB boundary. The fake decodes
+// real CMSIS-DAP transfers, so these observations come from CmsisDap+SwdMem,
+// not from a test double substituted for either production class.
+const NRF_TEST = {
+  DHCSR: 0xe000edf0, HALT: 0xa05f0003,
+  AIRCR: 0xe000ed0c, RESET: 0x05fa0004,
+  READY: 0x4001e400, CONFIG: 0x4001e504, ERASEPAGE: 0x4001e508,
+  FICR_PART: 0x10000100, PART: 0x52833, CODE_END: 0x80000,
+};
+
+function mockDapNrf(part = NRF_TEST.PART) {
+  const events = [];
+  let tar = 0;
+  let lastReply = [];
+  const memRead = addr => {
+    events.push({ kind: 'read', addr });
+    if (addr === NRF_TEST.READY) return 1;
+    if (addr === NRF_TEST.FICR_PART) return part;
+    return 0;
+  };
+  const memWrite = (addr, value) => events.push({ kind: 'write', addr, value: value >>> 0 });
+  const dapTransfer = (req, value) => {
+    const read = req & 2, ap = req & 1, address = req & 0x0c;
+    if (!ap) {
+      if (read && address === 0x00) return 0x0bb11477;
+      if (read && address === 0x04) return 0xf0000000;
+      return 0;
+    }
+    if (address === 0x04) { if (!read) tar = value >>> 0; return tar; }
+    if (address === 0x0c) { if (read) return memRead(tar); memWrite(tar, value); }
+    return 0;
+  };
+  const dapCommand = bytes => {
+    const command = bytes[0];
+    if (command === 0x03) events.push({ kind: 'dap-disconnect' });
+    if (command !== 0x05) return [command, 0x00];
+    const request = bytes[3], write = !(request & 2);
+    const value = write
+      ? (bytes[4] | (bytes[5] << 8) | (bytes[6] << 16) | (bytes[7] << 24)) >>> 0
+      : 0;
+    const result = dapTransfer(request, value) >>> 0;
+    const reply = [0x05, 1, 0x01];
+    if (!write) reply.push(result & 0xff, (result >> 8) & 0xff, (result >> 16) & 0xff, (result >>> 24) & 0xff);
+    return reply;
+  };
+  return {
+    events,
+    configuration: { interfaces: [{ interfaceNumber: 0, alternate: { endpoints: [
+      { direction: 'out', type: 'bulk', endpointNumber: 1 },
+      { direction: 'in', type: 'bulk', endpointNumber: 1 },
+    ] } }] },
+    async open() { events.push({ kind: 'open' }); },
+    async close() { events.push({ kind: 'close' }); },
+    async selectConfiguration() { events.push({ kind: 'select' }); },
+    async claimInterface() { events.push({ kind: 'claim' }); },
+    async transferOut(ep, data) { lastReply = dapCommand(Array.from(data)); return { status: 'ok' }; },
+    async transferIn() { const b = new Uint8Array(64); b.set(lastReply); return { data: { buffer: b.buffer } }; },
+  };
+}
+
+const eventIndex = (events, kind, addr, value) => events.findIndex(event =>
+  event.kind === kind && (addr === undefined || event.addr === addr)
+    && (value === undefined || event.value === value));
+
+{
+  const dev = mockDapNrf();
+  const hex = [record(0, 0, [0x11, 0x22, 0x33, 0x44]),
+    record(0x1000, 0, [0xaa, 0xbb, 0xcc, 0xdd]), ':00000001FF'].join('\n');
+  let result = null, error = null;
+  try { result = await flashDaplinkMicrobit(dev, hex, { log: () => {} }); } catch (e) { error = e; }
+  ok('DAPLink nRF52833: valid target completes through the real USB/DAP/SWD stack',
+    !error && result?.part === NRF_TEST.PART, error?.message || '');
+
+  const halt = eventIndex(dev.events, 'write', NRF_TEST.DHCSR, NRF_TEST.HALT);
+  const partCheck = eventIndex(dev.events, 'read', NRF_TEST.FICR_PART);
+  const eraseMode = eventIndex(dev.events, 'write', NRF_TEST.CONFIG, 2);
+  const erase0 = eventIndex(dev.events, 'write', NRF_TEST.ERASEPAGE, 0);
+  const erase1 = eventIndex(dev.events, 'write', NRF_TEST.ERASEPAGE, 0x1000);
+  const writeMode = eventIndex(dev.events, 'write', NRF_TEST.CONFIG, 1);
+  const word0 = eventIndex(dev.events, 'write', 0, 0x44332211);
+  const word1 = eventIndex(dev.events, 'write', 0x1000, 0xddccbbaa);
+  const readMode = eventIndex(dev.events, 'write', NRF_TEST.CONFIG, 0);
+  const reset = eventIndex(dev.events, 'write', NRF_TEST.AIRCR, NRF_TEST.RESET);
+  const disconnect = eventIndex(dev.events, 'dap-disconnect');
+  const close = eventIndex(dev.events, 'close');
+  ok('DAPLink nRF52833: halt, part-check, erase, program, read-mode, reset, cleanup are ordered',
+    [halt, partCheck, eraseMode, erase0, erase1, writeMode, word0, word1, readMode, reset, disconnect, close]
+      .every((index, i, all) => index >= 0 && (i === 0 || index > all[i - 1])));
+  const erasedPages = dev.events
+    .filter(event => event.kind === 'write' && event.addr === NRF_TEST.ERASEPAGE)
+    .map(event => event.value);
+  ok('DAPLink nRF52833: both touched 4 KiB pages are erased exactly once',
+    JSON.stringify(erasedPages) === JSON.stringify([0, 0x1000]), JSON.stringify(erasedPages));
+}
+
+{
+  const dev = mockDapNrf(0x52840);
+  const hex = [record(0, 0, [0x11, 0x22, 0x33, 0x44]), ':00000001FF'].join('\n');
+  let error = null;
+  try { await flashDaplinkMicrobit(dev, hex, { log: () => {} }); } catch (e) { error = e; }
+  ok('DAPLink nRF52833: wrong part is refused by name',
+    error && /not an nRF52833/.test(error.message), error?.message || '');
+  const destructive = dev.events.filter(event => event.kind === 'write'
+    && (event.addr === NRF_TEST.CONFIG || event.addr === NRF_TEST.ERASEPAGE
+      || (event.addr >= 0 && event.addr < NRF_TEST.CODE_END)));
+  ok('DAPLink nRF52833: wrong-part refusal precedes every destructive NVMC/flash write',
+    destructive.length === 0, JSON.stringify(destructive));
+  const disconnect = eventIndex(dev.events, 'dap-disconnect');
+  const close = eventIndex(dev.events, 'close');
+  ok('DAPLink nRF52833: wrong-part refusal still disconnects DAP before closing USB',
+    disconnect >= 0 && close > disconnect);
 }
 
 

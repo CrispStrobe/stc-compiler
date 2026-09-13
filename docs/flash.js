@@ -1185,3 +1185,93 @@ export async function flashSwdStm32(device, image, { base = 0x08000000, log = ()
     try { await device.close(); } catch { /* ditto */ }
   }
 }
+
+// nRF52833 NVMC (Non-Volatile Memory Controller) + FICR, from the nRF52833
+// Product Specification v1.x §4.4 (NVMC) and §4.8 (FICR). No vendor library —
+// the same clean-room, CMSIS-DAP-only path flashSwdStm32 takes for the STM32.
+//
+//   NVMC base 0x4001E000:
+//     READY     0x4001E400  bit0 = 1 when the last write/erase finished
+//     CONFIG    0x4001E504  WEN: 0 = Ren (read only), 1 = Wen (write), 2 = Een (erase)
+//     ERASEPAGE 0x4001E508  write a page's base address to erase that 4 KiB page
+//   FICR.INFO.PART 0x10000100 reads 0x00052833 on the nRF52833 (the micro:bit V2).
+const NRF = {
+  NVMC_READY: 0x4001e400, NVMC_CONFIG: 0x4001e504, NVMC_ERASEPAGE: 0x4001e508,
+  WEN_REN: 0, WEN_WEN: 1, WEN_EEN: 2,
+  PAGE_SIZE: 0x1000,      // 4 KiB, FICR.CODEPAGESIZE
+  CODE_END: 0x80000,      // 512 KiB code flash
+  FICR_PART: 0x10000100, PART_NRF52833: 0x52833,
+};
+
+/**
+ * Flash a micro:bit V2 (nRF52833 target, DAPLink interface) over WebUSB via
+ * CMSIS-DAP + SWD, writing the .hex straight to the nRF52833's NVMC. Reuses
+ * CmsisDap + SwdMem verbatim; only the flash-controller registers differ from
+ * flashSwdStm32. Refuses by name if the attached target is not an nRF52833.
+ *
+ * @param {USBDevice} device an opened-or-openable CMSIS-DAP WebUSB device
+ * @param {string} hex the micro:bit .hex (Intel HEX text)
+ * @returns {Promise<{bytes: number, part: number}>}
+ */
+export async function flashDaplinkMicrobit(device, hex, { log = () => {} } = {}) {
+  const { image, lowest, highest } = parseIntelHex(hex);
+  await device.open();
+  if (device.configuration === null) await device.selectConfiguration(1);
+  const iface = device.configuration.interfaces.find(i =>
+    i.alternate.endpoints.some(e => e.type === 'bulk')) || device.configuration.interfaces[0];
+  await device.claimInterface(iface.interfaceNumber);
+  const eps = iface.alternate.endpoints;
+  const epOut = (eps.find(e => e.direction === 'out') || { endpointNumber: 1 }).endpointNumber;
+  const epIn = (eps.find(e => e.direction === 'in') || { endpointNumber: 1 }).endpointNumber;
+
+  const dap = new CmsisDap(device, { epOut, epIn, log });
+  const mem = new SwdMem(dap);
+  const waitReady = async () => {
+    for (let i = 0; i < 100000; i++) { if ((await mem.read32(NRF.NVMC_READY)) & 1) return; }
+    throw new Error('NVMC never signalled READY (erase/program timed out)');
+  };
+  try {
+    await dap.connect();
+    await dap.transfer(0x00 | DAP.RnW);                 // DP IDCODE
+    await mem.init();
+    await mem.write32(F0.DHCSR, F0.DBGKEY | F0.C_DEBUGEN | F0.C_HALT);   // halt the core
+
+    // Refuse anything that is not an nRF52833 BY NAME: writing NVMC on the
+    // wrong part could brick it, and this flashes the micro:bit V2 only.
+    const part = (await mem.read32(NRF.FICR_PART)) >>> 0;
+    if ((part & 0xffffff) !== NRF.PART_NRF52833) {
+      throw new Error(`the attached target is not an nRF52833 (FICR.INFO.PART=0x${part.toString(16)}); `
+        + 'this flashes the micro:bit V2 only');
+    }
+    log(`nRF52833 confirmed (PART 0x${part.toString(16)})`);
+
+    const end = Math.min(highest + 1, NRF.CODE_END);    // UICR (0x10001xxx) is out of scope
+    const first = Math.max(lowest, 0);
+    if (first >= end) throw new Error('the .hex has no code-flash data to write');
+
+    // Erase every 4 KiB page the image touches (NVMC Een).
+    await mem.write32(NRF.NVMC_CONFIG, NRF.WEN_EEN);
+    for (let page = first & ~(NRF.PAGE_SIZE - 1); page < end; page += NRF.PAGE_SIZE) {
+      await mem.write32(NRF.NVMC_ERASEPAGE, page);
+      await waitReady();
+    }
+    log('erased');
+
+    // Program 32-bit words (NVMC Wen). A byte past `highest` reads as erased 0xFF.
+    await mem.write32(NRF.NVMC_CONFIG, NRF.WEN_WEN);
+    const b = a => (a <= highest ? image[a] : 0xff);
+    for (let a = first & ~3; a < end; a += 4) {
+      await mem.write32(a, (b(a) | (b(a + 1) << 8) | (b(a + 2) << 16) | (b(a + 3) << 24)) >>> 0);
+      if ((a & 0xfff) === 0) { await waitReady(); log(`  ${a - first}/${end - first} bytes`); }
+    }
+    await waitReady();
+    await mem.write32(NRF.NVMC_CONFIG, NRF.WEN_REN);
+    log(`programmed ${end - (first & ~3)} bytes`);
+
+    await mem.write32(F0.AIRCR, F0.AIRCR_KEY | F0.SYSRESETREQ);   // reset into the new program
+    return { bytes: end - (first & ~3), part };
+  } finally {
+    await dap.disconnect();
+    try { await device.close(); } catch { /* ditto */ }
+  }
+}
