@@ -29,6 +29,32 @@ The compile side of the STC12 work in
 and the BrickWright block-to-silicon back end: the browser generates source,
 POSTs it here, gets back an image, and flashes it over Web Serial or WebUSB.
 
+### Which version is authoritative?
+
+It depends on what a consumer uses. A source-level oracle, local script or
+copied source module is reproducible only when it names the **full Git commit
+SHA** it read and checks the resulting bytes or behaviour. The public service
+is different: production is deployed deliberately rather than on every push,
+so `main` may be newer than the code serving
+`https://stc-compiler.vercel.app`. For a live compile, the authority is the
+deployed revision and toolchain versions returned by `GET /health`, together
+with the API behaviour the consumer actually exercised. A push to `main` is
+not evidence that production changed.
+
+A generated firmware receipt therefore records both sides: the deployed
+revision and toolchain identity, plus hashes of the input and output. A sibling
+test that reads this repository directly instead records the exact source SHA.
+When adopting a change downstream, update the applicable receipt or pin and run
+the consumer gate; do not substitute the latest branch name for either kind of
+evidence.
+
+One current exception is explicit rather than hidden: Brickwright Lite's
+`flasher.js` says it was vendored from this repository, but its downstream copy
+also contains Lite-only nRF52833/DAPLink code and has no recorded
+`stc-compiler-flasher` pin. It is not an exact vendored copy today. Until that
+code is upstreamed here or declared as a downstream divergence, neither tree
+should claim byte identity for it.
+
 It is a separate deployment from `legacy-lego-compiler` on purpose. SDCC is
 GPL-2.0-or-later; that repository's story is MIT plus MPL/BSD, and there is no
 reason to entangle the two.
@@ -223,9 +249,12 @@ carries one linked, flashable image.
 
 ### `GET /health`
 
-Reports every toolchain's version (SDCC, avr-gcc, arm-none-eabi-gcc, ca65),
-every compile target, every assemble target, and every pseudocode device. Also
-the cheapest way to see whether a cold start staged the toolchains correctly.
+Reports the deployed Git revision as `version`, every toolchain's version
+(SDCC, avr-gcc, arm-none-eabi-gcc, ca65), every compile target, every assemble
+target, and every pseudocode device. It is the identity receipt for the live
+service as well as the cheapest way to see whether a cold start staged the
+toolchains correctly. The revision is the deployment's commit, which may lag
+`main` because deployments are manual.
 
 ### `GET /` · `GET /docs`
 
