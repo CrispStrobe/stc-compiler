@@ -398,6 +398,17 @@ and emits something is easy to mistake for a device that works:
   (`$6000` PORTB, `$6001` PORTA, `$6002`/`$6003` the DDRs), and the open
   question is the millisecond tick — VIA Timer 1 in free-run mode wants an IRQ
   handler, and `crt0.s` currently points IRQ at a bare `RTI`.
+- **The Arduino route compiles as C, not C++ (yet).** `language: "arduino"`
+  runs `avr-gcc` over the sketch — enough for the `setup`/`loop`/GPIO subset
+  (`digitalWrite`, `millis`, `delay`) — but real Arduino C++ (objects like
+  `Serial`, `String`, classes, templates, C++ libraries) is not compiled,
+  because `cc1plus` was trimmed from the avr bundle to save size. This is the
+  **natural home for C++ in this service**, and it is well-scoped: `cc1plus` is
+  in the Debian avr-gcc `.deb` (`fetch-avr-gcc.sh` just drops it), ATTinyCore is
+  already C++ source, and — unlike a hosted RISC-V C++ (no target `libstdc++`
+  for rv32, a console-only machine) — no STL is *expected* on AVR, so nothing
+  misleads. Scope: re-add `cc1plus` to the avr bundle, compile the sketch with
+  `avr-g++` linking the ATTinyCore C++ core, keep the size + GLIBC gates green.
 - **`print` is refused on the ATtinys**, which is correct: neither the ATtiny85
   nor the ATtiny88 has a USART.
 - **`LIST` is not lowered on micro:bit, Pico or Arcade yet.** MicroPython and
