@@ -269,10 +269,23 @@ EATER_TARGETS = {
 # (a7=64 write, a7=93 exit) is what that machine services.
 RISCV_TARGETS = {
     "riscv32": {
-        "mcu": "rv32im",
-        "description": "RISC-V RV32IM — emulated console (bw-board RiscV32Machine)",
+        "mcu": "rv32im", "toolchain": "shecc",
+        "description": "RISC-V RV32IM — shecc (wasm), a C subset; emulated console",
+    },
+    # The full-C companion: a native gcc + picolibc bundle (riscv-gcc/, like the
+    # arm/ and avr/ bundles), for arbitrary C — floats, malloc, qsort, math.h,
+    # string.h — that shecc's subset cannot compile. Same {entry, segments}
+    # image, same emulated RV32IM console; the difference is the compiler.
+    "riscv32-gcc": {
+        "mcu": "rv32imac", "toolchain": "riscv64-unknown-elf-gcc",
+        "description": "RISC-V RV32IMAC — full C via native gcc + picolibc; emulated console",
     },
 }
+
+# The full-C RISC-V bundle: native gcc + picolibc, staged like the ARM bundle.
+SRC_RISCV_GCC = os.path.join(BASE_DIR, "riscv-gcc")
+RISCV_GCC_STAGE = "/tmp/riscv-gcc"
+RISCV_GCC_STAGE_BIN = os.path.join(RISCV_GCC_STAGE, "bin")
 
 # ---- cc65 toolchain (6502 assembler/linker) ---------------------------------
 SRC_CC65 = os.path.join(BASE_DIR, "cc65")
@@ -420,6 +433,42 @@ def stage_arm() -> str | None:
             return ARM_STAGE_BIN
 
     found = shutil.which("arm-none-eabi-gcc")
+    return os.path.dirname(found) if found else None
+
+
+def stage_riscv_gcc() -> str | None:
+    """Directory holding riscv64-unknown-elf-gcc, or None if unavailable.
+
+    Same cold-start staging as stage_arm: the riscv-gcc/ bundle ships in git,
+    is copied into /tmp on Vercel (read-only deployment dir, executable bit
+    stripped), and falls back to a system riscv64-unknown-elf-gcc for local
+    dev. The bundle's gcc driver resolves its own cc1 / as / ld relative to
+    argv[0] (its configured absolute /usr/lib paths are absent on Vercel), so
+    no PATH surgery is needed — exactly like the ARM bundle.
+    """
+    if sys.platform.startswith("linux") and os.path.isdir(SRC_RISCV_GCC):
+        if not os.path.exists(os.path.join(RISCV_GCC_STAGE_BIN, "riscv64-unknown-elf-gcc")):
+            os.makedirs(RISCV_GCC_STAGE, exist_ok=True)
+            for part in os.listdir(SRC_RISCV_GCC):
+                source = os.path.join(SRC_RISCV_GCC, part)
+                destination = os.path.join(RISCV_GCC_STAGE, part)
+                if os.path.islink(source):
+                    if not os.path.exists(destination):
+                        os.symlink(os.readlink(source), destination)
+                elif os.path.isdir(source) and not os.path.isdir(destination):
+                    shutil.copytree(source, destination, symlinks=True)
+                elif os.path.isfile(source) and not os.path.exists(destination):
+                    shutil.copy2(source, destination)
+            for sub in ("bin",
+                        os.path.join("lib", "riscv64-unknown-elf", "bin"),
+                        os.path.join("lib", "gcc")):
+                for root, _dirs, _files in os.walk(os.path.join(RISCV_GCC_STAGE, sub)):
+                    _make_executable(root)
+        staged = os.path.join(RISCV_GCC_STAGE_BIN, "riscv64-unknown-elf-gcc")
+        if os.path.exists(staged) and _can_execute(staged):
+            return RISCV_GCC_STAGE_BIN
+
+    found = shutil.which("riscv64-unknown-elf-gcc")
     return os.path.dirname(found) if found else None
 
 
@@ -1334,6 +1383,94 @@ def build_riscv(req: CompileReq, spec: dict, generated_c: str | None,
     }
 
 
+def build_riscv_gcc(req: CompileReq, spec: dict, generated_c: str | None,
+                    stem: str = "main") -> dict:
+    """Compile ARBITRARY C for RV32 with the native gcc + picolibc bundle.
+
+    The full-C companion to build_riscv (shecc's subset): floats, malloc,
+    qsort, math.h, string.h. Same {entry, segments} image an emulated RV32IM
+    machine boots — the difference is the compiler. Freestanding: the tiny
+    startup + picolibc console live in riscv-gcc/runtime/ over the machine's
+    ECALL ABI, so there is no hosted libc syscall layer and no execution here.
+    """
+    refusal = reject_path_options(req.options)
+    if refusal:
+        return refusal
+
+    bin_dir = stage_riscv_gcc()
+    if bin_dir is None:
+        return {"success": False, "stage": "compile",
+                "error": "no RISC-V gcc toolchain available; the riscv-gcc/ bundle "
+                         "is not vendored in this deployment and no "
+                         "riscv64-unknown-elf-gcc is on PATH",
+                "c": generated_c}
+
+    root = os.path.dirname(bin_dir)
+    runtime = os.path.join(root, "runtime")
+    picoinc = os.path.join(root, "picolibc", "include")
+    picolib = os.path.join(root, "picolibc", "lib")
+    deps = os.path.join(root, "lib-deps")
+    env = dict(os.environ)
+    if os.path.isdir(deps):
+        env["LD_LIBRARY_PATH"] = deps + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+
+    work = os.path.join(tempfile.gettempdir(), f"build-{uuid.uuid4().hex}")
+    os.makedirs(work, exist_ok=True)
+    try:
+        src = os.path.join(work, "main.c")
+        with open(src, "w", encoding="utf-8") as handle:
+            handle.write(req.code)
+        elf = os.path.join(work, f"{stem}.elf")
+        cmd = [os.path.join(bin_dir, "riscv64-unknown-elf-gcc"),
+               "-march=rv32imac", "-mabi=ilp32", "-Os",
+               "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
+               "-nostdlib", "-isystem", picoinc,
+               "-T", os.path.join(runtime, "riscv-cc.ld"),
+               os.path.join(runtime, "crt0.S"), os.path.join(runtime, "console.c"), src]
+        for name, val in (req.defines or {}).items():
+            cmd.append(f"-D{name}" + (f"={val}" if val is not None else ""))
+        cmd += list(req.options or [])
+        cmd += ["-L" + picolib, "-lc", "-lm", "-lgcc", "-o", elf]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=COMPILE_TIMEOUT, cwd=work, env=env)
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": f"compile timed out after {COMPILE_TIMEOUT}s"}
+        log = (proc.stdout + proc.stderr).replace(work + os.sep, "")
+        if proc.returncode != 0 or not os.path.exists(elf):
+            return {"success": False, "stage": "compile",
+                    "error": log or "compilation failed", "log": log, "c": generated_c}
+        with open(elf, "rb") as handle:
+            elf_bytes = handle.read()
+        try:
+            image = riscv_cc.elf32_to_image(elf_bytes)
+        except ValueError as exc:
+            return {"success": False, "stage": "compile",
+                    "error": f"the compiler produced no loadable image: {exc}",
+                    "log": log, "c": generated_c}
+        total = sum(len(s["bytes"]) for s in image["segments"])
+        mem = (f"RV32 image: {total} bytes across {len(image['segments'])} segment(s), "
+               f"entry 0x{image['entry']:x}")
+        return {
+            "success": True, "c": generated_c, "translated": None, "unresolved": None,
+            "warnings": None, "disassembly": None, "listing": None,
+            "base64": base64.b64encode(elf_bytes).decode("ascii"),
+            "filename": f"{stem}.elf", "bytes": len(elf_bytes), "log": log, "memory": mem,
+            "symbols": None, "symbols_error": None,
+            "toolchain": "riscv64-unknown-elf-gcc", "mcu": spec["mcu"],
+            "entry": image["entry"],
+            "image": {
+                "entry": image["entry"],
+                "segments": [
+                    {"addr": s["addr"], "bytes": base64.b64encode(s["bytes"]).decode("ascii")}
+                    for s in image["segments"]
+                ],
+            },
+        }
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def build(req: CompileReq) -> dict:
     """Compile and return the JSON-shaped result. Shared by both endpoints."""
     if len(req.code.encode("utf-8")) > MAX_SOURCE_BYTES:
@@ -1446,6 +1583,8 @@ def build(req: CompileReq) -> dict:
             return {"success": False,
                     "error": "the Keil C51 dialect is 8051-only; it cannot be "
                              "compiled for RISC-V"}
+        if riscv.get("toolchain") == "riscv64-unknown-elf-gcc":
+            return build_riscv_gcc(req, riscv, generated_c, stem)
         return build_riscv(req, riscv, generated_c, stem)
 
     target = TARGETS.get(req.target.lower())
