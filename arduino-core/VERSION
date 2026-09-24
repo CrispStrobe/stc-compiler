@@ -1,0 +1,5 @@
+ArduinoCore-avr  https://github.com/arduino/ArduinoCore-avr  86df345b3cf46754a5db38fb983ec2808ce31303  (1.8.8)
+ATTinyCore       https://github.com/SpenceKonde/ATTinyCore  9e7024945b3a873fbb2f482d88625c4d2524ba92  (master)
+
+Both LGPL-2.1-or-later. Regenerate with scripts/fetch-arduino-core.sh; do not
+hand-edit files under this directory.
