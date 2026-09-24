@@ -27,12 +27,32 @@ if ! git merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
     echo "refusing: HEAD is not on origin/main — push first"; exit 1
 fi
 
-# Auth: the logged-in CLI state, with a token from ~/.env as fallback.
+# The deploy must go to THE stc-compiler project. An unlinked directory (a
+# fresh clone, a git worktree -- .vercel/ is gitignored) does not fail: the
+# CLI silently CREATES A NEW PROJECT named after the directory and deploys
+# there. That happened on 2026-09-24 (a project "stc-arduino-cpp"). Refuse.
+LINKED="$(sed -n 's/.*"projectName":"\([^"]*\)".*/\1/p' .vercel/project.json 2>/dev/null || true)"
+if [ "$LINKED" != "stc-compiler" ]; then
+    echo "refusing: this directory is linked to '${LINKED:-nothing}', not stc-compiler."
+    echo "  copy .vercel/project.json from a linked checkout, or: vercel link --project stc-compiler"
+    exit 1
+fi
+
+# Auth: a token from ~/.env first, else the logged-in CLI state. The token is
+# tried FIRST because `vercel whoami` hangs forever with no TTY (a background
+# shell, CI, an agent), so probing it first blocked every headless deploy.
 TOKEN_ARGS=()
-if ! vercel whoami >/dev/null 2>&1; then
-    VERCEL_TOKEN="$(grep '^VERCEL_TOKEN=' ~/.env 2>/dev/null | cut -d= -f2- || true)"
-    [ -n "${VERCEL_TOKEN:-}" ] || { echo "not logged in and no VERCEL_TOKEN in ~/.env"; exit 1; }
+VERCEL_TOKEN="$(grep '^VERCEL_TOKEN=' ~/.env 2>/dev/null | cut -d= -f2- || true)"
+if [ -n "${VERCEL_TOKEN:-}" ]; then
     TOKEN_ARGS=(--token "$VERCEL_TOKEN")
+else
+    # Bounded where `timeout` exists (Linux; macOS has it as gtimeout or not
+    # at all), and never reading a terminal.
+    TMO=""; command -v timeout >/dev/null && TMO="timeout 20"
+    command -v gtimeout >/dev/null && TMO="gtimeout 20"
+    if ! TERM=dumb $TMO vercel whoami </dev/null >/dev/null 2>&1; then
+        echo "not logged in (or whoami timed out) and no VERCEL_TOKEN in ~/.env"; exit 1
+    fi
 fi
 
 # Headless hardening (kerotakis lesson): the CLI crashes on uv_tty_init
