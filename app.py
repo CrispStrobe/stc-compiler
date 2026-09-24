@@ -23,6 +23,7 @@ import uuid
 import keil2sdcc
 import riscv_cc
 import stc_disasm
+import arduino_build
 import stc_pseudocode
 import stc_symtab
 
@@ -172,35 +173,20 @@ TARGETS = {
 # separately and only when an AVR part is actually asked for, so an 8051
 # request never pays for it.
 #
-# What is deliberately NOT here: the full Arduino core + arduino-cli (250 MB).
+# What is deliberately NOT here: arduino-cli (~250 MB with its downloads).
 # stc_pseudocode's AvrTarget writes the ports directly instead, which is both
 # smaller and the same discipline the 8051 target already uses.
 #
-# For `language: "arduino"` sketches, a MINIMAL ATTinyCore subset is vendored
-# in arduino-core/. It is LGPL-2.1, server-side only: the compiled .hex is
-# returned, not the core source. See NOTICE.md for the licensing posture.
+# For `language: "arduino"` sketches, the real cores are vendored in
+# arduino-core/ -- ArduinoCore-avr for the ATmegas, ATTinyCore for the
+# ATtinys -- and compiled as C++ by arduino_build.py. LGPL-2.1, server-side
+# only: the compiled .hex is returned, not the core. See NOTICE.md.
 SRC_AVR = os.path.join(BASE_DIR, "avr")
-SRC_ARDUINO_CORE = os.path.join(BASE_DIR, "arduino-core")
+SRC_ARDUINO_CORE = arduino_build.CORE_ROOT
 
-# Arduino language route: which AVR targets have ATTinyCore variant support.
-# Each entry maps to a variant directory under arduino-core/variants/ and
-# the -DARDUINO_{board} define the core's #ifdefs expect.
-ARDUINO_TARGETS = {
-    "attiny85": {
-        "mcu": "attiny85", "flash": 8192,
-        "variant": "tinyx5",
-        "board": "AVR_ATTINYX5",
-        "default_clock": 8000000,
-        "description": "ATtiny85 — Arduino API via ATTinyCore, 8 KB flash",
-    },
-    "attiny88": {
-        "mcu": "attiny88", "flash": 8192,
-        "variant": "tinyx8",
-        "board": "AVR_ATTINYX8",
-        "default_clock": 8000000,
-        "description": "ATtiny88 — Arduino API via ATTinyCore, 8 KB flash",
-    },
-}
+# Arduino language route: every target it accepts, chip names and board
+# names alike, with the core and variant each one means.
+ARDUINO_TARGETS = arduino_build.BOARDS
 AVR_STAGE = "/tmp/avr"
 AVR_STAGE_BIN = os.path.join(AVR_STAGE, "bin")
 
@@ -433,6 +419,27 @@ def sdcc_bin_dir() -> str:
     return os.path.dirname(found) if found else STAGE_BIN
 
 
+def _avr_stage_is_stale() -> bool:
+    """Whether /tmp/avr was staged from an OLDER bundle than the one here.
+
+    Staging happens once per instance, keyed on bin/avr-gcc existing. When
+    the bundle grows a program -- cc1plus and lto1 joined cc1 for the Arduino
+    route -- a stage made before that has avr-gcc and lacks them, so every
+    C++ compile fails with "cc1plus: not found" while C compiles on happily.
+    The compiler programs directory is the one that changes; compare it."""
+    try:
+        version = open(os.path.join(SRC_AVR, "GCC_VERSION")).read().strip()
+    except OSError:
+        return False
+    rel = os.path.join("lib", "gcc", "avr", version)
+    try:
+        wanted = set(os.listdir(os.path.join(SRC_AVR, rel)))
+        have = set(os.listdir(os.path.join(AVR_STAGE, rel)))
+    except OSError:
+        return True
+    return not wanted <= have
+
+
 def stage_avr() -> str | None:
     """Directory holding avr-gcc, or None if no AVR toolchain is reachable.
 
@@ -451,7 +458,9 @@ def stage_avr() -> str | None:
     here would mean the verifier no longer verifies anything.
     """
     if os.path.isdir(SRC_AVR):
-        if not os.path.exists(os.path.join(AVR_STAGE_BIN, "avr-gcc")):
+        if not os.path.exists(os.path.join(AVR_STAGE_BIN, "avr-gcc")) \
+                or _avr_stage_is_stale():
+            shutil.rmtree(AVR_STAGE, ignore_errors=True)
             os.makedirs(AVR_STAGE, exist_ok=True)
             for part in os.listdir(SRC_AVR):
                 source = os.path.join(SRC_AVR, part)
@@ -797,214 +806,61 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
         shutil.rmtree(work, ignore_errors=True)
 
 
-# ---- Arduino (ATTinyCore) build -----------------------------------------------
-# The ATTinyCore's wiring.c and wiring_digital.c are compiled alongside the
-# user's sketch, providing the standard Arduino API: pinMode, digitalWrite,
-# digitalRead, millis, delay. The sketch is compiled as C (avr-gcc, no C++),
-# which is sufficient for the setup/loop/GPIO subset — Serial or other C++
-# features would need cc1plus, which the vendored bundle does not ship.
+# ---- Arduino build ----------------------------------------------------------
+# A sketch is compiled as real C++ against the vendored core (arduino_build.py
+# owns the pipeline: .ino preprocessing, cached core objects, libraries, LTO
+# link). This wrapper only stages the toolchain and maps failures onto the
+# service's response shape.
 
-# main() wrapper appended to every Arduino sketch. Mirrors ATTinyCore's
-# main.cpp but as plain C.
-_ARDUINO_MAIN_C = """\
-#include <Arduino.h>
-void setup(void);
-void loop(void);
-int main(void) {
-    init();
-    setup();
-    for (;;) loop();
-    return 0;
-}
-"""
-
-# Core C source files compiled alongside every Arduino sketch.
-_ARDUINO_CORE_SOURCES = ["wiring.c", "wiring_digital.c"]
-
-
-def build_arduino(req: CompileReq, spec: dict, stem: str = "main") -> dict:
-    """Compile an Arduino sketch for an ATtiny with the ATTinyCore.
-
-    The sketch is expected to define setup() and loop(). A main() wrapper and
-    the ATTinyCore's wiring/digital C sources are compiled alongside it, giving
-    the standard Arduino GPIO API (pinMode, digitalWrite, digitalRead, delay,
-    millis).
+def build_arduino(req: CompileReq, spec: dict, stem: str = "main",
+                  generated: str | None = None) -> dict:
+    """Compile an Arduino sketch for `spec` (an arduino_build.BOARDS entry).
 
     Returns the same response shape as build_avr: base64 image, filename,
-    bytes, log, memory.
+    bytes, log, memory -- plus `prototypes` (what the .ino preprocessing
+    declared on the sketch's behalf) and `libraries` (which bundled libraries
+    it pulled in). `generated` is the source a pseudocode program lowered to,
+    echoed back as `c` exactly as the other pseudocode routes echo theirs.
     """
     refusal = reject_path_options(req.options)
     if refusal:
         return refusal
+    if req.format not in ("ihx", "hex", "bin"):
+        return {"success": False, "error": "format must be ihx, hex or bin"}
 
     bin_dir = stage_avr()
     if bin_dir is None:
         return {"success": False, "stage": "compile",
                 "error": "no AVR toolchain available; the avr/ bundle is not "
-                         "vendored in this deployment and no avr-gcc is on PATH"}
-
-    core_dir = os.path.join(SRC_ARDUINO_CORE, "cores", "tiny")
-    variant_dir = os.path.join(SRC_ARDUINO_CORE, "variants", spec["variant"])
-    if not os.path.isdir(core_dir) or not os.path.isdir(variant_dir):
-        return {"success": False, "stage": "compile",
-                "error": "ATTinyCore sources not found in this deployment; "
-                         "the arduino-core/ directory is missing or incomplete"}
+                         "vendored in this deployment and no avr-gcc is on PATH",
+                "c": generated}
 
     deps = os.path.join(os.path.dirname(bin_dir), "lib-deps")
     env = dict(os.environ)
     if os.path.isdir(deps):
         env["LD_LIBRARY_PATH"] = deps + os.pathsep + env.get("LD_LIBRARY_PATH", "")
 
-    f_cpu = req.fosc or spec["default_clock"]
-
-    work = os.path.join(tempfile.gettempdir(), f"build-{uuid.uuid4().hex}")
-    os.makedirs(work, exist_ok=True)
+    # The board's clock unless the caller NAMED one. `fosc` defaults to the
+    # 8051's 11.0592 MHz crystal, so reading it unconditionally built every
+    # sketch that did not mention a clock for an 11 MHz Uno: it compiled, ran
+    # on the real 16 MHz board, and every delay() was 31% short.
+    f_cpu = req.fosc if "fosc" in req.model_fields_set else None
 
     try:
-        # Write user sketch
-        sketch_code = req.code
-        if "#include <Arduino.h>" not in sketch_code and '#include "Arduino.h"' not in sketch_code:
-            sketch_code = '#include <Arduino.h>\n' + sketch_code
-        sketch_src = os.path.join(work, "sketch.c")
-        with open(sketch_src, "w", encoding="utf-8") as fh:
-            fh.write(sketch_code)
-
-        # Write main() wrapper
-        main_src = os.path.join(work, "main_wrap.c")
-        with open(main_src, "w", encoding="utf-8") as fh:
-            fh.write(_ARDUINO_MAIN_C)
-
-        gcc = os.path.join(bin_dir, "avr-gcc")
-        common_flags = [
-            f"-mmcu={spec['mcu']}", "-Os", "-std=gnu99", "-Wall",
-            "-Wno-implicit-fallthrough", "-Wno-sign-compare",
-            "-ffunction-sections", "-fdata-sections",
-            f"-DF_CPU={int(f_cpu)}UL",
-            f"-DCLOCK_SOURCE=0",
-            f"-DARDUINO=10819",
-            f"-DARDUINO_{spec['board']}",
-            "-DARDUINO_ARCH_AVR",
-            f"-I{core_dir}", f"-I{variant_dir}",
-        ]
-        for name, value in req.defines.items():
-            if not name.replace("_", "").isalnum():
-                shutil.rmtree(work, ignore_errors=True)
-                return {"success": False, "error": f"bad define name: {name!r}"}
-            common_flags.append(f"-D{name}" if value is None else f"-D{name}={value}")
-
-        if req.symbols or req.disassemble:
-            common_flags.append("-gdwarf-2")
-
-        # Compile each source to .o
-        objects = []
-        log_parts = []
-
-        # Core sources
-        for src_name in _ARDUINO_CORE_SOURCES:
-            src_path = os.path.join(core_dir, src_name)
-            obj_path = os.path.join(work, src_name.replace(".c", ".o"))
-            cmd = [gcc] + common_flags + ["-c", src_path, "-o", obj_path]
-            result = subprocess.run(cmd, capture_output=True, text=True,
-                                    timeout=COMPILE_TIMEOUT, cwd=work, env=env)
-            log_parts.append((result.stdout or "") + (result.stderr or ""))
-            if result.returncode != 0:
-                log = "\n".join(log_parts).replace(work + os.sep, "").replace(core_dir + os.sep, "core/")
-                shutil.rmtree(work, ignore_errors=True)
-                return {"success": False, "error": log.strip() or "core compilation failed",
-                        "log": log, "stage": "compile"}
-            objects.append(obj_path)
-
-        # Sketch
-        sketch_obj = os.path.join(work, "sketch.o")
-        cmd = [gcc] + common_flags + ["-c", sketch_src, "-o", sketch_obj]
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=COMPILE_TIMEOUT, cwd=work, env=env)
-        log_parts.append((result.stdout or "") + (result.stderr or ""))
-        if result.returncode != 0:
-            log = "\n".join(log_parts).replace(work + os.sep, "")
-            shutil.rmtree(work, ignore_errors=True)
-            return {"success": False, "error": log.strip() or "sketch compilation failed",
-                    "log": log, "stage": "compile"}
-        objects.append(sketch_obj)
-
-        # main() wrapper
-        main_obj = os.path.join(work, "main_wrap.o")
-        cmd = [gcc] + common_flags + ["-c", main_src, "-o", main_obj]
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=COMPILE_TIMEOUT, cwd=work, env=env)
-        log_parts.append((result.stdout or "") + (result.stderr or ""))
-        if result.returncode != 0:
-            log = "\n".join(log_parts).replace(work + os.sep, "")
-            shutil.rmtree(work, ignore_errors=True)
-            return {"success": False, "error": log.strip() or "main wrapper compilation failed",
-                    "log": log, "stage": "compile"}
-        objects.append(main_obj)
-
-        # Link
-        elf = os.path.join(work, "main.elf")
-        link_cmd = [gcc, f"-mmcu={spec['mcu']}", "-Os",
-                    "-Wl,--gc-sections", "-o", elf] + objects
-        result = subprocess.run(link_cmd, capture_output=True, text=True,
-                                timeout=COMPILE_TIMEOUT, cwd=work, env=env)
-        log_parts.append((result.stdout or "") + (result.stderr or ""))
-        if result.returncode != 0 or not os.path.exists(elf):
-            log = "\n".join(log_parts).replace(work + os.sep, "")
-            shutil.rmtree(work, ignore_errors=True)
-            return {"success": False, "error": log.strip() or "link failed",
-                    "log": log, "stage": "link"}
-
-        log = "\n".join(log_parts).replace(work + os.sep, "").replace(core_dir + os.sep, "core/")
-
-        # objcopy → hex or bin
-        objcopy = os.path.join(bin_dir, "avr-objcopy")
-        if req.format == "bin":
-            out = os.path.join(work, "main.bin")
-            name = f"{stem}.bin"
-            copy_args = ["-O", "binary"]
-        else:
-            out = os.path.join(work, "main.hex")
-            name = f"{stem}.hex"
-            copy_args = ["-O", "ihex"]
-        subprocess.run([objcopy, *copy_args, "-R", ".eeprom", elf, out],
-                       capture_output=True, timeout=10, env=env)
-        if not os.path.exists(out):
-            return {"success": False, "error": "avr-objcopy produced no image",
-                    "log": log}
-        with open(out, "rb") as fh:
-            blob = fh.read()
-
-        # Memory report
-        mem = ""
-        try:
-            sized = subprocess.run(
-                [os.path.join(bin_dir, "avr-size"), f"--mcu={spec['mcu']}",
-                 "--format=avr", elf],
-                capture_output=True, text=True, timeout=10, env=env)
-            mem = sized.stdout or ""
-        except (OSError, subprocess.SubprocessError):
-            pass
-
-        return {
-            "success": True,
-            "c": None,
-            "translated": None,
-            "unresolved": None,
-            "warnings": None,
-            "disassembly": None,
-            "listing": None,
-            "base64": base64.b64encode(blob).decode("ascii"),
-            "filename": name,
-            "bytes": len(blob),
-            "log": log,
-            "memory": mem,
-            "symbols": None,
-            "symbols_error": None,
-            "toolchain": "avr-gcc+ATTinyCore",
-            "mcu": spec["mcu"],
-            "f_cpu": int(f_cpu),
-        }
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+        out = arduino_build.build(
+            req.code, spec, bin_dir=bin_dir, env=env, f_cpu=f_cpu,
+            defines=req.defines, fmt=req.format, stem=stem,
+            timeout=COMPILE_TIMEOUT, disassemble=req.disassemble)
+    except arduino_build.ArduinoBuildError as exc:
+        return {"success": False, "error": str(exc), "log": exc.log or str(exc),
+                "stage": exc.stage, "c": generated}
+    out["c"] = generated
+    if req.symbols:
+        # avr_symtab reads the scheduler the pseudocode emitters write; a
+        # hand-written sketch has no such structure to map.
+        out["symbols_error"] = ("a sketch has no scheduler to map; symbols "
+                                "are produced for pseudocode AVR builds")
+    return out
 
 
 def build_arm(req: CompileReq, spec: dict, generated_c: str | None,
@@ -1579,6 +1435,13 @@ def build(req: CompileReq) -> dict:
         req = req.model_copy(update={"fosc": None})
         if chip.toolchain == "avr-gcc":
             return build_avr(req, AVR_TARGETS[chip.key], generated_c, None, stem)
+        if chip.toolchain == "arduino-core":
+            # The emitted sketch is compiled exactly as a hand-written one
+            # is; the board is the DEVICE line's (the Nano's variant is not
+            # the Uno's), and F_CPU is the board's, which is why the Arduino
+            # emitter ignores CLOCK.
+            return build_arduino(req, ARDUINO_TARGETS[chip.key], stem,
+                                 generated=generated_c)
         if chip.toolchain == "arm-none-eabi-gcc":
             return build_arm(req, ARM_TARGETS[chip.key], generated_c, stem)
         if chip.toolchain == "sdcc-mcs51" and chip.key in TARGETS:
@@ -1608,15 +1471,14 @@ def build(req: CompileReq) -> dict:
         keil_warnings = result.warnings
         req = req.model_copy(update={"code": generated_c})
     elif req.language.lower() in ("arduino", "ino"):
-        # Arduino sketch: compile with ATTinyCore for a tiny target.
-        # The target field selects the MCU; only those with ATTinyCore variant
-        # support are accepted.
+        # Arduino sketch: real C++ against the vendored core the target
+        # names -- ArduinoCore-avr for the ATmegas, ATTinyCore for the tinys.
         spec = ARDUINO_TARGETS.get(req.target.lower())
         if spec is None:
             known = sorted(ARDUINO_TARGETS)
             return {"success": False,
-                    "error": f"Arduino language requires a supported ATtiny target; "
-                             f"got '{req.target}'. Known: {', '.join(known)}"}
+                    "error": f"the Arduino language has no board '{req.target}'. "
+                             f"Known: {', '.join(known)}"}
         return build_arduino(req, spec, stem)
     elif req.language.lower() != "c":
         return {"success": False,
@@ -2596,6 +2458,30 @@ async def health():
         except Exception:  # noqa: BLE001 - absence is reported, not raised
             avr_version = ""
 
+    # The Arduino route needs two more compilers proper than C does: cc1plus
+    # for the sketch and core, lto1 for the -flto link. Probed the way cc1 is
+    # above, because the driver answering --version says nothing about them.
+    arduino_cpp = None
+    if avr_bin and avr_version and not avr_version.startswith("BROKEN"):
+        try:
+            missing = []
+            for prog in ("cc1plus", "lto1"):
+                path = subprocess.run(
+                    [os.path.join(avr_bin, "avr-gcc"), f"-print-prog-name={prog}"],
+                    capture_output=True, text=True, timeout=10,
+                    env=health_env).stdout.strip()
+                if not (path and os.path.exists(path)) or subprocess.run(
+                        [path, "--version"], capture_output=True, timeout=10,
+                        env=health_env, stdin=subprocess.DEVNULL).returncode != 0:
+                    missing.append(prog)
+            with open(os.path.join(SRC_ARDUINO_CORE, "VERSION")) as fh:
+                cores = [line.split()[0] + " " + line.split()[-1].strip("()")
+                         for line in fh if line.startswith(("ArduinoCore", "ATTiny"))]
+            arduino_cpp = (f"BROKEN: {', '.join(missing)} will not start" if missing
+                           else "; ".join(cores))
+        except Exception:  # noqa: BLE001 - absence is reported, not raised
+            arduino_cpp = None
+
     # ARM side — same pattern as AVR.
     arm_bin = stage_arm()
     arm_version = ""
@@ -2663,6 +2549,7 @@ async def health():
         "version": os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7] or "unknown",
         "sdcc": version.strip().splitlines()[0] if version else "",
         "avr_gcc": avr_version.strip().splitlines()[0] if avr_version else None,
+        "arduino_cpp": arduino_cpp,
         "arm_gcc": arm_version.strip().splitlines()[0] if arm_version else None,
         "cc65": cc65_version.strip().splitlines()[0] if cc65_version else None,
         "riscv_gcc": riscv_gcc_version.strip().splitlines()[0] if riscv_gcc_version else None,

@@ -114,9 +114,10 @@
     flashable image needs SDCC or avr-gcc, which are native binaries this page
     cannot run, so <em>Compile to .hex</em> posts the generated source to the
     hosted API at <code>stc-compiler.vercel.app</code> and everything else
-    stays here. A micro:bit needs no compiler at all — MicroPython is
-    interpreted on the device — and an Arduino sketch is built by the Arduino
-    IDE, so for those the download <em>is</em> the deliverable.
+    stays here. An Arduino board's sketch is compiled there too, as C++
+    against the real Arduino core. A micro:bit needs no compiler at all —
+    MicroPython is interpreted on the device — so for it the download
+    <em>is</em> the deliverable.
   </p>
   <p>
     <strong>RISC-V is the exception.</strong> Tick <em>RISC-V C</em>, write C, and
@@ -136,7 +137,7 @@
 
 <script src="https://cdn.jsdelivr.net/pyodide/v314.0.3/full/pyodide.js"></script>
 <script type=module>
-import { flashAvr, flashMicroPython, flashStc } from './flash.js';
+import { flashAvr, flashAvrMega, flashMicroPython, flashStc } from './flash.js';
 const API = "https://stc-compiler.vercel.app";
 const $ = id => document.getElementById(id);
 let py = null, result = null, image = null;
@@ -271,7 +272,7 @@ def bw_transpile(source):
             "device": target.display,
             "toolchain": target.toolchain,
             "isp": target.isp_protocol,
-            "compilable": target.toolchain in ("sdcc-mcs51", "avr-gcc"),
+            "compilable": target.toolchain in ("sdcc-mcs51", "avr-gcc", "arduino-core"),
             "hint": target.compile_hint,
             # The canonical device token and the clock, so the page can ask the
             # hosted compiler to build the C IT ALREADY HAS rather than sending
@@ -409,10 +410,13 @@ $('hex').onclick = async () => {
     // goes away entirely when SDCC arrives as WebAssembly.
     const response = await fetch(API + '/compile', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        code: result.code, language: 'c',
-        target: result.target, fosc: result.clock,
-      }),
+      // An Arduino board's source is a sketch, built by the service's
+      // `arduino` route against the real core; its clock is the board's, so
+      // a CLOCK line (ignored by the Arduino emitter) is not sent as fosc.
+      body: JSON.stringify(result.toolchain === 'arduino-core'
+        ? {code: result.code, language: 'arduino', target: result.target}
+        : {code: result.code, language: 'c',
+           target: result.target, fosc: result.clock}),
     });
     const data = await response.json();
     if (!data.success) {
@@ -485,7 +489,7 @@ function flashable() {
   if (!CAN_SERIAL || !result || !result.ok) return false;
   // An AVR needs the compiled image; a micro:bit does not need a compiler at
   // all -- MicroPython's REPL takes the source straight.
-  if (result.toolchain === 'avr-gcc') return !!image;
+  if (result.toolchain === 'avr-gcc' || result.toolchain === 'arduino-core') return !!image;
   // Only the STC12 family's ISP is implemented. The STC15 and STC89 speak
   // genuinely different protocols, and saying so before the user power-cycles
   // a board beats failing afterwards.
@@ -546,7 +550,9 @@ $('flash').onclick = async () => {
       });
       setStatus(`flashed ${done.bytes} bytes`, 'ok');
     } else {
-      done = await flashAvr(port, new TextDecoder().decode(image.bytes), { log });
+      // The Mega's bootloader speaks STK500v2, not the Uno's optiboot v1.
+      const flasher = result.target === 'arduino-mega' ? flashAvrMega : flashAvr;
+      done = await flasher(port, new TextDecoder().decode(image.bytes), { log });
       setStatus(`flashed ${done.bytes} bytes and verified`, 'ok');
     }
   } catch (err) {
