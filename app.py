@@ -9,6 +9,7 @@ extensions can talk to both with the same client code.
 """
 
 import base64
+import hashlib
 import html
 import json
 import os
@@ -425,27 +426,39 @@ def sdcc_bin_dir() -> str:
     return os.path.dirname(found) if found else STAGE_BIN
 
 
-def _avr_stage_is_stale() -> bool:
-    """Whether /tmp/avr was staged from an OLDER bundle than the one here.
+def _avr_bundle_fingerprint() -> str:
+    """Every path in the committed bundle with its size: what a stage made
+    from it must match. Cheap (a few hundred files), and unlike comparing one
+    directory it notices a bundle that grew anywhere -- a new compiler
+    program, a new device header, a new device library."""
+    items = []
+    for root, _dirs, files in os.walk(SRC_AVR):
+        for f in files:
+            path = os.path.join(root, f)
+            try:
+                items.append(f"{os.path.relpath(path, SRC_AVR)}:{os.lstat(path).st_size}")
+            except OSError:
+                pass
+    return hashlib.sha256("\n".join(sorted(items)).encode()).hexdigest()
 
-    Staging happens once per instance, keyed on bin/avr-gcc existing. When
-    the bundle grows a program -- cc1plus and lto1 joined cc1 for the Arduino
-    route -- a stage made before that has avr-gcc and lacks them, so every
-    C++ compile fails with "cc1plus: not found" while C compiles on happily.
-    The compiler programs directory is the one that changes; compare it."""
+
+_AVR_STAMP = os.path.join(AVR_STAGE, ".bundle-fingerprint")
+
+
+def _avr_stage_is_stale() -> bool:
+    """Whether /tmp/avr was staged from a different bundle than the one here.
+
+    Staging happens once per instance. The first version of this check
+    compared only the compiler-programs directory, which caught cc1plus and
+    lto1 joining cc1 and missed a bundle that gained a DEVICE HEADER
+    (iom32u4.h, for the Arduboy): the stage kept the old tree and every
+    32U4 compile failed with "avr/iom32u4.h: No such file". So the stage is
+    stamped with a fingerprint of the whole committed bundle."""
     try:
-        version = open(os.path.join(SRC_AVR, "GCC_VERSION")).read().strip()
-    except OSError:
-        return False
-    rel = os.path.join("lib", "gcc", "avr", version)
-    try:
-        # Committed compilers are .xz (bundle_xz.py); the stage holds them
-        # decompressed, so compare the names they materialize to.
-        wanted = bundle_xz.logical_names(os.listdir(os.path.join(SRC_AVR, rel)))
-        have = set(os.listdir(os.path.join(AVR_STAGE, rel)))
+        with open(_AVR_STAMP) as fh:
+            return fh.read() != _avr_bundle_fingerprint()
     except OSError:
         return True
-    return not wanted <= have
 
 
 def stage_avr() -> str | None:
@@ -481,6 +494,8 @@ def stage_avr() -> str | None:
             # Vercel's 225 MB function limit (bundle_xz.py); /tmp is where
             # they become runnable.
             bundle_xz.materialize(AVR_STAGE)
+            with open(_AVR_STAMP, "w") as fh:
+                fh.write(_avr_bundle_fingerprint())
             # cc1, collect2, as and ld are all fork/exec'd and all lose the
             # executable bit on the way through Vercel's deployment.
             for sub in ("bin", os.path.join("lib", "avr", "bin"),

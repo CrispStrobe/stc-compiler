@@ -21,6 +21,8 @@ their own upstream licenses.
 | `arduino-core/cores/tiny/**`, `arduino-core/variants/{tinyx5,tinyx8}/**`, `arduino-core/libraries/tiny/**` | [ATTinyCore](https://github.com/SpenceKonde/ATTinyCore) by Spence Konde | **LGPL-2.1-or-later** (see below) |
 | `arduino-core/libraries/arduino/Servo/**` | [Servo](https://github.com/arduino-libraries/Servo) 1.3.0 by Arduino | **LGPL-2.1-or-later** (see below) |
 | `arduino-core/libraries/common/LiquidCrystal/**` | [LiquidCrystal](https://github.com/arduino-libraries/LiquidCrystal) 1.0.7 by Arduino | **LGPL-2.1-or-later** (see below) |
+| `arduino-core/libraries/arduino/Arduboy2/**` | [Arduboy2](https://github.com/MLXXXp/Arduboy2) 6.0.0 by Scott Allen et al. | **BSD-3-Clause** (its `LICENSE.txt`) |
+| `arduino-core/libraries/arduino/ArduboyTones/**` | [ArduboyTones](https://github.com/MLXXXp/ArduboyTones) 1.0.3 by Scott Allen | **MIT** (its `LICENSE.txt`) |
 | `arduino-core/libraries/common/Adafruit_NeoPixel/**` | [Adafruit_NeoPixel](https://github.com/adafruit/Adafruit_NeoPixel) 1.15.5 by Adafruit | **LGPL-3.0** (see below; licence text in its `COPYING`) |
 | `riscv/riscv-cc.wasm` | [shecc](https://github.com/sysprog21/shecc) — RV32IM C compiler, built to `wasm32-wasi` | **BSD-2-Clause** |
 | `riscv-gcc/bin/**`, `riscv-gcc/lib/gcc/**`, `riscv-gcc/lib/riscv64-unknown-elf/bin/**` | [GCC](https://gcc.gnu.org/) for `riscv64-unknown-elf` + GNU binutils | **GPL-3.0-or-later**, runtime under the **GCC Runtime Library Exception** |

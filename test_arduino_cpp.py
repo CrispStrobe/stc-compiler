@@ -364,3 +364,64 @@ def test_a_sketch_build_returns_a_symbol_table_when_asked():
 def test_no_symbols_unless_asked():
     r = compile_sketch("void setup() {}\nvoid loop() {}\n")
     assert r["symbols"] is None and r["symbols_error"] is None
+
+
+# ----------------------------------------------------------------- Arduboy
+
+ARDUBOY_SKETCH = """
+#include <Arduboy2.h>
+Arduboy2 arduboy;
+int x = 10;
+void setup() { arduboy.begin(); arduboy.setFrameRate(30); }
+void loop() {
+  if (!arduboy.nextFrame()) return;
+  arduboy.pollButtons();
+  if (arduboy.pressed(RIGHT_BUTTON)) x++;
+  arduboy.clear();
+  arduboy.print(F("Hello, Arduboy!"));
+  arduboy.fillRect(x, 20, 8, 8, WHITE);
+  arduboy.display();
+}
+"""
+
+
+def test_an_arduboy2_sketch_builds_for_the_arduboy():
+    r = compile_sketch(ARDUBOY_SKETCH, "arduboy")
+    assert r["success"], r.get("error")
+    assert r["mcu"] == "atmega32u4" and r["variant"] == "leonardo" and r["board"] == "AVR_ARDUBOY"
+    assert "Arduboy2" in r["libraries"]
+    assert "atmega32u4" in r["memory"]
+
+
+def test_arduboy_tones_builds_too():
+    code = ("#include <Arduboy2.h>\n#include <ArduboyTones.h>\nArduboy2 ab;\n"
+            "ArduboyTones sound(ab.audio.enabled);\n"
+            "void setup() { ab.begin(); sound.tone(440, 100); }\nvoid loop() {}\n")
+    r = compile_sketch(code, "arduboy")
+    assert r["success"], r.get("error")
+    assert {"Arduboy2", "ArduboyTones"} <= set(r["libraries"])
+
+
+def test_the_arduboy_keeps_its_bootloader_room():
+    # 32 KB of flash, the top 4 KB the bootloader's: 28672 for the sketch.
+    code = ("const uint8_t big[29000] PROGMEM = {1};\n"
+            "void setup() { Serial.begin(9600); Serial.println(pgm_read_byte(&big[28999])); }\n"
+            "void loop() {}\n")
+    r = compile_sketch(code, "arduboy")
+    assert not r["success"] and "28672 bytes of flash" in r["error"], r.get("error")
+
+
+def test_a_stale_stage_is_noticed_when_the_bundle_grows():
+    # The first staleness check compared one directory and missed a new
+    # device header (iom32u4.h). The stamp covers the whole bundle.
+    stamp = app._AVR_STAMP
+    with open(stamp) as fh:
+        saved = fh.read()
+    try:
+        with open(stamp, "w") as fh:
+            fh.write("a bundle from before")
+        assert app._avr_stage_is_stale()
+    finally:
+        with open(stamp, "w") as fh:
+            fh.write(saved)
+    assert not app._avr_stage_is_stale()
