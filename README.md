@@ -314,6 +314,7 @@ end** knows, which the service can **compile**, and which a browser can
 | `stm32f030` | arm-none-eabi-gcc | Cortex-M0, real flash image at `0x08000000` (`stm32f030-flash.ld`) |
 | `eater6502` | cc65 | 65C02, 32 KB ROM at `$8000` (`eater.cfg`) |
 | `riscv32` | shecc (as wasm) | RV32IM, ELF32 image for an emulated console — no native toolchain, no flashing |
+| `riscv32-gcc` | native gcc + picolibc (`riscv-gcc/`) | RV32IMAC, **full C** (floats, malloc, qsort, math.h) — ELF32 image for the same emulated console |
 
 `riscv32` is the odd one out: it hosts no native compiler. It runs
 [shecc](https://github.com/sysprog21/shecc) — a small self-hosting C compiler
@@ -334,6 +335,19 @@ the `shecc`→wasm compiler *and* the RV32 machine — loaded from jsDelivr at a
 pinned commit (`BW_BOARD_PIN` in `docs/index.html`); it is the same wasm the
 hosted target runs. `scripts/check-pages.js` exercises the whole client-side path
 (compile → run → the program's output) in a real browser.
+
+**When shecc's subset is not enough, `riscv32-gcc` is the full-C path.** It runs
+a native `riscv64-unknown-elf-gcc` + picolibc bundle — vendored in `riscv-gcc/`
+the same way the ARM and AVR bundles are (Debian bullseye, one multilib, DWARF
+stripped, ~46 MB), staged into `/tmp` on Vercel — so arbitrary C compiles:
+`printf("%f")`, `malloc`, `qsort`, `<math.h>`, `<string.h>`. It returns the same
+`{entry, segments}` image for the emulated RV32 console (no flashing); the
+freestanding startup + picolibc console (`riscv-gcc/runtime/`) sit over the
+machine's ECALL ABI. This is a hosted (server-side) target — it needs a native
+compiler, so unlike `riscv32` it does not run in the browser page.
+`scripts/fetch-riscv-gcc.sh` reproduces the bundle; the `riscv-gcc-bundle` CI job
+guards that every dependency travels with it, nothing needs GLIBC > 2.34, and it
+stays within the deploy budget.
 
 The 8051 targets compile `-mmcs51 --std-c99`; adding a part is three lines in
 `TARGETS` in [`app.py`](app.py). **For a pseudocode program the `DEVICE` line

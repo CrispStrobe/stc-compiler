@@ -19,6 +19,9 @@ their own upstream licenses.
 | `cc65/bin/**`, `cc65/lib/**`, `cc65/include/**`, `cc65/asminc/**` | [cc65](https://github.com/cc65/cc65) | **zlib** (Debian: BSD-3-zlib) |
 | `arduino-core/cores/tiny/**`, `arduino-core/variants/**` | [ATTinyCore](https://github.com/SpenceKonde/ATTinyCore) by Spence Konde | **LGPL-2.1** (see below) |
 | `riscv/riscv-cc.wasm` | [shecc](https://github.com/sysprog21/shecc) — RV32IM C compiler, built to `wasm32-wasi` | **BSD-2-Clause** |
+| `riscv-gcc/bin/**`, `riscv-gcc/lib/gcc/**`, `riscv-gcc/lib/riscv64-unknown-elf/bin/**` | [GCC](https://gcc.gnu.org/) for `riscv64-unknown-elf` + GNU binutils | **GPL-3.0-or-later**, runtime under the **GCC Runtime Library Exception** |
+| `riscv-gcc/picolibc/**` | [picolibc](https://github.com/picolibc/picolibc) — the C library | **BSD-2/3-Clause** (a few files under other permissive terms) |
+| `riscv-gcc/lib-deps/**` | the shared libraries the compiler links (GMP, MPFR, MPC, ISL, zlib) | LGPL-3.0-or-later / zlib, as each upstream states |
 
 ### Provenance
 
@@ -32,12 +35,15 @@ source, in `vendor/<name>/`:
 | arm-none-eabi | Debian bullseye `gcc-arm-none-eabi`, `binutils-arm-none-eabi`, unmodified | `vendor/arm/VERSION` + two `.copyright` files |
 | cc65 | **built from upstream source**, commit `547d923` — not a Debian package | `vendor/cc65/VERSION`, `vendor/cc65/LICENSE` |
 | shecc | **built from upstream source**, commit `362b94b`, cross-compiled to `wasm32-wasi` — byte-reproducible, see `riscv/riscv-cc.PROVENANCE.md` | `vendor/shecc/VERSION`, `vendor/shecc/LICENSE` |
+| riscv-gcc | Debian bullseye `gcc-riscv64-unknown-elf`, `binutils-riscv64-unknown-elf`, `picolibc-riscv64-unknown-elf`, unmodified — trimmed to the rv32imac/ilp32 multilib, DWARF stripped | `vendor/riscv-gcc/VERSION` + three `.copyright` files |
 
-`scripts/fetch-sdcc.sh`, `scripts/fetch-avr-gcc.sh` and
-`scripts/fetch-arm-gcc.sh` reproduce the first three bundles exactly. The
-fetch scripts strip the bundles down — to one target, one multilib, and
-without DWARF — which is a *subset*, not a modification: no binary is patched,
-and the corresponding source for each is the upstream Debian source package.
+`scripts/fetch-sdcc.sh`, `scripts/fetch-avr-gcc.sh`,
+`scripts/fetch-arm-gcc.sh` and `scripts/fetch-riscv-gcc.sh` reproduce those
+four bundles exactly. The fetch scripts strip the bundles down — to one
+target, one multilib, and without DWARF — which is a *subset*, not a
+modification: no binary is patched, and the corresponding source for each is
+the upstream Debian source package. (The RISC-V bundle also carries picolibc
+as its C library, where the ARM bundle is freestanding.)
 
 cc65 is the exception in every sense: it was compiled rather than repackaged,
 so `vendor/cc65/VERSION` names the upstream commit instead of a `.deb`. Its
