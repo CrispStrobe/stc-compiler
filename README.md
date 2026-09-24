@@ -69,7 +69,7 @@ Three lanes, which is worth holding in mind because the endpoints follow it:
 ```
                      ┌─ emit_c ────────▶ C ──▶ sdcc / avr-gcc / arm-gcc / cc65 ──▶ image
 pseudocode ─parse─▶ AST ─ emit (MicroPython) ─▶ .py   (interpreted on the device)
-                     ├─ emit (Arduino C++) ──▶ .ino  (built by the IDE)
+                     ├─ emit (Arduino C++) ──▶ .ino ──▶ avr-gcc + Arduino core ──▶ image
                      ├─ emit (TypeScript) ───▶ .ts   (built by PXT / MakeCode)
                      └─ emit_pseudocode ─────▶ text  (the round trip)
 
@@ -140,10 +140,11 @@ curl -X POST https://stc-compiler.vercel.app/download \
 # -> main.hex
 ```
 
-For a target this service cannot build — a micro:bit, an Arduino sketch, a
-MakeCode Arcade game — the **source** is the file: `main.py`, `main.ino` or
-`main.ts`, returned 200 with `X-Source-Only` naming the toolchain it would
-have needed. A genuine error (a bad pin, an unknown target) is still a 400
+For a target this service cannot build — a micro:bit, a Pico, a MakeCode
+Arcade game — the **source** is the file: `main.py` or `main.ts`, returned 200
+with `X-Source-Only` naming the toolchain it would have needed. (An Arduino
+board was on this list until 2026-09-24; it now builds, and `/download` hands
+back its `.hex`. `/transpile` still returns the `.ino`.) A genuine error (a bad pin, an unknown target) is still a 400
 with the message. The difference is whether there is usable output, not
 whether a compiler ran.
 
@@ -355,9 +356,34 @@ selects these limits**, not the request's `target` field — so an image that
 outgrows an STC89's 8 KB is refused by the linker instead of being handed back. Keil translation is 8051-only by definition
 and is refused for any other target rather than silently miscompiled.
 
-`language: "arduino"` is a fifth route: an Arduino-API sketch compiled against
-a vendored **ATTinyCore** subset, for `attiny85` and `attiny88` only. That is
-the one place a real Arduino core is linked server-side; see the licensing
+`language: "arduino"` is a fifth route: an Arduino **sketch**, compiled as real
+C++ — `Serial`, `String`, classes, templates, `F()` — against the same core
+source the Arduino IDE uses, vendored in `arduino-core/` by
+`scripts/fetch-arduino-core.sh` at pinned commits:
+
+| `target` | core | variant |
+|---|---|---|
+| `arduino-uno`, `atmega328p` | ArduinoCore-avr 1.8.8 | `standard` |
+| `arduino-nano` | ArduinoCore-avr 1.8.8 | `eightanaloginputs` (adds A6/A7) |
+| `atmega168p` | ArduinoCore-avr 1.8.8 | `standard` |
+| `arduino-mega`, `atmega2560` | ArduinoCore-avr 1.8.8 | `mega` |
+| `attiny85`, `attiny88` | ATTinyCore (2.0 line) | `tinyx5`, `tinyx8` |
+
+The pipeline is the IDE's ([`arduino_build.py`](arduino_build.py)): the sketch
+gets `#include <Arduino.h>` and prototypes for its functions (so `loop()` may
+call a function defined below it), each behind `#line` so a diagnostic names
+`main.ino:<line>` — the line you wrote; the core is built with its own
+platform flags, `-flto` included, and cached per board and clock so a warm
+instance compiles only the sketch; an `#include` of `Wire.h`, `SPI.h`,
+`EEPROM.h` or `SoftwareSerial.h` pulls in the core's bundled library. `F_CPU`
+is the board's (16 MHz, 8 MHz for the ATtinys) unless `fosc` is given. The
+response adds `prototypes` (what was declared for you), `libraries`,
+`variant` and `board`.
+
+Not offered: libraries outside the core's bundle (there is no library
+manager — an `#include <Servo.h>` fails naming what *is* available), and C++
+past what gcc-avr 5.4 knows (`gnu++11` for ArduinoCore-avr, as its
+platform.txt asks; `gnu++1z` for ATTinyCore, which asks for 17). Licensing
 posture in [`NOTICE.md`](NOTICE.md).
 
 The `stm32f030` image is a genuine flash image — vectors first, initial SP in
@@ -373,7 +399,7 @@ Nineteen `DEVICE` names across six architectures:
 | STC 8051 | `stc12c5a60s2` `stc12c5a16s2` `stc15f2k60s2` `stc15w408as` `stc89c52` `stc89c52rc` | C | **yes** |
 | bare AVR | `atmega328p` `atmega168p` | C | **yes** |
 | bare AVR (tiny) | `attiny85` `attiny88` | C | **yes** (no `print` — no USART) |
-| Arduino core | `arduino-uno` `arduino-nano` `arduino-mega` | C++ `.ino` | no — needs `arduino-cli` |
+| Arduino core | `arduino-uno` `arduino-nano` `arduino-mega` | C++ `.ino` | **yes** — against ArduinoCore-avr |
 | MicroPython | `microbit` (`micro-bit`) | `.py` | nothing to compile |
 | MicroPython | `pico` (`rp2040`) | `.py` | nothing to compile |
 | 6502 | `eater6502` | — | no pseudocode generator — see *Known gaps* |
@@ -398,17 +424,6 @@ and emits something is easy to mistake for a device that works:
   (`$6000` PORTB, `$6001` PORTA, `$6002`/`$6003` the DDRs), and the open
   question is the millisecond tick — VIA Timer 1 in free-run mode wants an IRQ
   handler, and `crt0.s` currently points IRQ at a bare `RTI`.
-- **The Arduino route compiles as C, not C++ (yet).** `language: "arduino"`
-  runs `avr-gcc` over the sketch — enough for the `setup`/`loop`/GPIO subset
-  (`digitalWrite`, `millis`, `delay`) — but real Arduino C++ (objects like
-  `Serial`, `String`, classes, templates, C++ libraries) is not compiled,
-  because `cc1plus` was trimmed from the avr bundle to save size. This is the
-  **natural home for C++ in this service**, and it is well-scoped: `cc1plus` is
-  in the Debian avr-gcc `.deb` (`fetch-avr-gcc.sh` just drops it), ATTinyCore is
-  already C++ source, and — unlike a hosted RISC-V C++ (no target `libstdc++`
-  for rv32, a console-only machine) — no STL is *expected* on AVR, so nothing
-  misleads. Scope: re-add `cc1plus` to the avr bundle, compile the sketch with
-  `avr-g++` linking the ATTinyCore C++ core, keep the size + GLIBC gates green.
 - **`print` is refused on the ATtinys**, which is correct: neither the ATtiny85
   nor the ATtiny88 has a USART.
 - **`LIST` is not lowered on micro:bit, Pico or Arcade yet.** MicroPython and
@@ -688,10 +703,13 @@ On the Uno the same two names are refused for an unrelated reason — the DIP
 package does not bring them out at all — and the two messages are deliberately
 different, because one sends you to the package and the other to the schematic.
 
-**Core C++ transpiles here; it does not compile here.** SDCC cannot build it
-and `arduino-cli` plus the AVR core is ~250 MB against Vercel's 250 MB
-function limit. `POST /compile` with an Arduino `DEVICE` is refused, naming
-the toolchain it would need, and returns the generated source anyway.
+**Core C++ compiles here.** `POST /compile` with an Arduino `DEVICE` builds
+the emitted sketch through the `language: "arduino"` route — the same C++
+front end and vendored ArduinoCore-avr a hand-written sketch gets — and
+returns the image with the generated `.ino` in `c`. `arduino-cli` is still
+not used: with its tool downloads it is ~250 MB against Vercel's 250 MB
+function limit, and all it would add over `arduino_build.py` is a library
+manager.
 
 ### Bare AVR
 
@@ -964,10 +982,11 @@ the copies it knows about; it cannot check that the set is complete, because
 it *is* the set.
 
 That covers more than it sounds like: a micro:bit needs no compiler
-(MicroPython is interpreted on the device) and an Arduino sketch is built by
-the IDE, so for those targets the page is the whole toolchain. **Compile to
+(MicroPython is interpreted on the device) and a Pico's MicroPython is too,
+so for those targets the page is the whole toolchain. **Compile to
 .hex** posts to the hosted API for the parts that genuinely need SDCC,
-avr-gcc, arm-none-eabi-gcc or cc65, and says so.
+avr-gcc (an Arduino board's sketch included), arm-none-eabi-gcc or cc65, and
+says so.
 
 CI starts a browser and transpiles every example in it, because "the page
 loads" and "CPython starts in it and emits MicroPython" are different claims.
@@ -1061,10 +1080,11 @@ uf2.py                 binary -> UF2 container
 keil-shim/             our replacements for Keil-only headers
   generate-compat.py   REGENERATES keil-compat.h — never hand-edit that file
 bin/ share/            vendored SDCC        (~8 MB)
-avr/                   vendored avr-gcc     (39 MB)
+avr/                   vendored avr-gcc, C and C++ (40 MB; cc1/cc1plus/lto1 as .xz, see bundle_xz.py)
 arm/                   vendored arm-none-eabi-gcc (43 MB)
 cc65/                  vendored cc65        (3.7 MB)
-arduino-core/          minimal ATTinyCore subset (LGPL, server-side only)
+arduino-core/          ArduinoCore-avr + ATTinyCore (LGPL, server-side only)
+arduino_build.py       the `arduino` route: .ino preprocessing, core cache, link
 docs/                  the GitHub Pages app + mirrored modules
 vendor/                upstream VERSION and copyright files
 test_*.py              the pytest suite (see Tests)
@@ -1162,11 +1182,9 @@ for **every** part in `AVR_TARGETS` under `-Werror`, `scripts/elf-needed.py`
 asserts every non-glibc dependency travels with the bundle, and the job checks
 the GLIBC floor and uploads the verified bundle as an artifact.
 
-The Arduino core is deliberately **not** vendored in full: it is LGPL-2.1, and
-static linking it into an image this service hands back engages the relink
-obligation. avr-libc is BSD-3-Clause and avr-gcc's runtime carries the GCC
-Runtime Library Exception, so compiled output is unencumbered. The one
-exception is the minimal ATTinyCore subset in `arduino-core/`, whose posture is
+avr-libc is BSD-3-Clause and avr-gcc's runtime carries the GCC Runtime
+Library Exception, so C images are unencumbered. A sketch built by the
+`arduino` route links the LGPL-2.1 Arduino core as well; that posture is
 argued in full in [`NOTICE.md`](NOTICE.md).
 
 ### This service does not produce the same firmware as a local build

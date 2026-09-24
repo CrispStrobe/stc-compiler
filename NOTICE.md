@@ -17,7 +17,8 @@ their own upstream licenses.
 | `arm/bin/**`, `arm/lib/gcc/**`, `arm/libexec/**` | GCC for `arm-none-eabi` + GNU binutils | **GPL-3.0-or-later**, runtime under the **GCC Runtime Library Exception** |
 | `avr/lib-deps/**`, `arm/lib-deps/**` | the shared libraries those compilers link (GMP, MPFR, MPC, zlib, …) | LGPL-3.0-or-later / zlib, as each upstream states |
 | `cc65/bin/**`, `cc65/lib/**`, `cc65/include/**`, `cc65/asminc/**` | [cc65](https://github.com/cc65/cc65) | **zlib** (Debian: BSD-3-zlib) |
-| `arduino-core/cores/tiny/**`, `arduino-core/variants/**` | [ATTinyCore](https://github.com/SpenceKonde/ATTinyCore) by Spence Konde | **LGPL-2.1** (see below) |
+| `arduino-core/cores/arduino/**`, `arduino-core/variants/{standard,eightanaloginputs,mega}/**`, `arduino-core/libraries/arduino/**` | [ArduinoCore-avr](https://github.com/arduino/ArduinoCore-avr) 1.8.8 by Arduino | **LGPL-2.1-or-later** (see below) |
+| `arduino-core/cores/tiny/**`, `arduino-core/variants/{tinyx5,tinyx8}/**`, `arduino-core/libraries/tiny/**` | [ATTinyCore](https://github.com/SpenceKonde/ATTinyCore) by Spence Konde | **LGPL-2.1-or-later** (see below) |
 | `riscv/riscv-cc.wasm` | [shecc](https://github.com/sysprog21/shecc) — RV32IM C compiler, built to `wasm32-wasi` | **BSD-2-Clause** |
 | `riscv-gcc/bin/**`, `riscv-gcc/lib/gcc/**`, `riscv-gcc/lib/riscv64-unknown-elf/bin/**` | [GCC](https://gcc.gnu.org/) for `riscv64-unknown-elf` + GNU binutils | **GPL-3.0-or-later**, runtime under the **GCC Runtime Library Exception** |
 | `riscv-gcc/picolibc/**` | [picolibc](https://github.com/picolibc/picolibc) — the C library | **BSD-2/3-Clause** (a few files under other permissive terms) |
@@ -116,31 +117,38 @@ repository.
 
 *None of the above is legal advice.*
 
-## ATTinyCore — LGPL-2.1 posture
+## The Arduino cores — LGPL-2.1 posture
 
-The `arduino-core/` directory vendors a minimal subset of
-[ATTinyCore](https://github.com/SpenceKonde/ATTinyCore) (© 2015–2022 Spence
-Konde, © 2005–2006 David A. Mellis), covering only the files needed to compile
-Arduino-API sketches for ATtiny85 and ATtiny88: `wiring.c`, `wiring_digital.c`,
-the core headers, and two variant pin maps.
+The `arduino-core/` directory vendors two Arduino cores, each at a pinned
+commit recorded in `arduino-core/VERSION` and fetched, checksum-verified, by
+`scripts/fetch-arduino-core.sh`:
 
-ATTinyCore is licensed under **LGPL-2.1-or-later**. The LGPL's linking
-obligation means that anyone who receives a binary linked against LGPL code must
-be able to relink it with a modified version of the library. Here that
-obligation is satisfied naturally:
+- [ArduinoCore-avr](https://github.com/arduino/ArduinoCore-avr) 1.8.8
+  (© Arduino and contributors, © 2005–2006 David A. Mellis) — `cores/arduino`,
+  the `standard`, `eightanaloginputs` and `mega` variants, and the bundled
+  EEPROM, SPI, Wire and SoftwareSerial libraries.
+- [ATTinyCore](https://github.com/SpenceKonde/ATTinyCore) (© 2015–2022 Spence
+  Konde, © 2005–2006 David A. Mellis) — `cores/tiny`, the `tinyx5` and
+  `tinyx8` variants, and its EEPROM, SPI, Wire and SoftwareSerial.
+
+Both are licensed under **LGPL-2.1-or-later**. The LGPL's linking obligation
+means that anyone who receives a binary linked against LGPL code must be able
+to relink it with a modified version of the library. Here:
 
 1. **The core source is public and unmodified.** It is checked into this
-   repository exactly as published upstream. Anyone can inspect, modify, and
-   rebuild it.
-2. **The compiled .hex is produced server-side.** The user receives only the
-   compiled output (an Intel HEX image), never the LGPL object code as a
-   library. The core is compiled alongside the user's sketch in one avr-gcc
-   invocation, not pre-linked as a static library — but even if it were, the
-   full unmodified source is right here in the repo.
+   repository exactly as published upstream (the fetch script copies files
+   verbatim; the one compatibility shim, `DECIMAL_DIG` for gcc 5.4, is a
+   compiler flag, not an edit). Anyone can inspect, modify and rebuild it.
+2. **The compiled .hex is produced server-side** from the user's own sketch,
+   which the user already has, and that public core source. The core's
+   objects are cached on the server between requests but are never returned;
+   the response is the linked Intel HEX image only. The flags every build uses
+   are in `arduino_build.py`, so the same image can be relinked against a
+   modified core with the same toolchain.
 3. **No core source is shipped to the browser or to downstream app repos.**
-   The ATTinyCore files live only on the server. The returned .hex is the
-   user's program; the LGPL does not claim it (LGPL §6: "a work that uses the
-   Library" is not a derivative work of it).
+   The core files live only on the server. The returned .hex is the user's
+   program linked with the core — the same combined work the Arduino IDE
+   produces on a user's own machine.
 
 This is standard Arduino-ecosystem practice: the Arduino IDE itself compiles
 LGPL core libraries alongside user sketches and ships the resulting .hex to the
