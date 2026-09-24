@@ -6,17 +6,22 @@
 # x86_64 Linux, so we lift already-built, already-stripped binaries out of
 # Debian's .deb packages rather than cross-compiling anything.
 #
-# What this deliberately does NOT fetch is arduino-cli and the Arduino AVR
-# core. That combination is ~250 MB against Vercel's 250 MB function limit,
-# it downloads cores at runtime, and the core is LGPL-2.1 — statically linked
-# into a .hex we hand back, that engages the relink obligation. The generator
-# writes ports directly instead (stc_pseudocode.AvrTarget), so avr-libc is all
-# the runtime we need, and avr-libc is BSD-3-Clause.
+# What this deliberately does NOT fetch is arduino-cli. It is ~250 MB with
+# its tool downloads, against Vercel's 250 MB function limit, and it fetches
+# cores at runtime. The Arduino cores themselves are small C/C++ source trees
+# and are vendored in arduino-core/ instead (scripts/fetch-arduino-core.sh),
+# compiled per request by the avr-gcc this script builds; their LGPL-2.1
+# posture is in NOTICE.md. The pseudocode ATMEGA targets still write ports
+# directly (stc_pseudocode.AvrTarget), so they need avr-libc (BSD-3-Clause)
+# and nothing else.
 #
 # Size: the full gcc-avr install is ~230 MB, and almost all of it is the 42
-# multilib variants and the C++ compiler. We keep cc1 (not cc1plus — the
-# generator emits C), the driver, the assembler, the linker, objcopy/objdump/
-# size, and the ONE multilib the supported parts use. That lands near 25 MB.
+# multilib variants. We keep cc1, cc1plus (the Arduino route compiles real
+# core C++ — Serial, String, classes), the driver, the assembler, the linker,
+# objcopy/objdump/size, and only the multilibs the supported parts use. That
+# lands near 63 MB. There is no libstdc++ for AVR and none is fetched: the
+# Arduino core supplies operator new/delete and __cxa_pure_virtual itself,
+# and no STL is expected on an 8-bit part.
 #
 # Run this from the repo root:  ./scripts/fetch-avr-gcc.sh
 #
@@ -77,7 +82,7 @@ DEVICE_HEADERS="iom328*.h iom168*.h iom2560*.h iotn85*.h iotn84*.h iotn88*.h"
 # avr-libc multilib directories (crt*.o, lib<device>.a) is dropped — avr25
 # alone carries 49 files for devices we do not support. The common libraries
 # (libc.a, libm.a, libprintf_*.a, libscanf_*.a) are always kept.
-DEVICE_LIBS="*mega328p* *mega168p* *mega168pa* *mega168pb* *mega2560* *tiny85* *tiny84*"
+DEVICE_LIBS="*mega328p* *mega168p* *mega168pa* *mega168pb* *mega2560* *tiny85* *tiny84* *tiny88*"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
@@ -177,25 +182,34 @@ DST="$ROOT/avr/lib/gcc/avr/$VERSION"
 mkdir -p "$DST"
 
 # cc1 is the C compiler proper; collect2 is what the driver calls to link.
-# cc1plus (13 MB) is deliberately left behind: nothing here emits C++.
-for f in cc1 collect2 libgcc.a; do
+# cc1plus (~13 MB) is the C++ compiler the `arduino` language route needs:
+# the driver reaches it for any .cpp input, so avr-gcc itself compiles the
+# Arduino core and the sketch — no avr-g++ driver is shipped or needed.
+for f in cc1 cc1plus collect2 libgcc.a; do
   test -f "$SRC/$f" || { echo "missing $f in gcc-avr" >&2; exit 1; }
   cp "$SRC/$f" "$DST/$f"
 done
-chmod +x "$DST/cc1" "$DST/collect2"
+chmod +x "$DST/cc1" "$DST/cc1plus" "$DST/collect2"
 
-# The LTO linker plugin, which is needed even though we never pass -flto.
-# This gcc was configured with plugin support, so it hands ld a --plugin
-# argument on every link and dies with
+# The LTO linker plugin, which is needed even without -flto. This gcc was
+# configured with plugin support, so it hands ld a --plugin argument on every
+# link and dies with
 #
 #   fatal error: -fuse-linker-plugin, but liblto_plugin.so not found
 #
-# if it is absent. 860 KB for the plugin and lto-wrapper. lto1 (11 MB) is
-# still left out: that one is only reached by an actual -flto compile, which
-# this service does not offer.
+# if it is absent. 860 KB for the plugin and lto-wrapper.
+#
+# lto1 (11 MB) is the -flto back end, and the `arduino` route needs it. Both
+# cores are built with -flto exactly as their platform.txt says, and for
+# ATTinyCore that is not an optimisation but a precondition: its
+# wiring_analog.c defines functions whose bodies call a `badCall()` carrying
+# __attribute__((error)) on parts that lack the feature. With LTO the unused
+# function is discarded before code generation; without it the error fires
+# and the core does not build at all.
 cp -a "$SRC"/liblto_plugin.so* "$DST/" 2>/dev/null || true
 test -f "$SRC/lto-wrapper" && cp "$SRC/lto-wrapper" "$DST/lto-wrapper" \
   && chmod +x "$DST/lto-wrapper"
+cp "$SRC/lto1" "$DST/lto1" && chmod +x "$DST/lto1"
 
 # device-specs is what makes -mmcu=atmega328p mean anything: one spec file per
 # part, naming its core, its startfile and its device library. Small, and
@@ -323,8 +337,8 @@ corresponding source: apt-get source gcc-avr binutils-avr avr-libc
 
 gcc-avr and binutils-avr are GPL-3.0-or-later. The GCC Runtime Library
 Exception covers libgcc, so images compiled with this bundle are unencumbered.
-avr-libc is BSD-3-Clause. The Arduino core (LGPL-2.1) is NOT vendored and is
-not linked into anything this service returns.
+avr-libc is BSD-3-Clause. The Arduino cores in arduino-core/ (LGPL-2.1) are
+vendored separately and compiled from source per request; see NOTICE.md.
 EOF
 
 printf '%s\n' "$VERSION" > "$ROOT/avr/GCC_VERSION"
@@ -334,6 +348,8 @@ du -sh "$ROOT/avr" | sed 's/^/    /'
 echo
 echo "avr-gcc present: $(test -x "$ROOT/avr/bin/avr-gcc" && echo yes || echo NO)"
 echo "cc1 present:     $(test -x "$DST/cc1" && echo yes || echo NO)"
+echo "cc1plus present: $(test -x "$DST/cc1plus" && echo yes || echo NO)"
+echo "lto1 present:    $(test -x "$DST/lto1" && echo yes || echo NO)"
 echo "tooldir as:      $(test -x "$ROOT/avr/lib/avr/bin/as" && echo yes || echo NO)"
 echo "io.h present:    $(test -f "$ROOT/avr/lib/avr/include/avr/io.h" && echo yes || echo NO)"
 echo "avr5 crt:        $(ls "$ROOT/avr/lib/avr/lib/avr5"/crtatmega328p.o >/dev/null 2>&1 \
