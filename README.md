@@ -325,6 +325,16 @@ base64) an emulated RV32 machine boots — there is no hardware to flash. It is 
 C *subset* (educational), not a full C compiler. See
 [`riscv/riscv-cc.PROVENANCE.md`](riscv/riscv-cc.PROVENANCE.md).
 
+**And it is the one target the page compiles *and runs* with no server at all.**
+Tick **RISC-V C** on the [page](https://crispstrobe.github.io/stc-compiler/),
+write C, and **▶ Compile & Run** compiles it to an RV32 image and boots it on an
+emulated RV32IM machine entirely in the browser — nothing is posted anywhere.
+That mode reuses the [bw-board](https://github.com/CrispStrobe/bw-board) engine —
+the `shecc`→wasm compiler *and* the RV32 machine — loaded from jsDelivr at a
+pinned commit (`BW_BOARD_PIN` in `docs/index.html`); it is the same wasm the
+hosted target runs. `scripts/check-pages.js` exercises the whole client-side path
+(compile → run → the program's output) in a real browser.
+
 The 8051 targets compile `-mmcs51 --std-c99`; adding a part is three lines in
 `TARGETS` in [`app.py`](app.py). **For a pseudocode program the `DEVICE` line
 selects these limits**, not the request's `target` field — so an image that
