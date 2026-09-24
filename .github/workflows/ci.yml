@@ -64,8 +64,26 @@ jobs:
       # The script leaves cc1/cc1plus/lto1 xz-compressed, as committed (the
       # 225 MB Vercel limit); every check below executes or inspects them, so
       # they are decompressed in place first, exactly as stage_avr() does.
+      # The committed bundle must be what the script builds, or CI is testing a
+      # different toolchain from the one that deploys. Until 2026-09-24 it was
+      # not: iotn88.h and libattiny88.a had been added by hand from another
+      # avr-libc (same code, different metadata). Everything is compared byte
+      # for byte except the three .xz files, whose bytes depend on the local
+      # liblzma; those are compared DECOMPRESSED, after the next step.
+      - name: The rebuilt bundle is the committed bundle
+        run: git diff --exit-code --stat -- avr vendor/avr ':(exclude)*.xz'
+
       - name: Decompress the compilers, as staging does
         run: python3 bundle_xz.py materialize avr
+
+      - name: The committed compressed compilers decompress to the rebuilt ones
+        run: |
+          set -euo pipefail
+          d="avr/lib/gcc/avr/$(cat avr/GCC_VERSION)"
+          for prog in cc1 cc1plus lto1; do
+            git show "HEAD:$d/$prog.xz" | xz -dc | cmp - "$d/$prog"
+            echo "  $prog: committed .xz == rebuilt"
+          done
 
       # Where the toolchain ACTUALLY looks, printed before anything asserts.
       # Debian bakes absolute paths into gcc and relocates them relative to
