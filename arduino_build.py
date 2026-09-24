@@ -125,6 +125,12 @@ ASM_FLAGS = ["-x", "assembler-with-cpp"]
 SOURCE_EXTS = (".c", ".cpp", ".S")
 
 
+# A library the ATmegas have under one name and ATTinyCore under another.
+# Sketches written for an Uno say <Servo.h>; on an ATtiny the working one is
+# ATTinyCore's Servo_ATTinyCore (the stock Servo needs ATmega timers).
+TINY_EQUIVALENTS = {"Servo.h": "Servo_ATTinyCore.h"}
+
+
 class ArduinoBuildError(Exception):
     """A failed step, with what the tools said. `stage` is compile or link."""
 
@@ -506,15 +512,19 @@ def available_libraries(spec: dict) -> dict[str, str]:
     `#include` names -- as the IDE's library discovery keys them."""
     _, _, libs = core_dirs(spec)
     out = {}
-    if not os.path.isdir(libs):
-        return out
-    for lib in sorted(os.listdir(libs)):
-        src = os.path.join(libs, lib, "src")
-        if not os.path.isdir(src):
+    # The core's own libraries first, then the architecture-independent ones
+    # both cores share: a core's Servo.h (ATTinyCore ships its own) wins over
+    # anything common, exactly as a platform library outranks a user one.
+    for root in (libs, os.path.join(CORE_ROOT, "libraries", "common")):
+        if not os.path.isdir(root):
             continue
-        for f in sorted(os.listdir(src)):
-            if f.endswith(".h"):
-                out.setdefault(f, src)
+        for lib in sorted(os.listdir(root)):
+            src = os.path.join(root, lib, "src")
+            if not os.path.isdir(src):
+                continue
+            for f in sorted(os.listdir(src)):
+                if f.endswith(".h"):
+                    out.setdefault(f, src)
     return out
 
 
@@ -642,6 +652,32 @@ _TOOL_PATH_RE = re.compile(
     r"[^\s:'`]*/(ld|as|collect2|cc1plus|cc1|lto1|lto-wrapper|avr-gcc)(?=:)")
 
 
+def _core_archive(gcc: str, objects: list[str], env: dict, timeout: int) -> str:
+    """The core's objects as an archive, next to them in the cache, made once.
+
+    The IDE links the core as core.a, and that is not a detail: from an
+    archive the linker takes a member only when something references it. Tone.o
+    defines a timer ISR; linked as a plain object it is ALWAYS in the image,
+    so any library that uses the same timer (ATTinyCore's Servo; on an Uno,
+    IRremote or MsTimer2) failed with "multiple definition of __vector_N" --
+    measured -- and every image carried the core's unused interrupt handlers.
+    The members are LTO objects, so the archive needs the LTO plugin's symbol
+    table; `ar` and the plugin are asked of the driver, not assumed."""
+    archive = os.path.join(os.path.dirname(objects[0]), "core.a")
+    if os.path.exists(archive):
+        return archive
+    ask = lambda flag: subprocess.run([gcc, flag], capture_output=True, text=True,
+                                      timeout=10, env=env).stdout.strip()
+    ar, plugin = ask("-print-prog-name=ar"), ask("-print-file-name=liblto_plugin.so")
+    tmp = f"{archive}.{uuid.uuid4().hex}"
+    r = subprocess.run([ar, "rcs", "--plugin", plugin, tmp, *objects],
+                       capture_output=True, text=True, timeout=timeout, env=env)
+    if r.returncode != 0:
+        raise ArduinoBuildError("could not archive the core", log=(r.stdout or "") + (r.stderr or ""))
+    os.replace(tmp, archive)
+    return archive
+
+
 def _clean(log: str, work: str) -> str:
     """Tool output with the server's paths taken out: the sketch is named by
     its own filename, the core and libraries by where they live in the core,
@@ -687,9 +723,12 @@ def build(code: str, spec: dict, *, bin_dir: str, env: dict,
         defines_main = any(fn["name"] == "main" for fn in find_function_definitions(code))
         core_sources = [s for s in _sources(core_dir, False)
                         if not (defines_main and os.path.basename(s) == "main.cpp")]
-        objects = _cached_objects(
+        core_objects = _cached_objects(
             gcc, "core" + ("-nomain" if defines_main else ""), core_sources,
             spec, f_cpu, [core_dir, variant_dir], dflags, env, timeout)
+        core_archive = _core_archive(gcc, core_objects, env, timeout)
+        # Libraries link as objects, the core as an archive -- the IDE's split.
+        objects = []
         for lib in libs:
             objects += _cached_objects(
                 gcc, "library " + os.path.basename(os.path.dirname(lib)),
@@ -727,6 +766,9 @@ def build(code: str, spec: dict, *, bin_dir: str, env: dict,
                 log += (f"\n{missing.group(1)} is not part of the {spec['core']} "
                         f"core or its bundled libraries ({', '.join(have)}); "
                         "other libraries are not available on this service.")
+                instead = TINY_EQUIVALENTS.get(missing.group(1)) if spec["core"] == "tiny" else None
+                if instead:
+                    log += f"\nOn the ATtinys, use #include <{instead}> instead."
             raise ArduinoBuildError(log.strip() or "sketch compilation failed", log)
 
         elf = os.path.join(work, f"{stem}.elf")
@@ -734,7 +776,7 @@ def build(code: str, spec: dict, *, bin_dir: str, env: dict,
             r = subprocess.run(
                 [gcc, f"-mmcu={spec['mcu']}", "-Os", "-gdwarf-2" if symbols else "-g", "-flto",
                  "-fuse-linker-plugin", "-Wl,--gc-sections", "-w",
-                 "-o", elf, sketch_obj, *objects, "-lm"],
+                 "-o", elf, sketch_obj, *objects, core_archive, "-lm"],
                 capture_output=True, text=True, timeout=timeout, env=env)
         except subprocess.TimeoutExpired:
             raise ArduinoBuildError(f"link timed out after {timeout}s", stage="link")

@@ -227,10 +227,50 @@ def test_ordering_cases_the_ide_gets_wrong_still_compile():
 
 
 def test_an_unbundled_library_says_so():
-    r = compile_sketch("#include <Servo.h>\nvoid setup() {}\nvoid loop() {}\n")
+    r = compile_sketch("#include <IRremote.h>\nvoid setup() {}\nvoid loop() {}\n")
     assert not r["success"]
-    assert "Servo.h" in r["error"] and "not available" in r["error"]
-    assert "Wire" in r["error"]  # names what IS there
+    assert "IRremote.h" in r["error"] and "not available" in r["error"]
+    assert "Wire" in r["error"] and "Servo" in r["error"]  # names what IS there
+
+
+def test_servo_h_on_an_attiny_names_the_one_that_works():
+    r = compile_sketch("#include <Servo.h>\nvoid setup() {}\nvoid loop() {}\n", "attiny85")
+    assert not r["success"] and "Servo_ATTinyCore.h" in r["error"]
+
+
+@pytest.mark.parametrize("header,body,targets", [
+    ("Servo.h", "Servo s;\nvoid setup() { s.attach(9); s.write(90); }",
+     ["arduino-uno", "arduino-nano", "arduino-mega", "atmega168p"]),
+    ("Servo_ATTinyCore.h", "Servo s;\nvoid setup() { s.attach(1); s.write(90); }",
+     ["attiny85", "attiny88"]),
+    ("LiquidCrystal.h", "LiquidCrystal lcd(7, 8, 9, 10, 11, 12);\n"
+     "void setup() { lcd.begin(16, 2); lcd.print(\"hi\"); }",
+     ["arduino-uno", "arduino-mega", "attiny85", "attiny88"]),
+    ("Adafruit_NeoPixel.h", "Adafruit_NeoPixel px(8, 1, NEO_GRB + NEO_KHZ800);\n"
+     "void setup() { px.begin(); px.setPixelColor(0, px.Color(255, 0, 0)); px.show(); }",
+     ["arduino-uno", "arduino-mega", "attiny85", "attiny88"]),
+    ("tinyNeoPixel.h", "tinyNeoPixel px(8, 3, NEO_GRB + NEO_KHZ800);\nvoid setup() { px.begin(); px.show(); }",
+     ["attiny85", "attiny88"]),
+])
+def test_the_added_libraries_build(header, body, targets):
+    for target in targets:
+        r = compile_sketch(f"#include <{header}>\n{body}\nvoid loop() {{}}\n", target)
+        assert r["success"], f"{header} on {target}: {r.get('error')}"
+        assert header[:-2] in r["libraries"]
+
+
+def test_the_core_links_as_an_archive_so_an_unused_isr_stays_out():
+    # Linked as plain objects, Tone.o's timer ISR was always in the image and
+    # collided with ATTinyCore's Servo on the same timer ("multiple definition
+    # of __vector_3"). From core.a it is pulled only by a sketch that tones.
+    servo = "#include <Servo_ATTinyCore.h>\nServo s;\nvoid setup() { s.attach(1); }\nvoid loop() {}\n"
+    assert compile_sketch(servo, "attiny85")["success"]
+    # ... and a sketch that DOES use tone() still gets Tone.o.
+    tone = "void setup() { tone(3, 440); }\nvoid loop() {}\n"
+    r = compile_sketch(tone, "arduino-uno", disassemble=True)
+    assert r["success"] and "__vector_7" in r["disassembly"]      # TIMER2_COMPA, Tone's ISR
+    plain = compile_sketch("void setup() {}\nvoid loop() {}\n", "arduino-uno", disassemble=True)
+    assert "__vector_7" not in plain["disassembly"]
 
 
 def test_a_missing_loop_is_explained():

@@ -1,5 +1,8 @@
 ArduinoCore-avr  https://github.com/arduino/ArduinoCore-avr  86df345b3cf46754a5db38fb983ec2808ce31303  (1.8.8)
 ATTinyCore       https://github.com/SpenceKonde/ATTinyCore  9e7024945b3a873fbb2f482d88625c4d2524ba92  (master)
+Servo            https://github.com/arduino-libraries/Servo  2862ad9864d0dda5669b264857deafbba624940d  (1.3.0)
+LiquidCrystal    https://github.com/arduino-libraries/LiquidCrystal  a89b4d46b28878557670440f2c35385c19307b69  (1.0.7)
+Adafruit_NeoPixel https://github.com/adafruit/Adafruit_NeoPixel  d514fc3beae85dd4c2b19781b93faa47bd6e996f  (1.15.5)
 
-Both LGPL-2.1-or-later. Regenerate with scripts/fetch-arduino-core.sh; do not
+LGPL (2.1-or-later; Adafruit_NeoPixel LGPL-3.0). Regenerate with scripts/fetch-arduino-core.sh; do not
 hand-edit files under this directory.
