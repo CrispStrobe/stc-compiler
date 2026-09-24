@@ -872,16 +872,12 @@ def build_arduino(req: CompileReq, spec: dict, stem: str = "main",
         out = arduino_build.build(
             req.code, spec, bin_dir=bin_dir, env=env, f_cpu=f_cpu,
             defines=req.defines, fmt=req.format, stem=stem,
-            timeout=COMPILE_TIMEOUT, disassemble=req.disassemble)
+            timeout=COMPILE_TIMEOUT, disassemble=req.disassemble,
+            symbols=req.symbols)
     except arduino_build.ArduinoBuildError as exc:
         return {"success": False, "error": str(exc), "log": exc.log or str(exc),
                 "stage": exc.stage, "c": generated}
     out["c"] = generated
-    if req.symbols:
-        # avr_symtab reads the scheduler the pseudocode emitters write; a
-        # hand-written sketch has no such structure to map.
-        out["symbols_error"] = ("a sketch has no scheduler to map; symbols "
-                                "are produced for pseudocode AVR builds")
     return out
 
 

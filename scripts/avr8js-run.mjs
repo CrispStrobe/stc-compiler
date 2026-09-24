@@ -13,7 +13,11 @@ import fs from 'fs';
 const require = createRequire(import.meta.url);
 const avr = require('avr8js');
 
-const [hexPath, mcu, msArg, clockArg] = process.argv.slice(2);
+const [hexPath, mcu, msArg, clockArg, peekArg] = process.argv.slice(2);
+// Optional "addr:size,addr:size" -- SRAM (data-space) bytes to report after
+// the run, little-endian, so a symbol table's addresses can be checked
+// against the running program rather than taken on trust.
+const peeks = (peekArg || '').split(',').filter(Boolean).map(p => p.split(':').map(Number));
 const ms = Number(msArg);
 const clockHz = Number(clockArg || 16e6);
 // Flash in 16-bit words: 32 KB (ATmega328P/168P) or 256 KB (ATmega2560).
@@ -82,4 +86,9 @@ while (cpu.cycles < end) {
     avr.avrInstruction(cpu);
     cpu.tick();
 }
-process.stdout.write(JSON.stringify({serial, toggles, cycles: cpu.cycles}) + '\n');
+const peeked = peeks.map(([addr, size]) => {
+    let v = 0;
+    for (let i = size - 1; i >= 0; i--) v = v * 256 + cpu.data[addr + i];
+    return v;
+});
+process.stdout.write(JSON.stringify({serial, toggles, cycles: cpu.cycles, peeked}) + '\n');
