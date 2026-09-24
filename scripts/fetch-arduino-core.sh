@@ -50,7 +50,16 @@ NEOPIXEL_REPO="adafruit/Adafruit_NeoPixel"
 NEOPIXEL_SHA="d514fc3beae85dd4c2b19781b93faa47bd6e996f"       # 1.15.5
 NEOPIXEL_SHA256="a149a7a81cbb32d3917bebe4d63d8e50043ea11dd7e94682905b1720de314487"
 
-AVR_VARIANTS="standard eightanaloginputs mega"
+# The Arduboy (ATmega32U4, the Leonardo's chip): its library and its tone
+# player. Both permissive -- Arduboy2 BSD-3-Clause, ArduboyTones MIT.
+ARDUBOY2_REPO="MLXXXp/Arduboy2"
+ARDUBOY2_SHA="7dc88bed3031ab01d3227d065123740e4d938093"       # 6.0.0
+ARDUBOY2_SHA256="e5986d624031f1e2eceaf410d8b2dcd6c80cd623867aa9f6a97fdcd9bcd21dd6"
+TONES_REPO="MLXXXp/ArduboyTones"
+TONES_SHA="972fe8117002da47073b6c1835117d654a03e16f"          # 1.0.3
+TONES_SHA256="a43779d1f435ed6a56971c12aaf323151f6bfa8856d194c8e37f5b3dd03abb6e"
+
+AVR_VARIANTS="standard eightanaloginputs mega leonardo"
 AVR_LIBRARIES="EEPROM SPI Wire SoftwareSerial"
 TINY_VARIANTS="tinyx5 tinyx8"
 TINY_LIBRARIES="EEPROM SPI Wire SoftwareSerial Servo_ATTinyCore tinyNeoPixel"
@@ -94,6 +103,8 @@ fetch "$TINY_CORE_REPO" "$TINY_CORE_SHA" "$TINY_CORE_SHA256" "$WORK/tiny"
 fetch "$SERVO_REPO" "$SERVO_SHA" "$SERVO_SHA256" "$WORK/servo"
 fetch "$LCD_REPO" "$LCD_SHA" "$LCD_SHA256" "$WORK/lcd"
 fetch "$NEOPIXEL_REPO" "$NEOPIXEL_SHA" "$NEOPIXEL_SHA256" "$WORK/neopixel"
+fetch "$ARDUBOY2_REPO" "$ARDUBOY2_SHA" "$ARDUBOY2_SHA256" "$WORK/arduboy2"
+fetch "$TONES_REPO" "$TONES_SHA" "$TONES_SHA256" "$WORK/tones"
 
 say "Assembling arduino-core/ ..."
 # LICENSE.md is ATTinyCore's (the full LGPL-2.1 text); ArduinoCore-avr ships
@@ -135,12 +146,19 @@ cp "$WORK/neopixel/Adafruit_NeoPixel.h" "$WORK/neopixel/Adafruit_NeoPixel.cpp" \
 cp "$WORK/neopixel/library.properties" "$WORK/neopixel/COPYING" \
    "$ROOT/arduino-core/libraries/common/Adafruit_NeoPixel/" 2>/dev/null || true
 
+copy_lib "$WORK/arduboy2" "$ROOT/arduino-core/libraries/arduino/Arduboy2"
+cp "$WORK/arduboy2/LICENSE.txt" "$ROOT/arduino-core/libraries/arduino/Arduboy2/"
+copy_lib "$WORK/tones" "$ROOT/arduino-core/libraries/arduino/ArduboyTones"
+cp "$WORK/tones/LICENSE.txt" "$ROOT/arduino-core/libraries/arduino/ArduboyTones/" 2>/dev/null || true
+
 cat > "$ROOT/arduino-core/VERSION" <<EOF
 ArduinoCore-avr  https://github.com/${AVR_CORE_REPO}  ${AVR_CORE_SHA}  (1.8.8)
 ATTinyCore       https://github.com/${TINY_CORE_REPO}  ${TINY_CORE_SHA}  (master)
 Servo            https://github.com/${SERVO_REPO}  ${SERVO_SHA}  (1.3.0)
 LiquidCrystal    https://github.com/${LCD_REPO}  ${LCD_SHA}  (1.0.7)
 Adafruit_NeoPixel https://github.com/${NEOPIXEL_REPO}  ${NEOPIXEL_SHA}  (1.15.5)
+Arduboy2         https://github.com/${ARDUBOY2_REPO}  ${ARDUBOY2_SHA}  (6.0.0, BSD-3-Clause)
+ArduboyTones     https://github.com/${TONES_REPO}  ${TONES_SHA}  (1.0.3, MIT)
 
 LGPL (2.1-or-later; Adafruit_NeoPixel LGPL-3.0). Regenerate with scripts/fetch-arduino-core.sh; do not
 hand-edit files under this directory.

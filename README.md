@@ -367,6 +367,7 @@ source the Arduino IDE uses, vendored in `arduino-core/` by
 | `arduino-nano` | ArduinoCore-avr 1.8.8 | `eightanaloginputs` (adds A6/A7) |
 | `atmega168p` | ArduinoCore-avr 1.8.8 | `standard` |
 | `arduino-mega`, `atmega2560` | ArduinoCore-avr 1.8.8 | `mega` |
+| `arduboy` | ArduinoCore-avr 1.8.8 + Arduboy2 6.0.0 | `leonardo` (ATmega32U4, 28 KB for the sketch) |
 | `attiny85`, `attiny88` | ATTinyCore (2.0 line) | `tinyx5`, `tinyx8` |
 
 The pipeline is the IDE's ([`arduino_build.py`](arduino_build.py)): the sketch
@@ -378,8 +379,9 @@ instance compiles only the sketch, and linked as an archive (`core.a`) as the
 IDE does, so a core object such as Tone's timer interrupt is only in the image
 when the sketch uses it. An `#include` pulls in a library: the core's own
 (`Wire.h`, `SPI.h`, `EEPROM.h`, `SoftwareSerial.h`), `Servo.h` (on the ATtinys
-`Servo_ATTinyCore.h`), `LiquidCrystal.h`, `Adafruit_NeoPixel.h`, and on the
-ATtinys also `tinyNeoPixel.h`. `F_CPU`
+`Servo_ATTinyCore.h`), `LiquidCrystal.h`, `Adafruit_NeoPixel.h`, on the
+ATtinys also `tinyNeoPixel.h`, and for the Arduboy `Arduboy2.h` and
+`ArduboyTones.h`. `F_CPU`
 is the board's (16 MHz, 8 MHz for the ATtinys) unless `fosc` is given. The
 response adds `prototypes` (what was declared for you), `libraries`,
 `variant` and `board`.

@@ -90,6 +90,18 @@ BOARDS = {
         "board": "AVR_MEGA2560", "default_clock": 16000000, "flash": 262144,
         "description": "Arduino Mega 2560 — ArduinoCore-avr",
     },
+    # The Arduboy: an ATmega32U4 (the Leonardo's chip, and its variant) with
+    # the defines the official Arduboy board package passes -- ARDUBOY_10
+    # selects the production hardware in Arduboy2, and the 32U4's core USB
+    # code will not build without a VID/PID. 28 KB of flash: the bootloader
+    # keeps the top 4 KB.
+    "arduboy": {
+        "mcu": "atmega32u4", "core": "arduino", "variant": "leonardo",
+        "board": "AVR_ARDUBOY", "default_clock": 16000000, "flash": 28672,
+        "defines": ["-DARDUBOY_10", "-DUSB_VID=0x2341", "-DUSB_PID=0x8036",
+                    '-DUSB_MANUFACTURER="Unknown"', '-DUSB_PRODUCT="Arduboy"'],
+        "description": "Arduboy — ATmega32U4, Arduboy2 library, ArduinoCore-avr",
+    },
     "attiny85": {
         "mcu": "attiny85", "core": "tiny", "variant": "tinyx5",
         "board": "AVR_ATTINYX5", "default_clock": 8000000, "flash": 8192,
@@ -565,7 +577,7 @@ def _flags_for(path: str, spec: dict, f_cpu: int, includes: list[str],
     base = [f"-mmcu={spec['mcu']}", *COMMON_FLAGS,
             f"-DF_CPU={int(f_cpu)}L", f"-DARDUINO={ARDUINO_VERSION}",
             f"-DARDUINO_{spec['board']}", "-DARDUINO_ARCH_AVR",
-            *cf["defines"], *defines, *warnings,
+            *cf["defines"], *spec.get("defines", []), *defines, *warnings,
             *[f"-I{d}" for d in includes]]
     if path.endswith(".cpp"):
         return base + [f"-std={cf['cxx_std']}", *CXX_FLAGS, "-x", "c++"]
@@ -619,7 +631,8 @@ def _cached_objects(gcc: str, name: str, sources: list[str], spec: dict,
     # each other's objects -- measured, an error named a deleted checkout.
     key = hashlib.sha256(repr((
         FLAGS_VERSION, CORE_ROOT, core_version, name, spec["mcu"], spec["core"],
-        spec["variant"], spec["board"], int(f_cpu), sorted(defines),
+        spec["variant"], spec["board"], tuple(spec.get("defines", [])),
+        int(f_cpu), sorted(defines),
         gcc)).encode()).hexdigest()[:24]
     final = os.path.join(CACHE_ROOT, key)
     done = os.path.join(final, ".complete")
