@@ -26,9 +26,12 @@ import stc_disasm
 import stc_pseudocode
 import stc_symtab
 
-from fastapi import FastAPI
+import collections
+import threading
+import time as _time
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -296,6 +299,79 @@ app = FastAPI(title="stc-compiler", docs_url="/docs")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
+
+# ---- Compile-endpoint abuse guard -------------------------------------------
+# The compile endpoints hand untrusted source to real compilers, which is CPU
+# heavy. This is a BEST-EFFORT, PER-INSTANCE guard: Vercel runs many stateless
+# instances, so it bounds a single instance's exposure (per-IP burst + on-box
+# concurrency), not a global quota — a true global limit needs external state.
+# It is deliberately generous; it exists to stop a runaway loop or one client
+# monopolising an instance, not to meter normal use. Compiles are also already
+# wall-clock-bounded (COMPILE_TIMEOUT) and the toolchains never RUN user code.
+_RL_WINDOW_S = 60
+_RL_MAX_PER_IP = 40          # requests per IP per window, per instance
+_RL_MAX_INFLIGHT = 6         # concurrent compiles on this instance
+_rl_lock = threading.Lock()
+_rl_hits: "dict[str, list[float]]" = collections.defaultdict(list)
+_rl_inflight = 0
+
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "?"
+
+
+def _rate_ok(request: Request) -> bool:
+    """True if this IP is under its per-window budget (and records the hit)."""
+    ip = _client_ip(request)
+    now = _time.monotonic()
+    cutoff = now - _RL_WINDOW_S
+    with _rl_lock:
+        hits = _rl_hits[ip]
+        hits[:] = [t for t in hits if t > cutoff]
+        if len(hits) >= _RL_MAX_PER_IP:
+            return False
+        hits.append(now)
+        if len(_rl_hits) > 4096:   # bound memory: drop idle IPs
+            for k in [k for k, v in list(_rl_hits.items()) if not v or v[-1] <= cutoff]:
+                _rl_hits.pop(k, None)
+        return True
+
+
+def _slot_acquire() -> bool:
+    global _rl_inflight
+    with _rl_lock:
+        if _rl_inflight >= _RL_MAX_INFLIGHT:
+            return False
+        _rl_inflight += 1
+        return True
+
+
+def _slot_release() -> None:
+    global _rl_inflight
+    with _rl_lock:
+        _rl_inflight = max(0, _rl_inflight - 1)
+
+
+def _guarded_build(req: "CompileReq", request: Request):
+    """Rate-limit + concurrency-cap around build(); shared by /compile."""
+    if not _rate_ok(request):
+        return JSONResponse(
+            {"success": False, "stage": "rate-limit",
+             "error": f"Too many requests. The limit is {_RL_MAX_PER_IP} per minute; "
+                      "please slow down."},
+            status_code=429)
+    if not _slot_acquire():
+        return JSONResponse(
+            {"success": False, "stage": "busy",
+             "error": "The compiler is busy right now — retry in a moment."},
+            status_code=503)
+    try:
+        return build(req)
+    finally:
+        _slot_release()
 
 
 def stage_toolchain():
@@ -1769,9 +1845,18 @@ def build(req: CompileReq) -> dict:
 
 
 @app.post("/compile")
-async def compile_source(req: CompileReq):
-    """Compile and return the image base64-encoded inside JSON."""
-    return build(req)
+async def compile_source(req: CompileReq, request: Request = None):
+    """Compile and return the image base64-encoded inside JSON.
+
+    Over HTTP this is behind a best-effort per-instance rate limit + concurrency
+    cap (see _guarded_build): the endpoint hands untrusted source to real
+    compilers. FastAPI always injects the live Request for an HTTP call; a
+    DIRECT in-process call (tests, the CI service job) passes no request and is
+    trusted — it skips the guard and compiles straight away.
+    """
+    if request is None:
+        return build(req)
+    return _guarded_build(req, request)
 
 
 class DisassembleReq(BaseModel):
@@ -2555,6 +2640,24 @@ async def health():
         except Exception:  # noqa: BLE001
             cc65_version = ""
 
+    # RISC-V — both routes, reported like the others (never fails the check).
+    # shecc runs as wasm under wasmtime; the full-C target is a native bundle
+    # probed the same way as ARM/AVR.
+    riscv_wasm_ok = riscv_cc.available()
+    riscv_gcc_bin = stage_riscv_gcc()
+    riscv_gcc_version = ""
+    if riscv_gcc_bin:
+        try:
+            deps = os.path.join(os.path.dirname(riscv_gcc_bin), "lib-deps")
+            henv = dict(os.environ)
+            if os.path.isdir(deps):
+                henv["LD_LIBRARY_PATH"] = deps + os.pathsep + henv.get("LD_LIBRARY_PATH", "")
+            riscv_gcc_version = subprocess.run(
+                [os.path.join(riscv_gcc_bin, "riscv64-unknown-elf-gcc"), "--version"],
+                capture_output=True, text=True, timeout=10, env=henv).stdout
+        except Exception:  # noqa: BLE001 - absence is reported, not raised
+            riscv_gcc_version = ""
+
     return {
         "ok": True,
         "version": os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7] or "unknown",
@@ -2562,6 +2665,8 @@ async def health():
         "avr_gcc": avr_version.strip().splitlines()[0] if avr_version else None,
         "arm_gcc": arm_version.strip().splitlines()[0] if arm_version else None,
         "cc65": cc65_version.strip().splitlines()[0] if cc65_version else None,
+        "riscv_gcc": riscv_gcc_version.strip().splitlines()[0] if riscv_gcc_version else None,
+        "riscv_wasm": "shecc (wasm)" if riscv_wasm_ok else None,
         "targets": {name: cfg["description"] for name, cfg in TARGETS.items()},
         "avr_targets": ({name: cfg["description"] for name, cfg in AVR_TARGETS.items()}
                         if avr_bin else {}),
@@ -2570,6 +2675,7 @@ async def health():
                             if avr_bin and os.path.isdir(SRC_ARDUINO_CORE) else {}),
         "arm_targets": ({name: cfg["description"] for name, cfg in ARM_TARGETS.items()}
                         if arm_bin else {}),
+        "riscv_targets": {name: cfg["description"] for name, cfg in RISCV_TARGETS.items()},
         "devices": sorted(stc_pseudocode.TARGETS),
         "assemble_targets": sorted(ASSEMBLE_TARGETS.keys()),
     }
