@@ -254,19 +254,25 @@ jobs:
           fi
 
       # The budget above counts four toolchain directories; Vercel counts the
-      # whole deployment, Python dependencies included, against a hard 225 MB.
-      # Measured 2026-09-24: 171.67 MB of tracked files deployed as 235.56 MB
-      # and was REFUSED, so everything else costs ~63.9 MB and tracked files
-      # must stay under ~161 MB. With cc1/cc1plus/lto1 committed as .xz
-      # (bundle_xz.py) they are ~147.5 MB, and that deploys.
+      # whole deployment against a hard 225 MB: tracked files + the installed
+      # Python dependencies + a fixed runtime overhead. Calibrated from two
+      # real deploys on 2026-09-24: 171.67 MB tracked + 47.43 MB of deps was
+      # REFUSED at 235.56 MB, so the overhead is ~16.5 MB and tracked + deps
+      # must stay under ~208.5 MB. Measuring the deps (not assuming them) is
+      # what makes a requirements.txt bump -- wasmtime alone is 32 MB -- trip
+      # this instead of a deploy.
       - name: The whole deployment fits Vercel's 225 MB function limit
         run: |
           set -euo pipefail
-          bytes=$(git ls-files -z | xargs -0 stat -c '%s %F' | awk '$2=="regular"{s+=$1} END{print s}')
-          mb=$((bytes/1000000))
-          echo "tracked files: ${mb} MB (limit 155; Vercel refuses above ~161)"
-          if [ "$mb" -gt 155 ]; then
-            echo "::error::tracked files are ${mb} MB; with ~64 MB of Python dependencies the deployment would exceed Vercel's 225 MB. Compress a binary with bundle_xz.py or trim a bundle."
+          tracked=$(git ls-files -z | xargs -0 stat -c '%s %F' | awk '$2=="regular"{s+=$1} END{print s}')
+          python3 -m pip install -q --target /tmp/deploy-deps \
+            --platform manylinux2014_x86_64 --python-version 3.12 \
+            --only-binary=:all: -r requirements.txt
+          deps=$(du -sb /tmp/deploy-deps | cut -f1)
+          total=$(( (tracked + deps) / 1000000 ))
+          echo "tracked $((tracked/1000000)) MB + python deps $((deps/1000000)) MB = ${total} MB (limit 203; Vercel refuses above ~208)"
+          if [ "$total" -gt 203 ]; then
+            echo "::error::tracked files + python deps are ${total} MB; with ~16.5 MB of runtime overhead the deployment would exceed Vercel's 225 MB. Compress a binary with bundle_xz.py, trim a bundle, or drop a dependency."
             exit 1
           fi
 
