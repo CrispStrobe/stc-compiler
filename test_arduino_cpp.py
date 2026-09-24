@@ -77,10 +77,30 @@ def test_templates_are_left_to_the_user():
     assert protos(code) == ["void setup();", "void loop();"]
 
 
-def test_a_type_defined_after_the_insertion_point_is_not_prototyped():
-    code = ("void setup() {}\nvoid loop() {}\n"
-            "struct Point { int x; };\nvoid show(Point p) {}\n")
-    assert protos(code) == ["void setup();", "void loop();"]
+def test_a_prototype_naming_a_later_type_goes_after_that_type():
+    # The IDE puts every prototype before the first function, so this one
+    # would name a type that does not exist yet. Here it waits for the type.
+    code = ("void setup() { show(p); }\nvoid loop() {}\n"
+            "struct Point { int x; } p;\nvoid show(Point q);\nvoid show(Point q) {}\n")
+    src, got = ab.prepare_sketch(code)
+    assert "void show(Point q);" in got
+    assert src.index("struct Point") < src.index("void show(Point q);\n#line")
+
+
+def test_a_class_calling_a_later_function_gets_its_prototype_first():
+    # An inline method is code: the prototypes must precede the class.
+    code = ("class Led {\n public:\n  void on() { report(1); }\n};\n"
+            "void setup() {}\nvoid loop() {}\nvoid report(int v) {}\n")
+    src, got = ab.prepare_sketch(code)
+    assert "void report(int v);" in got
+    assert src.index("void report(int v);") < src.index("class Led")
+    assert '#line 1 "sketch.ino"\nclass Led' in src
+
+
+def test_a_prototype_that_could_only_follow_its_function_is_dropped():
+    code = ("void setup() {}\nvoid loop() {}\nvoid show(struct Late *p) {}\n"
+            "struct Late { int x; };\n")
+    assert "void show(struct Late *p);" not in protos(code)
 
 
 def test_pointer_and_qualified_return_types():
@@ -184,6 +204,26 @@ def test_errors_name_the_sketch_line():
     assert not r["success"]
     assert "main.ino:4" in r["error"], r["error"]
     assert "/tmp" not in r["error"]
+
+
+def test_the_pages_own_starter_builds():
+    # The service's page offers this when "Arduino sketch" is chosen.
+    r = compile_sketch(app.ARDUINO_EXAMPLE, "arduino-uno")
+    assert r["success"], r.get("error")
+    assert "void report(unsigned long t);" in r["prototypes"]
+
+
+def test_ordering_cases_the_ide_gets_wrong_still_compile():
+    # Both fail with the IDE's placement (all prototypes before the class):
+    # report() has no declaration at the class, and show(Point) names a type
+    # that does not exist yet there.
+    code = ("class Led {\n public:\n  void on() { report(1); }\n};\nLed led;\n"
+            "void setup() { led.on(); }\nvoid loop() { tick(); }\n"
+            "void report(int v) { Serial.println(v); }\n"
+            "struct Point { int x; };\nPoint origin = {3};\n"
+            "void tick() { show(origin); }\nvoid show(Point q) { report(q.x); }\n")
+    r = compile_sketch(code)
+    assert r["success"], r.get("error")
 
 
 def test_an_unbundled_library_says_so():

@@ -2679,7 +2679,7 @@ PAGE = r"""<!doctype html>
       <option value=pseudocode>Pseudocode</option>
       <option value=c selected>C</option>
       <option value=keil>Keil C51</option>
-      <option value=arduino>Arduino (ATtiny)</option>
+      <option value=arduino>Arduino sketch (C++)</option>
     </select>
   </label>
   <label>target
@@ -2694,6 +2694,14 @@ PAGE = r"""<!doctype html>
       <optgroup label="AVR (avr-gcc)">
         <option value=atmega328p>ATmega328P &mdash; Uno / Nano</option>
         <option value=atmega168p>ATmega168P</option>
+        <option value=atmega2560>ATmega2560 &mdash; Mega</option>
+        <option value=attiny85>ATtiny85</option>
+        <option value=attiny88>ATtiny88</option>
+      </optgroup>
+      <optgroup label="Arduino boards (sketch)">
+        <option value=arduino-uno>Arduino Uno</option>
+        <option value=arduino-nano>Arduino Nano</option>
+        <option value=arduino-mega>Arduino Mega 2560</option>
       </optgroup>
     </select>
   </label>
@@ -2798,7 +2806,10 @@ $('go').onclick = async () => {
         code: $('code').value,
         language: $('language').value,
         target: $('target').value,
-        fosc: parseInt($('fosc').value, 10) || null,
+        // Omitted, not null, when the field is off: a sketch is built for
+        // its board's crystal unless a clock is SENT, and this field's
+        // default is the 8051's 11.0592 MHz.
+        fosc: $('fosc').disabled ? undefined : (parseInt($('fosc').value, 10) || null),
         format,
         disassemble: true,
       })
@@ -2926,7 +2937,8 @@ $('copy').onclick = async () => {
   setTimeout(() => { $('copy').textContent = previous; }, 1200);
 };
 
-const STARTERS = {c: $('code').value, pseudocode: __PSEUDO_EXAMPLE__};
+const STARTERS = {c: $('code').value, pseudocode: __PSEUDO_EXAMPLE__,
+                  arduino: __ARDUINO_EXAMPLE__, keil: $('code').value};
 let lastLanguage = $('language').value;
 $('language').onchange = () => {
   const next = $('language').value;
@@ -2935,7 +2947,11 @@ $('language').onchange = () => {
     $('code').value = STARTERS[next];
   }
   lastLanguage = next;
-  $('fosc').disabled = (next === 'pseudocode');   // pseudocode carries CLOCK
+  // pseudocode carries CLOCK; a sketch is built for its board's crystal.
+  $('fosc').disabled = (next === 'pseudocode' || next === 'arduino');
+  if (next === 'arduino' && !/^(arduino-|atmega|attiny)/.test($('target').value)) {
+    $('target').value = 'arduino-uno';
+  }
 };
 $('language').onchange();
 
@@ -2969,10 +2985,52 @@ $('code').addEventListener('keydown', event => {
 """
 
 
+# The page's starter for `language: "arduino"`: the C++ the C route could
+# never take -- a class, String, Serial -- so choosing the language shows why
+# it exists.
+ARDUINO_EXAMPLE = """\
+// An Arduino sketch: real C++ against the Arduino core.
+class Blinker {
+ public:
+  Blinker(uint8_t pin, unsigned long period) : pin_(pin), period_(period) {}
+  void begin() { pinMode(pin_, OUTPUT); }
+  void update() {
+    if (millis() - last_ >= period_) {
+      last_ = millis();
+      digitalWrite(pin_, !digitalRead(pin_));
+      report(last_);          // defined below: its prototype is generated
+    }
+  }
+ private:
+  uint8_t pin_;
+  unsigned long period_;
+  unsigned long last_ = 0;
+};
+
+Blinker led(LED_BUILTIN, 500);
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println(F("hello from C++"));
+  led.begin();
+}
+
+void loop() {
+  led.update();
+}
+
+void report(unsigned long t) {
+  Serial.println(String("toggled at ") + t + " ms");
+}
+"""
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     # RCDATA inside <textarea> tolerates a bare "<", but "&" would be read as
     # an entity -- and the example has "&=" in it. Escape properly.
     return (PAGE.replace("__EXAMPLE__", html.escape(EXAMPLE))
                 .replace("__PSEUDO_EXAMPLE__", json.dumps(stc_pseudocode.EXAMPLE))
+                .replace("__ARDUINO_EXAMPLE__",
+                         json.dumps(ARDUINO_EXAMPLE).replace("</", "<\\/"))
                 .replace("__ABOUT__", about_html()))

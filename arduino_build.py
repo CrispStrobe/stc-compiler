@@ -268,18 +268,67 @@ def _parse_header(header: str) -> dict | None:
     return {"name": name, "prototype": signature + ";", "signature": signature}
 
 
+_BODY_BEFORE_RE = re.compile(
+    r"\)\s*(?:(?:const|override|noexcept|final|mutable)\s*)*$")
+
+
+def _top_level_statements(masked: str) -> list[dict]:
+    """Each file-scope statement of the masked sketch: its [start, end) span
+    and whether it contains code -- a function body anywhere inside it, so a
+    class whose methods are defined inline counts, and an enum or an array
+    initialiser does not. A statement ends at a `;` at file scope, or at the
+    `}` closing a block that no `;` follows (a function, a namespace)."""
+    out = []
+    depth = paren = 0
+    start = None
+    code_inside = False
+    n = len(masked)
+    for i, c in enumerate(masked):
+        if start is None:
+            if c.isspace():
+                continue
+            start, code_inside = i, False
+        if c == "(":
+            paren += 1
+        elif c == ")":
+            paren -= 1
+        elif c == "{":
+            if _BODY_BEFORE_RE.search(masked[max(start, i - 120):i]):
+                code_inside = True
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0 and paren == 0:
+                j = i + 1
+                while j < n and masked[j] in " \t\r\n":
+                    j += 1
+                if j >= n or masked[j] != ";":
+                    out.append({"start": start, "end": i + 1, "code": code_inside})
+                    start = None
+        elif c == ";" and depth == 0 and paren == 0:
+            out.append({"start": start, "end": i + 1, "code": code_inside})
+            start = None
+    return out
+
+
 def prepare_sketch(code: str, filename: str = "sketch.ino") -> tuple[str, list[str]]:
     """The translation unit the compiler sees, and the prototypes it gained.
 
-    `Arduino.h` first, as the IDE does. Then the sketch up to its first
-    function definition, then the prototypes, then the rest -- each part
-    behind a `#line` so that a diagnostic in any of them names the sketch's
-    own line number.
+    `Arduino.h` first, as the IDE does, then the sketch with a prototype for
+    every free function it defines, each behind a `#line` so that a
+    diagnostic anywhere names the sketch's own line number.
 
-    A prototype whose signature names a type the sketch defines only LATER
-    than the insertion point would be an error the user did not write, so it
-    is left out; that function must then be defined before it is called,
-    which is the IDE's behaviour for the same sketch.
+    WHERE each prototype goes is the whole difficulty. The IDE puts them all
+    before the first function definition, which fails two ordinary sketches:
+    a class whose inline method calls a sketch function (the class comes
+    first, so the call has no declaration), and a function whose signature
+    names a struct defined further down (the prototype names a type that does
+    not exist yet). So each prototype goes as EARLY as it may: before the
+    first file-scope statement that contains code -- a class with inline
+    methods counts -- but never before the end of the definition of any type
+    its signature names. A prototype that could only land after its own
+    function adds nothing and is dropped; that function must be defined
+    before it is called, exactly as in plain C++.
     """
     defs = find_function_definitions(code)
     q = filename.replace("\\", "\\\\").replace('"', '\\"')
@@ -287,29 +336,43 @@ def prepare_sketch(code: str, filename: str = "sketch.ino") -> tuple[str, list[s
     if not defs:
         return head + code, []
 
-    insert_at = code.rfind("\n", 0, defs[0]["start"]) + 1
     masked = _mask(code)
-    late_types = set()
-    for m in _TYPE_DEF_RE.finditer(masked):
-        name = m.group(1) or m.group(2) or m.group(3)
-        if m.start() >= insert_at:
-            late_types.add(name)
+    stmts = _top_level_statements(masked)
+    line_start = lambda pos: code.rfind("\n", 0, pos) + 1
+    next_line = lambda pos: (code.find("\n", pos) + 1) or len(code)
 
+    first_code = next((st["start"] for st in stmts if st["code"]), defs[0]["start"])
+    base = line_start(min(first_code, defs[0]["start"]))
+
+    # Where each type the sketch defines stops being incomplete.
+    type_ready = {}
+    for st in stmts:
+        for m in _TYPE_DEF_RE.finditer(masked, st["start"], st["end"]):
+            name = m.group(1) or m.group(2) or m.group(3)
+            type_ready.setdefault(name, next_line(st["end"] - 1))
+
+    placed: dict[int, list[str]] = {}
     protos = []
     for fn in defs:
-        words = set(re.findall(r"[A-Za-z_]\w*", fn["signature"]))
-        if words & late_types:
+        if fn["prototype"] in protos:
             continue
-        if fn["prototype"] not in protos:
-            protos.append(fn["prototype"])
+        words = set(re.findall(r"[A-Za-z_]\w*", fn["signature"]))
+        pos = max([base] + [type_ready[w] for w in words if w in type_ready])
+        if pos > line_start(fn["start"]):
+            continue
+        placed.setdefault(pos, []).append(fn["prototype"])
+        protos.append(fn["prototype"])
 
-    line_no = code.count("\n", 0, insert_at) + 1
-    body = (code[:insert_at]
-            + ("" if not insert_at or code[insert_at - 1] == "\n" else "\n")
-            + "\n".join(protos) + "\n"
-            + f'#line {line_no} "{q}"\n'
-            + code[insert_at:])
-    return head + body, protos
+    body, cursor = [], 0
+    for pos in sorted(placed):
+        body.append(code[cursor:pos])
+        if pos and code[pos - 1] != "\n":
+            body.append("\n")
+        body.append("\n".join(placed[pos]) + "\n")
+        body.append(f'#line {code.count(chr(10), 0, pos) + 1} "{q}"\n')
+        cursor = pos
+    body.append(code[cursor:])
+    return head + "".join(body), protos
 
 
 def included_headers(code: str) -> list[str]:
