@@ -313,6 +313,17 @@ end** knows, which the service can **compile**, and which a browser can
 | `rp2040` | arm-none-eabi-gcc | Cortex-M0+, SRAM image (`pico-sram.ld`) |
 | `stm32f030` | arm-none-eabi-gcc | Cortex-M0, real flash image at `0x08000000` (`stm32f030-flash.ld`) |
 | `eater6502` | cc65 | 65C02, 32 KB ROM at `$8000` (`eater.cfg`) |
+| `riscv32` | shecc (as wasm) | RV32IM, ELF32 image for an emulated console — no native toolchain, no flashing |
+
+`riscv32` is the odd one out: it hosts no native compiler. It runs
+[shecc](https://github.com/sysprog21/shecc) — a small self-hosting C compiler
+with an RV32IM backend — as WebAssembly under `wasmtime` (`riscv_cc.py`), the
+*same* `riscv/riscv-cc.wasm` the browser page and the BrickWright RISC-V console
+use, so one artifact serves all three. shecc emits a Linux ELF32; the response
+carries the ELF (`base64`) plus an `image` of `{entry, segments}` (each segment
+base64) an emulated RV32 machine boots — there is no hardware to flash. It is a
+C *subset* (educational), not a full C compiler. See
+[`riscv/riscv-cc.PROVENANCE.md`](riscv/riscv-cc.PROVENANCE.md).
 
 The 8051 targets compile `-mmcs51 --std-c99`; adding a part is three lines in
 `TARGETS` in [`app.py`](app.py). **For a pseudocode program the `DEVICE` line

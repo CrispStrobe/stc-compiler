@@ -18,6 +18,7 @@ their own upstream licenses.
 | `avr/lib-deps/**`, `arm/lib-deps/**` | the shared libraries those compilers link (GMP, MPFR, MPC, zlib, …) | LGPL-3.0-or-later / zlib, as each upstream states |
 | `cc65/bin/**`, `cc65/lib/**`, `cc65/include/**`, `cc65/asminc/**` | [cc65](https://github.com/cc65/cc65) | **zlib** (Debian: BSD-3-zlib) |
 | `arduino-core/cores/tiny/**`, `arduino-core/variants/**` | [ATTinyCore](https://github.com/SpenceKonde/ATTinyCore) by Spence Konde | **LGPL-2.1** (see below) |
+| `riscv/riscv-cc.wasm` | [shecc](https://github.com/sysprog21/shecc) — RV32IM C compiler, built to `wasm32-wasi` | **BSD-2-Clause** |
 
 ### Provenance
 
@@ -30,6 +31,7 @@ source, in `vendor/<name>/`:
 | avr-gcc | Debian bullseye `gcc-avr`, `binutils-avr`, `avr-libc`, unmodified | `vendor/avr/VERSION` + three `.copyright` files |
 | arm-none-eabi | Debian bullseye `gcc-arm-none-eabi`, `binutils-arm-none-eabi`, unmodified | `vendor/arm/VERSION` + two `.copyright` files |
 | cc65 | **built from upstream source**, commit `547d923` — not a Debian package | `vendor/cc65/VERSION`, `vendor/cc65/LICENSE` |
+| shecc | **built from upstream source**, commit `362b94b`, cross-compiled to `wasm32-wasi` — byte-reproducible, see `riscv/riscv-cc.PROVENANCE.md` | `vendor/shecc/VERSION`, `vendor/shecc/LICENSE` |
 
 `scripts/fetch-sdcc.sh`, `scripts/fetch-avr-gcc.sh` and
 `scripts/fetch-arm-gcc.sh` reproduce the first three bundles exactly. The
@@ -42,6 +44,14 @@ so `vendor/cc65/VERSION` names the upstream commit instead of a `.deb`. Its
 licence carries no copyleft and no linking condition, but its third condition
 requires the notice to travel with a source distribution — which is what
 `vendor/cc65/LICENSE` is for.
+
+shecc is the same kind of exception, one step further: it was compiled *from
+source to WebAssembly* (`wasm32-wasi`), so `riscv/riscv-cc.wasm` is a build
+artifact, not a native bundle. `riscv/riscv-cc.PROVENANCE.md` pins the upstream
+commit, the wasi-sdk version and a byte-reproducible build; `vendor/shecc/LICENSE`
+carries its BSD-2-Clause notice, which the binary-redistribution condition
+requires to travel with the wasm. It runs under wasmtime, so no native RISC-V
+toolchain is hosted or staged.
 
 ## What the GPL does and does not reach here
 
