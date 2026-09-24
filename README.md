@@ -1080,7 +1080,7 @@ uf2.py                 binary -> UF2 container
 keil-shim/             our replacements for Keil-only headers
   generate-compat.py   REGENERATES keil-compat.h — never hand-edit that file
 bin/ share/            vendored SDCC        (~8 MB)
-avr/                   vendored avr-gcc, C and C++ (63 MB)
+avr/                   vendored avr-gcc, C and C++ (40 MB; cc1/cc1plus/lto1 as .xz, see bundle_xz.py)
 arm/                   vendored arm-none-eabi-gcc (43 MB)
 cc65/                  vendored cc65        (3.7 MB)
 arduino-core/          ArduinoCore-avr + ATTinyCore (LGPL, server-side only)

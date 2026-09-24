@@ -61,6 +61,12 @@ jobs:
       - name: Build the vendored bundle
         run: ./scripts/fetch-avr-gcc.sh
 
+      # The script leaves cc1/cc1plus/lto1 xz-compressed, as committed (the
+      # 225 MB Vercel limit); every check below executes or inspects them, so
+      # they are decompressed in place first, exactly as stage_avr() does.
+      - name: Decompress the compilers, as staging does
+        run: python3 bundle_xz.py materialize avr
+
       # Where the toolchain ACTUALLY looks, printed before anything asserts.
       # Debian bakes absolute paths into gcc and relocates them relative to
       # argv[0]; guessing which ones survive a move has cost two CI rounds
@@ -227,6 +233,23 @@ jobs:
           # not have ballooned (a lost --strip-debug, an extra multilib).
           if [ "$mb" -gt 170 ]; then
             echo "::error::toolchain bundles are ${mb} MB (>170); trim riscv-gcc"; exit 1
+          fi
+
+      # The budget above counts four toolchain directories; Vercel counts the
+      # whole deployment, Python dependencies included, against a hard 225 MB.
+      # Measured 2026-09-24: 171.67 MB of tracked files deployed as 235.56 MB
+      # and was REFUSED, so everything else costs ~63.9 MB and tracked files
+      # must stay under ~161 MB. With cc1/cc1plus/lto1 committed as .xz
+      # (bundle_xz.py) they are ~147.5 MB, and that deploys.
+      - name: The whole deployment fits Vercel's 225 MB function limit
+        run: |
+          set -euo pipefail
+          bytes=$(git ls-files -z | xargs -0 stat -c '%s %F' | awk '$2=="regular"{s+=$1} END{print s}')
+          mb=$((bytes/1000000))
+          echo "tracked files: ${mb} MB (limit 155; Vercel refuses above ~161)"
+          if [ "$mb" -gt 155 ]; then
+            echo "::error::tracked files are ${mb} MB; with ~64 MB of Python dependencies the deployment would exceed Vercel's 225 MB. Compress a binary with bundle_xz.py or trim a bundle."
+            exit 1
           fi
 
   # The pytest suite at the repository root: the dialect, every PART, the

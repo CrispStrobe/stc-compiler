@@ -373,3 +373,11 @@ echo
 #   docker run --rm -v "$PWD:/w" -w /w debian:bullseye-slim ./scripts/verify-avr.sh
 echo "Smoke test (must run on Linux x86_64):"
 echo "    ./scripts/verify-avr.sh"
+
+# LAST, after every check above has run on the plain binaries: the three
+# compilers proper go into git xz-compressed. Vercel refuses a function over
+# 225 MB in total, and with cc1plus and lto1 added for the Arduino route the
+# deployment measured 235.56 MB. stage_avr() decompresses them into /tmp on a
+# cold start (bundle_xz.py); CI runs `bundle_xz.py materialize avr` first.
+echo
+python3 "$ROOT/bundle_xz.py" compress "$DST" cc1 cc1plus lto1 | sed 's/^/    /'

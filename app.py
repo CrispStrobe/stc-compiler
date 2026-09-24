@@ -24,6 +24,7 @@ import keil2sdcc
 import riscv_cc
 import stc_disasm
 import arduino_build
+import bundle_xz
 import stc_pseudocode
 import stc_symtab
 
@@ -433,7 +434,9 @@ def _avr_stage_is_stale() -> bool:
         return False
     rel = os.path.join("lib", "gcc", "avr", version)
     try:
-        wanted = set(os.listdir(os.path.join(SRC_AVR, rel)))
+        # Committed compilers are .xz (bundle_xz.py); the stage holds them
+        # decompressed, so compare the names they materialize to.
+        wanted = bundle_xz.logical_names(os.listdir(os.path.join(SRC_AVR, rel)))
         have = set(os.listdir(os.path.join(AVR_STAGE, rel)))
     except OSError:
         return True
@@ -469,6 +472,10 @@ def stage_avr() -> str | None:
                     shutil.copytree(source, destination, symlinks=True)
                 elif os.path.isfile(source) and not os.path.exists(destination):
                     shutil.copy2(source, destination)
+            # cc1, cc1plus and lto1 are committed xz-compressed to fit
+            # Vercel's 225 MB function limit (bundle_xz.py); /tmp is where
+            # they become runnable.
+            bundle_xz.materialize(AVR_STAGE)
             # cc1, collect2, as and ld are all fork/exec'd and all lose the
             # executable bit on the way through Vercel's deployment.
             for sub in ("bin", os.path.join("lib", "avr", "bin"),
