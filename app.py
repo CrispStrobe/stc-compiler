@@ -21,6 +21,7 @@ import tempfile
 import uuid
 
 import keil2sdcc
+import riscv_cc
 import stc_disasm
 import stc_pseudocode
 import stc_symtab
@@ -254,6 +255,22 @@ EATER_TARGETS = {
     "eater6502": {
         "cpu": "65C02", "rom": 32768,
         "description": "EATER6502 — composable 6502 machine, 32 KB ROM at $8000",
+    },
+}
+
+# ---- RISC-V (RV32IM) compile target -----------------------------------------
+# Unlike the other toolchains this hosts no native compiler: it runs shecc
+# (github.com/sysprog21/shecc, BSD-2-Clause) as WebAssembly under wasmtime — the
+# same riscv/riscv-cc.wasm the browser page and the bw-board engine use, so one
+# artifact serves all three (see riscv/riscv-cc.PROVENANCE.md, riscv_cc.py).
+# shecc emits a Linux ELF32; the response carries the ELF and its {entry,
+# segments} image. The image is booted on an emulated RV32 machine (bw-board's
+# RiscV32Machine) — there is no hardware to flash — so its Linux ecall ABI
+# (a7=64 write, a7=93 exit) is what that machine services.
+RISCV_TARGETS = {
+    "riscv32": {
+        "mcu": "rv32im",
+        "description": "RISC-V RV32IM — emulated console (bw-board RiscV32Machine)",
     },
 }
 
@@ -1245,6 +1262,78 @@ def _fosc_from_source(code: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def build_riscv(req: CompileReq, spec: dict, generated_c: str | None,
+                stem: str = "main") -> dict:
+    """Compile C for RV32IM by running shecc as WebAssembly (see riscv_cc.py).
+
+    Same base response shape as the other toolchains — base64 image, filename,
+    bytes, log, memory — plus ``entry`` and an ``image`` of {entry, segments}
+    (each segment base64). The image is not a flashable HEX/binary: it is the
+    PT_LOAD picture an emulated RV32 machine boots, so there is no objcopy and
+    no symbol/disassembly path (shecc ships neither).
+    """
+    refusal = reject_path_options(req.options)
+    if refusal:
+        return refusal
+
+    if not riscv_cc.available():
+        return {"success": False, "stage": "compile",
+                "error": "no RISC-V compiler available; riscv/riscv-cc.wasm is "
+                         "not vendored in this deployment, or wasmtime is not "
+                         "installed",
+                "c": generated_c}
+
+    try:
+        ok, elf, log = riscv_cc.compile_c(req.code)
+    except riscv_cc.RiscvUnavailable as exc:
+        return {"success": False, "stage": "compile",
+                "error": f"the RISC-V compiler could not run: {exc}",
+                "c": generated_c}
+    if not ok:
+        return {"success": False, "stage": "compile", "error": log or "compilation failed",
+                "log": log, "c": generated_c}
+
+    try:
+        image = riscv_cc.elf32_to_image(elf)
+    except ValueError as exc:
+        return {"success": False, "stage": "compile",
+                "error": f"the compiler produced no loadable image: {exc}",
+                "log": log, "c": generated_c}
+
+    total = sum(len(s["bytes"]) for s in image["segments"])
+    mem = (f"RV32 image: {total} bytes across {len(image['segments'])} segment(s), "
+           f"entry 0x{image['entry']:x}")
+    return {
+        "success": True,
+        "c": generated_c,
+        "translated": None,
+        "unresolved": None,
+        "warnings": None,
+        "disassembly": None,
+        "listing": None,
+        "base64": base64.b64encode(elf).decode("ascii"),
+        "filename": f"{stem}.elf",
+        "bytes": len(elf),
+        "log": log,
+        "memory": mem,
+        "symbols": None,
+        "symbols_error": None,
+        "toolchain": "shecc",
+        "mcu": spec["mcu"],
+        "entry": image["entry"],
+        # The loadable image, ready for the RV32 machine: each segment's bytes
+        # base64-encoded at its virtual address. A client without an ELF parser
+        # uses this directly; one with a parser can re-derive it from base64.
+        "image": {
+            "entry": image["entry"],
+            "segments": [
+                {"addr": s["addr"], "bytes": base64.b64encode(s["bytes"]).decode("ascii")}
+                for s in image["segments"]
+            ],
+        },
+    }
+
+
 def build(req: CompileReq) -> dict:
     """Compile and return the JSON-shaped result. Shared by both endpoints."""
     if len(req.code.encode("utf-8")) > MAX_SOURCE_BYTES:
@@ -1351,10 +1440,18 @@ def build(req: CompileReq) -> dict:
                              "compiled for the 6502"}
         return build_6502(req, generated_c, stem)
 
+    riscv = RISCV_TARGETS.get(req.target.lower())
+    if riscv is not None:
+        if keil_changes:
+            return {"success": False,
+                    "error": "the Keil C51 dialect is 8051-only; it cannot be "
+                             "compiled for RISC-V"}
+        return build_riscv(req, riscv, generated_c, stem)
+
     target = TARGETS.get(req.target.lower())
     if target is None:
         known = sorted(list(TARGETS) + list(AVR_TARGETS) + list(ARM_TARGETS)
-                       + list(EATER_TARGETS))
+                       + list(EATER_TARGETS) + list(RISCV_TARGETS))
         return {"success": False,
                 "error": f"unknown target '{req.target}'; known: {', '.join(known)}"}
 
