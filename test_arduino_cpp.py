@@ -293,3 +293,34 @@ def test_pseudocode_for_an_arduino_board_now_builds(device):
     assert r["filename"] == "blink.hex"
     assert "#include <Arduino.h>" in r["c"]      # the generated sketch comes back
     assert r["variant"] == ab.BOARDS[device.lower()]["variant"]
+
+
+# ------------------------------------------------------------------ symbols
+
+def test_declared_globals_reads_file_scope_declarations():
+    code = ("int a, b[4] = {1, 2};\nvoid f(int x);\nconst char *msg = \"hi\";\n"
+            "Counter c(40), d(1);\nvoid g();\nstatic volatile uint8_t flags;\n"
+            "class K { int inside; };\nvoid setup() { int local = 1; }\nvoid loop() {}\n")
+    assert ab.declared_globals(code) == ["a", "b", "msg", "c", "d", "flags"]
+
+
+def test_a_sketch_build_returns_a_symbol_table_when_asked():
+    code = ("unsigned int ticks = 1000;\nint unused_global[8];\nString greeting = \"hi\";\n"
+            "void setup() { Serial.begin(9600); }\n"
+            "void loop() {\n  ticks++;\n  Serial.println(greeting + ticks);\n}\n")
+    r = compile_sketch(code, symbols=True)
+    assert r["success"] and r["symbols_error"] is None, r.get("error")
+    s = r["symbols"]
+    assert s["source"] == "main.ino" and s["device"] == "atmega328p" and s["fosc"] == 16000000
+    names = {v["name"]: v for v in s["variables"]}
+    assert set(names) == {"ticks", "greeting"}, names       # the core's (Serial, timer0_*) are not
+    assert names["ticks"]["space"] == "sram" and names["ticks"]["size"] == 2
+    assert names["greeting"]["size"] == 6                    # a String object
+    assert s["optimized_out"] == ["unused_global"]           # declared, never read: said, not hidden
+    assert {"setup", "loop"} <= {f["name"] for f in s["functions"]}
+    assert any(ln["line"] == 6 for ln in s["lines"]), s["lines"]   # `ticks++;`
+
+
+def test_no_symbols_unless_asked():
+    r = compile_sketch("void setup() {}\nvoid loop() {}\n")
+    assert r["symbols"] is None and r["symbols_error"] is None

@@ -375,6 +375,113 @@ def prepare_sketch(code: str, filename: str = "sketch.ino") -> tuple[str, list[s
     return head + "".join(body), protos
 
 
+_DECL_SKIP = re.compile(r"^\s*(?:class|struct|union|enum|typedef|using|template|namespace|extern\s*\")\b")
+_OBJDUMP_T_RE = re.compile(
+    r"^([0-9a-fA-F]{8}) (.{7}) (\S+)\t([0-9a-fA-F]{8}) (.+)$")
+DATA_VMA = 0x800000
+
+
+def declared_globals(code: str) -> list[str]:
+    """Names the sketch declares as variables at file scope, in order:
+    `int a, b[4];`, `Counter c(40);`, `String s = "x";`, `static long t;`.
+    Classes, typedefs, prototypes and function definitions are not variables.
+    Used to tell the sketch's own globals from the core's in the ELF."""
+    masked = _mask(code)
+    names: list[str] = []
+    for st in _top_level_statements(masked):
+        text = masked[st["start"]:st["end"]].strip()
+        if st["code"] or not text.endswith(";") or _DECL_SKIP.match(text):
+            continue
+        body = text[:-1]
+        # Split declarators on top-level commas (not inside () [] {} <>).
+        parts, depth, cur = [], 0, ""
+        for ch in body:
+            if ch in "([{<":
+                depth += 1
+            elif ch in ")]}>":
+                depth -= 1
+            if ch == "," and depth == 0:
+                parts.append(cur)
+                cur = ""
+            else:
+                cur += ch
+        parts.append(cur)
+        for i, part in enumerate(parts):
+            head = re.split(r"[=\[({]", part, maxsplit=1)[0]
+            ids = re.findall(r"[A-Za-z_]\w*", head)
+            if not ids:
+                continue
+            # `void f(int x);` is a prototype, not a variable of type void.
+            rest = part[len(head):].lstrip()
+            if i == 0 and rest.startswith("(") and re.search(r"\)\s*(const\s*)?$", part.strip()) \
+                    and (ids[0] in ("void",) or re.search(r"\(\s*(void|[A-Za-z_][\w:<>\s*&]*\s+[A-Za-z_]\w*.*|)\)", rest)):
+                continue
+            if ids[-1] not in names:
+                names.append(ids[-1])
+    return names
+
+
+def sketch_symbols(elf: str, code: str, spec: dict, f_cpu: int, *, bin_dir: str,
+                   env: dict, stem: str) -> dict:
+    """The debugger's symbol table for a sketch: its own globals (name,
+    address, size) in the shape avr_symtab gives a generated program's
+    `variables`, its functions (sketch functions and its classes' methods,
+    demangled), and the line table for the sketch file. The core's globals
+    (Serial, the timer0 counters) are left out; a global the sketch declares
+    but the optimiser removed is listed under `optimized_out` rather than
+    silently missing."""
+    objdump = os.path.join(bin_dir, "avr-objdump")
+    table_text = subprocess.run([objdump, "-t", "-C", elf], capture_output=True,
+                                text=True, timeout=15, env=env).stdout
+    lines_text = subprocess.run([objdump, "--dwarf=decodedline", elf],
+                                capture_output=True, text=True, timeout=15, env=env).stdout
+
+    declared = declared_globals(code)
+    masked = _mask(code)
+    classes = {m.group(1) for m in _TYPE_DEF_RE.finditer(masked) if m.group(1)}
+    free_functions = {fn["name"] for fn in find_function_definitions(code)}
+
+    variables, functions, present = [], [], set()
+    for raw in table_text.splitlines():
+        m = _OBJDUMP_T_RE.match(raw)
+        if not m:
+            continue
+        addr, flags, section, size, name = (int(m.group(1), 16), m.group(2),
+                                             m.group(3), int(m.group(4), 16), m.group(5).strip())
+        if "O" in flags and section in (".bss", ".data", ".noinit") and name in declared:
+            present.add(name)
+            variables.append({"name": name, "space": "sram",
+                              "addr": addr - DATA_VMA if addr >= DATA_VMA else addr,
+                              "size": size})
+        elif "F" in flags and section == ".text":
+            base = name.split("(")[0]
+            owner = base.split("::")[0] if "::" in base else None
+            if base in free_functions or (owner and owner in classes):
+                functions.append({"name": name, "addr": addr, "size": size})
+
+    source = f"{stem}.ino"
+    line_table: dict[int, int] = {}
+    for raw in lines_text.splitlines():
+        m = re.match(r"^(\S+)\s+(\d+)\s+0x([0-9a-fA-F]+)", raw.strip())
+        if m and m.group(1).split("/")[-1] == source:
+            ln, addr = int(m.group(2)), int(m.group(3), 16)
+            if ln not in line_table or addr < line_table[ln]:
+                line_table[ln] = addr
+
+    table = {
+        "fosc": int(f_cpu),
+        "device": spec["mcu"],
+        "source": source,
+        "variables": sorted(variables, key=lambda v: v["addr"]),
+        "functions": sorted(functions, key=lambda f: f["addr"]),
+        "lines": [{"line": ln, "addr": a} for ln, a in sorted(line_table.items())],
+    }
+    gone = [n for n in declared if n not in present]
+    if gone:
+        table["optimized_out"] = gone
+    return table
+
+
 def included_headers(code: str) -> list[str]:
     """Every `#include <x.h>` / `"x.h"` target, in order, without duplicates."""
     seen = []
@@ -497,8 +604,11 @@ def _cached_objects(gcc: str, name: str, sources: list[str], spec: dict,
     simply uses the winner's identical build."""
     with open(os.path.join(CORE_ROOT, "VERSION"), "rb") as fh:
         core_version = fh.read()
+    # CORE_ROOT is in the key because the objects carry their source paths
+    # (debug info, diagnostics): two checkouts sharing /tmp must not serve
+    # each other's objects -- measured, an error named a deleted checkout.
     key = hashlib.sha256(repr((
-        FLAGS_VERSION, core_version, name, spec["mcu"], spec["core"],
+        FLAGS_VERSION, CORE_ROOT, core_version, name, spec["mcu"], spec["core"],
         spec["variant"], spec["board"], int(f_cpu), sorted(defines),
         gcc)).encode()).hexdigest()[:24]
     final = os.path.join(CACHE_ROOT, key)
@@ -544,7 +654,7 @@ def _clean(log: str, work: str) -> str:
 def build(code: str, spec: dict, *, bin_dir: str, env: dict,
           f_cpu: int | None = None, defines: dict | None = None,
           fmt: str = "hex", stem: str = "sketch", timeout: int = 25,
-          disassemble: bool = False) -> dict:
+          disassemble: bool = False, symbols: bool = False) -> dict:
     """Build a sketch into an image. Raises ArduinoBuildError on a failure the
     user can act on; returns the service's usual success shape otherwise."""
     gcc = os.path.join(bin_dir, "avr-gcc")
@@ -593,7 +703,20 @@ def build(code: str, spec: dict, *, bin_dir: str, env: dict,
         sketch_obj = os.path.join(work, f"{stem}.ino.o")
         rc, log = _compile_one(
             gcc, sketch_src, sketch_obj,
-            _flags_for(sketch_src, spec, f_cpu, includes, dflags, ["-Wall"]),
+            _flags_for(sketch_src, spec, f_cpu, includes, dflags, ["-Wall"])
+            # A symbol table needs the SKETCH outside LTO: gcc 5.4 writes no
+            # line program for LTO'd code and inlines setup/loop into main,
+            # so there would be nothing to map. The core stays LTO. The
+            # image then differs from a build without symbols (functions stay
+            # functions), which is why a table is only ever returned WITH the
+            # image it describes -- the rule the 8051 symbols already follow.
+            # DWARF-2 for the same reason build_avr uses it: binutils 2.26
+            # decodes gcc 5.4's default DWARF-4 line table to NOTHING. Only
+            # here, never in the default flags: measured, switching the
+            # default to -gdwarf-2 changed 41 bytes of a Mega image (the
+            # debug format reached codegen), and a build without symbols
+            # must stay byte-identical to what it was.
+            + (["-fno-lto", "-gdwarf-2"] if symbols else []),
             env, timeout)
         log = _clean(log, work)
         if rc != 0:
@@ -609,7 +732,7 @@ def build(code: str, spec: dict, *, bin_dir: str, env: dict,
         elf = os.path.join(work, f"{stem}.elf")
         try:
             r = subprocess.run(
-                [gcc, f"-mmcu={spec['mcu']}", "-Os", "-g", "-flto",
+                [gcc, f"-mmcu={spec['mcu']}", "-Os", "-gdwarf-2" if symbols else "-g", "-flto",
                  "-fuse-linker-plugin", "-Wl,--gc-sections", "-w",
                  "-o", elf, sketch_obj, *objects, "-lm"],
                 capture_output=True, text=True, timeout=timeout, env=env)
@@ -657,6 +780,14 @@ def build(code: str, spec: dict, *, bin_dir: str, env: dict,
                 f"the sketch is {m.group(1)} bytes and the {spec['mcu']} has "
                 f"{spec['flash']} bytes of flash", mem, stage="link")
 
+        table = table_error = None
+        if symbols:
+            try:
+                table = sketch_symbols(elf, code, spec, f_cpu, bin_dir=bin_dir,
+                                       env=env, stem=stem)
+            except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                table_error = f"symbol table unavailable: {exc}"
+
         listing = listing_artifact = None
         if disassemble:
             import listing as listing_mod
@@ -677,8 +808,8 @@ def build(code: str, spec: dict, *, bin_dir: str, env: dict,
             "bytes": len(blob),
             "log": log,
             "memory": mem,
-            "symbols": None,
-            "symbols_error": None,
+            "symbols": table,
+            "symbols_error": table_error,
             "toolchain": ("avr-gcc+ArduinoCore-avr" if spec["core"] == "arduino"
                           else "avr-gcc+ATTinyCore"),
             "mcu": spec["mcu"],

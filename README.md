@@ -380,6 +380,16 @@ is the board's (16 MHz, 8 MHz for the ATtinys) unless `fosc` is given. The
 response adds `prototypes` (what was declared for you), `libraries`,
 `variant` and `board`.
 
+With `symbols: true` a sketch build also returns a symbol table: the sketch's
+own globals (`variables`, in the same shape the pseudocode builds use, so a
+debugger's variables view reads them), its functions (demangled), and a
+`main.ino` line table, plus `optimized_out` for any global the sketch declares
+that the optimiser removed. To make that table possible the sketch itself is
+compiled without LTO in a symbols build (gcc 5.4 writes no line program for
+LTO'd code and inlines `setup`/`loop` into `main`), so the image differs from a
+build without symbols -- a table is only ever valid for the image it came with.
+A build without symbols is byte-identical to before.
+
 Not offered: libraries outside the core's bundle (there is no library
 manager — an `#include <Servo.h>` fails naming what *is* available), and C++
 past what gcc-avr 5.4 knows (`gnu++11` for ArduinoCore-avr, as its

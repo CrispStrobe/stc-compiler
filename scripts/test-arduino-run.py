@@ -55,7 +55,7 @@ def build(code, language="arduino", target="atmega328p"):
         code=code, language=language, target=target)))
 
 
-def run(result, target, mcu, ms):
+def run(result, target, mcu, ms, peek=""):
     """Simulate at the BOARD's crystal, never at the clock the response
     reports. Using the response's f_cpu made a mis-clocked image
     self-consistent -- built for 11 MHz, simulated at 11 MHz, every delay
@@ -66,7 +66,7 @@ def run(result, target, mcu, ms):
         fh.write(base64.b64decode(result["base64"]).decode())
         path = fh.name
     try:
-        out = subprocess.run(["node", RUNNER, path, mcu, str(ms), str(clock)],
+        out = subprocess.run(["node", RUNNER, path, mcu, str(ms), str(clock), peek],
                              capture_output=True, text=True, timeout=300, cwd=ROOT)
     finally:
         os.unlink(path)
@@ -165,6 +165,31 @@ if r.get("success"):
     sim = run(r, "arduino-uno", "atmega328p", 500)
     n = sim["toggles"].get("PB5", 0)
     ok(9 <= n <= 11, "toggle every 50 ms: about 10 edges in 500 ms", str(n))
+
+# ---------------------------------------------------------------- symbols
+
+print("\n--- a sketch's symbol table points at the live variables ---")
+SYM = """
+unsigned int ticks = 1000;
+String greeting = "hi";
+void setup() { Serial.begin(115200); }
+void loop() { ticks++; delay(10); }
+"""
+r = asyncio.run(app.compile_source(app.CompileReq(
+    code=SYM, language="arduino", target="arduino-uno", symbols=True)))
+table = r.get("symbols") or {}
+by_name = {v["name"]: v for v in table.get("variables", [])}
+ok(r.get("success") and "ticks" in by_name and "greeting" in by_name,
+   "the table lists the sketch's globals", str(sorted(by_name)))
+ok({"setup", "loop"} <= {f["name"] for f in table.get("functions", [])},
+   "and its functions", str([f["name"] for f in table.get("functions", [])]))
+if "ticks" in by_name:
+    v = by_name["ticks"]
+    sim = run(r, "arduino-uno", "atmega328p", 200, f"{v['addr']}:{v['size']}")
+    # 200 ms of `ticks++; delay(10)` from 1000: about 1019. Read from the
+    # RUNNING chip at the table's address -- a wrong address reads garbage.
+    ok(1010 <= sim["peeked"][0] <= 1025, "the running chip holds `ticks` at that address",
+       f"read {sim['peeked'][0]} at 0x{v['addr']:x}")
 
 print(f"\n{checks - failures}/{checks} checks passed")
 sys.exit(1 if failures else 0)
