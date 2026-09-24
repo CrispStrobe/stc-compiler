@@ -191,25 +191,30 @@ ARDUINO_TARGETS = arduino_build.BOARDS
 AVR_STAGE = "/tmp/avr"
 AVR_STAGE_BIN = os.path.join(AVR_STAGE, "bin")
 
+# `default_clock` is the part's usual crystal (the ATtinys' is the 8 MHz
+# internal oscillator, as the pseudocode targets and ATTinyCore assume). It is
+# what hand-written C gets as F_CPU when the request names no clock, because
+# CompileReq.fosc's own default is the 8051's 11.0592 MHz: <util/delay.h> on
+# a 16 MHz Uno built for 11 MHz runs every delay 31% short.
 AVR_TARGETS = {
     "atmega328p": {
-        "mcu": "atmega328p", "flash": 32768,
+        "mcu": "atmega328p", "default_clock": 16000000, "flash": 32768,
         "description": "ATmega328P — Arduino Uno/Nano/Pro Mini, 32 KB flash",
     },
     "atmega168p": {
-        "mcu": "atmega168p", "flash": 16384,
+        "mcu": "atmega168p", "default_clock": 16000000, "flash": 16384,
         "description": "ATmega168P — 16 KB flash",
     },
     "atmega2560": {
-        "mcu": "atmega2560", "flash": 262144,
+        "mcu": "atmega2560", "default_clock": 16000000, "flash": 262144,
         "description": "ATmega2560 — Arduino Mega, 256 KB flash",
     },
     "attiny85": {
-        "mcu": "attiny85", "flash": 8192,
+        "mcu": "attiny85", "default_clock": 8000000, "flash": 8192,
         "description": "ATtiny85 — 8 KB flash, no hardware UART",
     },
     "attiny88": {
-        "mcu": "attiny88", "flash": 8192,
+        "mcu": "attiny88", "default_clock": 8000000, "flash": 8192,
         "description": "ATtiny88 — 8 KB flash, 28-pin DIP (Blinkenrocket)",
     },
 }
@@ -629,6 +634,9 @@ class CompileReq(BaseModel):
     symbols: bool = False
 
 
+_DEFINES_F_CPU = re.compile(r"^[ \t]*#[ \t]*define[ \t]+F_CPU\b", re.M)
+
+
 def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
               f_cpu: int | None, stem: str = "main") -> dict:
     """Compile C for an ATmega with avr-gcc, and return an Intel HEX image.
@@ -680,8 +688,12 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
            "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections"]
     # Source that already sets its own clock wins: generated code bakes F_CPU
     # in, and defining it twice from the command line is a warning at best and
-    # a conflicting redefinition at worst.
-    if f_cpu and "F_CPU" not in req.code:
+    # a conflicting redefinition at worst. "Sets" means a #define: a program
+    # that only USES F_CPU (`F_CPU / 1000`, `#if F_CPU > 8000000UL`) used to
+    # be treated as setting it, got no clock at all, and <util/delay.h> then
+    # silently assumed 1 MHz.
+    defines_clock = _DEFINES_F_CPU.search(req.code) is not None
+    if f_cpu and not defines_clock:
         cmd.append(f"-DF_CPU={int(f_cpu)}UL")
     if req.symbols or req.disassemble:
         # DWARF is the AVR's .cdb: the line records avr_symtab joins the
@@ -808,6 +820,9 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
             "symbols_error": symbols_error,
             "toolchain": "avr-gcc",
             "mcu": spec["mcu"],
+            # The F_CPU this build defined, or None when the source set its
+            # own (generated code does) or none was given.
+            "f_cpu": int(f_cpu) if f_cpu and not defines_clock else None,
         }
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -1504,7 +1519,9 @@ def build(req: CompileReq) -> dict:
             return {"success": False,
                     "error": "the Keil C51 dialect is 8051-only; it cannot be "
                              f"compiled for {avr['mcu']}"}
-        return build_avr(req, avr, generated_c, req.fosc)
+        return build_avr(req, avr, generated_c,
+                         req.fosc if "fosc" in req.model_fields_set
+                         else avr["default_clock"])
 
     arm = ARM_TARGETS.get(req.target.lower())
     if arm is not None:
