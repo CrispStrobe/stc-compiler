@@ -19,6 +19,9 @@ their own upstream licenses.
 | `cc65/bin/**`, `cc65/lib/**`, `cc65/include/**`, `cc65/asminc/**` | [cc65](https://github.com/cc65/cc65) | **zlib** (Debian: BSD-3-zlib) |
 | `arduino-core/cores/arduino/**`, `arduino-core/variants/{standard,eightanaloginputs,mega}/**`, `arduino-core/libraries/arduino/**` | [ArduinoCore-avr](https://github.com/arduino/ArduinoCore-avr) 1.8.8 by Arduino | **LGPL-2.1-or-later** (see below) |
 | `arduino-core/cores/tiny/**`, `arduino-core/variants/{tinyx5,tinyx8}/**`, `arduino-core/libraries/tiny/**` | [ATTinyCore](https://github.com/SpenceKonde/ATTinyCore) by Spence Konde | **LGPL-2.1-or-later** (see below) |
+| `arduino-core/libraries/arduino/Servo/**` | [Servo](https://github.com/arduino-libraries/Servo) 1.3.0 by Arduino | **LGPL-2.1-or-later** (see below) |
+| `arduino-core/libraries/common/LiquidCrystal/**` | [LiquidCrystal](https://github.com/arduino-libraries/LiquidCrystal) 1.0.7 by Arduino | **LGPL-2.1-or-later** (see below) |
+| `arduino-core/libraries/common/Adafruit_NeoPixel/**` | [Adafruit_NeoPixel](https://github.com/adafruit/Adafruit_NeoPixel) 1.15.5 by Adafruit | **LGPL-3.0** (see below; licence text in its `COPYING`) |
 | `riscv/riscv-cc.wasm` | [shecc](https://github.com/sysprog21/shecc) — RV32IM C compiler, built to `wasm32-wasi` | **BSD-2-Clause** |
 | `riscv-gcc/bin/**`, `riscv-gcc/lib/gcc/**`, `riscv-gcc/lib/riscv64-unknown-elf/bin/**` | [GCC](https://gcc.gnu.org/) for `riscv64-unknown-elf` + GNU binutils | **GPL-3.0-or-later**, runtime under the **GCC Runtime Library Exception** |
 | `riscv-gcc/picolibc/**` | [picolibc](https://github.com/picolibc/picolibc) — the C library | **BSD-2/3-Clause** (a few files under other permissive terms) |
@@ -119,9 +122,11 @@ repository.
 
 ## The Arduino cores — LGPL-2.1 posture
 
-The `arduino-core/` directory vendors two Arduino cores, each at a pinned
-commit recorded in `arduino-core/VERSION` and fetched, checksum-verified, by
-`scripts/fetch-arduino-core.sh`:
+The `arduino-core/` directory vendors two Arduino cores and three libraries,
+each at a pinned commit recorded in `arduino-core/VERSION` and fetched,
+checksum-verified, by `scripts/fetch-arduino-core.sh`. The libraries -- Servo
+and LiquidCrystal (LGPL-2.1-or-later) and Adafruit_NeoPixel (LGPL-3.0) -- are
+held to the same posture as the cores below. The cores:
 
 - [ArduinoCore-avr](https://github.com/arduino/ArduinoCore-avr) 1.8.8
   (© Arduino and contributors, © 2005–2006 David A. Mellis) — `cores/arduino`,

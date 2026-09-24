@@ -373,9 +373,13 @@ The pipeline is the IDE's ([`arduino_build.py`](arduino_build.py)): the sketch
 gets `#include <Arduino.h>` and prototypes for its functions (so `loop()` may
 call a function defined below it), each behind `#line` so a diagnostic names
 `main.ino:<line>` — the line you wrote; the core is built with its own
-platform flags, `-flto` included, and cached per board and clock so a warm
-instance compiles only the sketch; an `#include` of `Wire.h`, `SPI.h`,
-`EEPROM.h` or `SoftwareSerial.h` pulls in the core's bundled library. `F_CPU`
+platform flags, `-flto` included, cached per board and clock so a warm
+instance compiles only the sketch, and linked as an archive (`core.a`) as the
+IDE does, so a core object such as Tone's timer interrupt is only in the image
+when the sketch uses it. An `#include` pulls in a library: the core's own
+(`Wire.h`, `SPI.h`, `EEPROM.h`, `SoftwareSerial.h`), `Servo.h` (on the ATtinys
+`Servo_ATTinyCore.h`), `LiquidCrystal.h`, `Adafruit_NeoPixel.h`, and on the
+ATtinys also `tinyNeoPixel.h`. `F_CPU`
 is the board's (16 MHz, 8 MHz for the ATtinys) unless `fosc` is given. The
 response adds `prototypes` (what was declared for you), `libraries`,
 `variant` and `board`.
@@ -390,8 +394,8 @@ LTO'd code and inlines `setup`/`loop` into `main`), so the image differs from a
 build without symbols -- a table is only ever valid for the image it came with.
 A build without symbols is byte-identical to before.
 
-Not offered: libraries outside the core's bundle (there is no library
-manager — an `#include <Servo.h>` fails naming what *is* available), and C++
+Not offered: other libraries (there is no library manager — an
+`#include <IRremote.h>` fails naming what *is* available), and C++
 past what gcc-avr 5.4 knows (`gnu++11` for ArduinoCore-avr, as its
 platform.txt asks; `gnu++1z` for ATTinyCore, which asks for 17). Licensing
 posture in [`NOTICE.md`](NOTICE.md).
