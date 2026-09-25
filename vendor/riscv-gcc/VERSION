@@ -1,0 +1,11 @@
+gcc-riscv64-unknown-elf       gcc-riscv64-unknown-elf_8.3.0.2019.08+dfsg-1_amd64.deb
+binutils-riscv64-unknown-elf  binutils-riscv64-unknown-elf_2.32.2020.04+dfsg-2_amd64.deb
+picolibc-riscv64-unknown-elf  picolibc-riscv64-unknown-elf_1.5.1-2_all.deb
+
+from Debian bullseye, https://deb.debian.org/debian/pool/main
+corresponding source: apt-get source gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf picolibc
+
+gcc and binutils are GPL-3.0-or-later; libgcc rides under the GCC Runtime
+Library Exception. picolibc is BSD (2/3-clause + a few files under other
+permissive terms) — see picolibc-riscv64-unknown-elf.copyright. The bundle is a
+SUBSET (one multilib, DWARF stripped), not a modification: no binary is patched.

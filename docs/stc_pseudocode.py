@@ -2078,8 +2078,9 @@ class ArduinoTarget(Target):
     time_type = "unsigned long"
     time_signed = "long"
 
-    # Core C++ needs the Arduino build system; SDCC cannot touch it.
-    toolchain = "arduino-cli"
+    # Core C++, built by this service's `arduino` route (arduino_build.py):
+    # avr-gcc's C++ front end against the vendored ArduinoCore-avr.
+    toolchain = "arduino-core"
     default_clock = 16000000
 
     # PORT stays out: eight bits of one register is exactly what the core
@@ -2087,8 +2088,6 @@ class ArduinoTarget(Target):
     # portability that is the reason to emit core C++ at all. A PART needs
     # only three pins the core is happy to drive.
     supports = frozenset({"pwm", "tone", "print", "table", "part", "list"})
-    compile_hint = ("DEVICE ATMEGA328P: is the same board without the Arduino "
-                    "core, and that one does compile here.")
     source_extension = "ino"
 
     def __init__(self, key: str, display: str, digital_max: int, analog_max: int,

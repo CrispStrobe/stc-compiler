@@ -9,6 +9,7 @@ extensions can talk to both with the same client code.
 """
 
 import base64
+import hashlib
 import html
 import json
 import os
@@ -21,13 +22,19 @@ import tempfile
 import uuid
 
 import keil2sdcc
+import riscv_cc
 import stc_disasm
+import arduino_build
+import bundle_xz
 import stc_pseudocode
 import stc_symtab
 
-from fastapi import FastAPI
+import collections
+import threading
+import time as _time
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -168,57 +175,47 @@ TARGETS = {
 # separately and only when an AVR part is actually asked for, so an 8051
 # request never pays for it.
 #
-# What is deliberately NOT here: the full Arduino core + arduino-cli (250 MB).
+# What is deliberately NOT here: arduino-cli (~250 MB with its downloads).
 # stc_pseudocode's AvrTarget writes the ports directly instead, which is both
 # smaller and the same discipline the 8051 target already uses.
 #
-# For `language: "arduino"` sketches, a MINIMAL ATTinyCore subset is vendored
-# in arduino-core/. It is LGPL-2.1, server-side only: the compiled .hex is
-# returned, not the core source. See NOTICE.md for the licensing posture.
+# For `language: "arduino"` sketches, the real cores are vendored in
+# arduino-core/ -- ArduinoCore-avr for the ATmegas, ATTinyCore for the
+# ATtinys -- and compiled as C++ by arduino_build.py. LGPL-2.1, server-side
+# only: the compiled .hex is returned, not the core. See NOTICE.md.
 SRC_AVR = os.path.join(BASE_DIR, "avr")
-SRC_ARDUINO_CORE = os.path.join(BASE_DIR, "arduino-core")
+SRC_ARDUINO_CORE = arduino_build.CORE_ROOT
 
-# Arduino language route: which AVR targets have ATTinyCore variant support.
-# Each entry maps to a variant directory under arduino-core/variants/ and
-# the -DARDUINO_{board} define the core's #ifdefs expect.
-ARDUINO_TARGETS = {
-    "attiny85": {
-        "mcu": "attiny85", "flash": 8192,
-        "variant": "tinyx5",
-        "board": "AVR_ATTINYX5",
-        "default_clock": 8000000,
-        "description": "ATtiny85 — Arduino API via ATTinyCore, 8 KB flash",
-    },
-    "attiny88": {
-        "mcu": "attiny88", "flash": 8192,
-        "variant": "tinyx8",
-        "board": "AVR_ATTINYX8",
-        "default_clock": 8000000,
-        "description": "ATtiny88 — Arduino API via ATTinyCore, 8 KB flash",
-    },
-}
+# Arduino language route: every target it accepts, chip names and board
+# names alike, with the core and variant each one means.
+ARDUINO_TARGETS = arduino_build.BOARDS
 AVR_STAGE = "/tmp/avr"
 AVR_STAGE_BIN = os.path.join(AVR_STAGE, "bin")
 
+# `default_clock` is the part's usual crystal (the ATtinys' is the 8 MHz
+# internal oscillator, as the pseudocode targets and ATTinyCore assume). It is
+# what hand-written C gets as F_CPU when the request names no clock, because
+# CompileReq.fosc's own default is the 8051's 11.0592 MHz: <util/delay.h> on
+# a 16 MHz Uno built for 11 MHz runs every delay 31% short.
 AVR_TARGETS = {
     "atmega328p": {
-        "mcu": "atmega328p", "flash": 32768,
+        "mcu": "atmega328p", "default_clock": 16000000, "flash": 32768,
         "description": "ATmega328P — Arduino Uno/Nano/Pro Mini, 32 KB flash",
     },
     "atmega168p": {
-        "mcu": "atmega168p", "flash": 16384,
+        "mcu": "atmega168p", "default_clock": 16000000, "flash": 16384,
         "description": "ATmega168P — 16 KB flash",
     },
     "atmega2560": {
-        "mcu": "atmega2560", "flash": 262144,
+        "mcu": "atmega2560", "default_clock": 16000000, "flash": 262144,
         "description": "ATmega2560 — Arduino Mega, 256 KB flash",
     },
     "attiny85": {
-        "mcu": "attiny85", "flash": 8192,
+        "mcu": "attiny85", "default_clock": 8000000, "flash": 8192,
         "description": "ATtiny85 — 8 KB flash, no hardware UART",
     },
     "attiny88": {
-        "mcu": "attiny88", "flash": 8192,
+        "mcu": "attiny88", "default_clock": 8000000, "flash": 8192,
         "description": "ATtiny88 — 8 KB flash, 28-pin DIP (Blinkenrocket)",
     },
 }
@@ -293,6 +290,34 @@ Z80_TARGETS = {
 # The device id the Code tab sends is `z80`; `z80-bench` is the name the
 # gallery example carries, and callers reach for it. Same machine.
 Z80_TARGETS["z80-bench"] = Z80_TARGETS["z80"]
+# ---- RISC-V (RV32IM) compile target -----------------------------------------
+# Unlike the other toolchains this hosts no native compiler: it runs shecc
+# (github.com/sysprog21/shecc, BSD-2-Clause) as WebAssembly under wasmtime — the
+# same riscv/riscv-cc.wasm the browser page and the bw-board engine use, so one
+# artifact serves all three (see riscv/riscv-cc.PROVENANCE.md, riscv_cc.py).
+# shecc emits a Linux ELF32; the response carries the ELF and its {entry,
+# segments} image. The image is booted on an emulated RV32 machine (bw-board's
+# RiscV32Machine) — there is no hardware to flash — so its Linux ecall ABI
+# (a7=64 write, a7=93 exit) is what that machine services.
+RISCV_TARGETS = {
+    "riscv32": {
+        "mcu": "rv32im", "toolchain": "shecc",
+        "description": "RISC-V RV32IM — shecc (wasm), a C subset; emulated console",
+    },
+    # The full-C companion: a native gcc + picolibc bundle (riscv-gcc/, like the
+    # arm/ and avr/ bundles), for arbitrary C — floats, malloc, qsort, math.h,
+    # string.h — that shecc's subset cannot compile. Same {entry, segments}
+    # image, same emulated RV32IM console; the difference is the compiler.
+    "riscv32-gcc": {
+        "mcu": "rv32imac", "toolchain": "riscv64-unknown-elf-gcc",
+        "description": "RISC-V RV32IMAC — full C via native gcc + picolibc; emulated console",
+    },
+}
+
+# The full-C RISC-V bundle: native gcc + picolibc, staged like the ARM bundle.
+SRC_RISCV_GCC = os.path.join(BASE_DIR, "riscv-gcc")
+RISCV_GCC_STAGE = "/tmp/riscv-gcc"
+RISCV_GCC_STAGE_BIN = os.path.join(RISCV_GCC_STAGE, "bin")
 
 # ---- cc65 toolchain (6502 assembler/linker) ---------------------------------
 SRC_CC65 = os.path.join(BASE_DIR, "cc65")
@@ -303,6 +328,79 @@ app = FastAPI(title="stc-compiler", docs_url="/docs")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
+
+# ---- Compile-endpoint abuse guard -------------------------------------------
+# The compile endpoints hand untrusted source to real compilers, which is CPU
+# heavy. This is a BEST-EFFORT, PER-INSTANCE guard: Vercel runs many stateless
+# instances, so it bounds a single instance's exposure (per-IP burst + on-box
+# concurrency), not a global quota — a true global limit needs external state.
+# It is deliberately generous; it exists to stop a runaway loop or one client
+# monopolising an instance, not to meter normal use. Compiles are also already
+# wall-clock-bounded (COMPILE_TIMEOUT) and the toolchains never RUN user code.
+_RL_WINDOW_S = 60
+_RL_MAX_PER_IP = 40          # requests per IP per window, per instance
+_RL_MAX_INFLIGHT = 6         # concurrent compiles on this instance
+_rl_lock = threading.Lock()
+_rl_hits: "dict[str, list[float]]" = collections.defaultdict(list)
+_rl_inflight = 0
+
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "?"
+
+
+def _rate_ok(request: Request) -> bool:
+    """True if this IP is under its per-window budget (and records the hit)."""
+    ip = _client_ip(request)
+    now = _time.monotonic()
+    cutoff = now - _RL_WINDOW_S
+    with _rl_lock:
+        hits = _rl_hits[ip]
+        hits[:] = [t for t in hits if t > cutoff]
+        if len(hits) >= _RL_MAX_PER_IP:
+            return False
+        hits.append(now)
+        if len(_rl_hits) > 4096:   # bound memory: drop idle IPs
+            for k in [k for k, v in list(_rl_hits.items()) if not v or v[-1] <= cutoff]:
+                _rl_hits.pop(k, None)
+        return True
+
+
+def _slot_acquire() -> bool:
+    global _rl_inflight
+    with _rl_lock:
+        if _rl_inflight >= _RL_MAX_INFLIGHT:
+            return False
+        _rl_inflight += 1
+        return True
+
+
+def _slot_release() -> None:
+    global _rl_inflight
+    with _rl_lock:
+        _rl_inflight = max(0, _rl_inflight - 1)
+
+
+def _guarded_build(req: "CompileReq", request: Request):
+    """Rate-limit + concurrency-cap around build(); shared by /compile."""
+    if not _rate_ok(request):
+        return JSONResponse(
+            {"success": False, "stage": "rate-limit",
+             "error": f"Too many requests. The limit is {_RL_MAX_PER_IP} per minute; "
+                      "please slow down."},
+            status_code=429)
+    if not _slot_acquire():
+        return JSONResponse(
+            {"success": False, "stage": "busy",
+             "error": "The compiler is busy right now — retry in a moment."},
+            status_code=503)
+    try:
+        return build(req)
+    finally:
+        _slot_release()
 
 
 # What a COMPLETE stage looks like, so a stale one can be told from a good
@@ -378,6 +476,41 @@ def sdcc_bin_dir() -> str:
     return os.path.dirname(found) if found else STAGE_BIN
 
 
+def _avr_bundle_fingerprint() -> str:
+    """Every path in the committed bundle with its size: what a stage made
+    from it must match. Cheap (a few hundred files), and unlike comparing one
+    directory it notices a bundle that grew anywhere -- a new compiler
+    program, a new device header, a new device library."""
+    items = []
+    for root, _dirs, files in os.walk(SRC_AVR):
+        for f in files:
+            path = os.path.join(root, f)
+            try:
+                items.append(f"{os.path.relpath(path, SRC_AVR)}:{os.lstat(path).st_size}")
+            except OSError:
+                pass
+    return hashlib.sha256("\n".join(sorted(items)).encode()).hexdigest()
+
+
+_AVR_STAMP = os.path.join(AVR_STAGE, ".bundle-fingerprint")
+
+
+def _avr_stage_is_stale() -> bool:
+    """Whether /tmp/avr was staged from a different bundle than the one here.
+
+    Staging happens once per instance. The first version of this check
+    compared only the compiler-programs directory, which caught cc1plus and
+    lto1 joining cc1 and missed a bundle that gained a DEVICE HEADER
+    (iom32u4.h, for the Arduboy): the stage kept the old tree and every
+    32U4 compile failed with "avr/iom32u4.h: No such file". So the stage is
+    stamped with a fingerprint of the whole committed bundle."""
+    try:
+        with open(_AVR_STAMP) as fh:
+            return fh.read() != _avr_bundle_fingerprint()
+    except OSError:
+        return True
+
+
 def stage_avr() -> str | None:
     """Directory holding avr-gcc, or None if no AVR toolchain is reachable.
 
@@ -396,7 +529,9 @@ def stage_avr() -> str | None:
     here would mean the verifier no longer verifies anything.
     """
     if os.path.isdir(SRC_AVR):
-        if not os.path.exists(os.path.join(AVR_STAGE_BIN, "avr-gcc")):
+        if not os.path.exists(os.path.join(AVR_STAGE_BIN, "avr-gcc")) \
+                or _avr_stage_is_stale():
+            shutil.rmtree(AVR_STAGE, ignore_errors=True)
             os.makedirs(AVR_STAGE, exist_ok=True)
             for part in os.listdir(SRC_AVR):
                 source = os.path.join(SRC_AVR, part)
@@ -405,6 +540,12 @@ def stage_avr() -> str | None:
                     shutil.copytree(source, destination, symlinks=True)
                 elif os.path.isfile(source) and not os.path.exists(destination):
                     shutil.copy2(source, destination)
+            # cc1, cc1plus and lto1 are committed xz-compressed to fit
+            # Vercel's 225 MB function limit (bundle_xz.py); /tmp is where
+            # they become runnable.
+            bundle_xz.materialize(AVR_STAGE)
+            with open(_AVR_STAMP, "w") as fh:
+                fh.write(_avr_bundle_fingerprint())
             # cc1, collect2, as and ld are all fork/exec'd and all lose the
             # executable bit on the way through Vercel's deployment.
             for sub in ("bin", os.path.join("lib", "avr", "bin"),
@@ -454,6 +595,42 @@ def stage_arm() -> str | None:
             return ARM_STAGE_BIN
 
     found = shutil.which("arm-none-eabi-gcc")
+    return os.path.dirname(found) if found else None
+
+
+def stage_riscv_gcc() -> str | None:
+    """Directory holding riscv64-unknown-elf-gcc, or None if unavailable.
+
+    Same cold-start staging as stage_arm: the riscv-gcc/ bundle ships in git,
+    is copied into /tmp on Vercel (read-only deployment dir, executable bit
+    stripped), and falls back to a system riscv64-unknown-elf-gcc for local
+    dev. The bundle's gcc driver resolves its own cc1 / as / ld relative to
+    argv[0] (its configured absolute /usr/lib paths are absent on Vercel), so
+    no PATH surgery is needed — exactly like the ARM bundle.
+    """
+    if sys.platform.startswith("linux") and os.path.isdir(SRC_RISCV_GCC):
+        if not os.path.exists(os.path.join(RISCV_GCC_STAGE_BIN, "riscv64-unknown-elf-gcc")):
+            os.makedirs(RISCV_GCC_STAGE, exist_ok=True)
+            for part in os.listdir(SRC_RISCV_GCC):
+                source = os.path.join(SRC_RISCV_GCC, part)
+                destination = os.path.join(RISCV_GCC_STAGE, part)
+                if os.path.islink(source):
+                    if not os.path.exists(destination):
+                        os.symlink(os.readlink(source), destination)
+                elif os.path.isdir(source) and not os.path.isdir(destination):
+                    shutil.copytree(source, destination, symlinks=True)
+                elif os.path.isfile(source) and not os.path.exists(destination):
+                    shutil.copy2(source, destination)
+            for sub in ("bin",
+                        os.path.join("lib", "riscv64-unknown-elf", "bin"),
+                        os.path.join("lib", "gcc")):
+                for root, _dirs, _files in os.walk(os.path.join(RISCV_GCC_STAGE, sub)):
+                    _make_executable(root)
+        staged = os.path.join(RISCV_GCC_STAGE_BIN, "riscv64-unknown-elf-gcc")
+        if os.path.exists(staged) and _can_execute(staged):
+            return RISCV_GCC_STAGE_BIN
+
+    found = shutil.which("riscv64-unknown-elf-gcc")
     return os.path.dirname(found) if found else None
 
 
@@ -522,6 +699,9 @@ class CompileReq(BaseModel):
     symbols: bool = False
 
 
+_DEFINES_F_CPU = re.compile(r"^[ \t]*#[ \t]*define[ \t]+F_CPU\b", re.M)
+
+
 def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
               f_cpu: int | None, stem: str = "main") -> dict:
     """Compile C for an ATmega with avr-gcc, and return an Intel HEX image.
@@ -573,8 +753,12 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
            "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections"]
     # Source that already sets its own clock wins: generated code bakes F_CPU
     # in, and defining it twice from the command line is a warning at best and
-    # a conflicting redefinition at worst.
-    if f_cpu and "F_CPU" not in req.code:
+    # a conflicting redefinition at worst. "Sets" means a #define: a program
+    # that only USES F_CPU (`F_CPU / 1000`, `#if F_CPU > 8000000UL`) used to
+    # be treated as setting it, got no clock at all, and <util/delay.h> then
+    # silently assumed 1 MHz.
+    defines_clock = _DEFINES_F_CPU.search(req.code) is not None
+    if f_cpu and not defines_clock:
         cmd.append(f"-DF_CPU={int(f_cpu)}UL")
     if req.symbols or req.disassemble:
         # DWARF is the AVR's .cdb: the line records avr_symtab joins the
@@ -701,219 +885,65 @@ def build_avr(req: CompileReq, spec: dict, generated_c: str | None,
             "symbols_error": symbols_error,
             "toolchain": "avr-gcc",
             "mcu": spec["mcu"],
+            # The F_CPU this build defined, or None when the source set its
+            # own (generated code does) or none was given.
+            "f_cpu": int(f_cpu) if f_cpu and not defines_clock else None,
         }
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
-# ---- Arduino (ATTinyCore) build -----------------------------------------------
-# The ATTinyCore's wiring.c and wiring_digital.c are compiled alongside the
-# user's sketch, providing the standard Arduino API: pinMode, digitalWrite,
-# digitalRead, millis, delay. The sketch is compiled as C (avr-gcc, no C++),
-# which is sufficient for the setup/loop/GPIO subset — Serial or other C++
-# features would need cc1plus, which the vendored bundle does not ship.
+# ---- Arduino build ----------------------------------------------------------
+# A sketch is compiled as real C++ against the vendored core (arduino_build.py
+# owns the pipeline: .ino preprocessing, cached core objects, libraries, LTO
+# link). This wrapper only stages the toolchain and maps failures onto the
+# service's response shape.
 
-# main() wrapper appended to every Arduino sketch. Mirrors ATTinyCore's
-# main.cpp but as plain C.
-_ARDUINO_MAIN_C = """\
-#include <Arduino.h>
-void setup(void);
-void loop(void);
-int main(void) {
-    init();
-    setup();
-    for (;;) loop();
-    return 0;
-}
-"""
-
-# Core C source files compiled alongside every Arduino sketch.
-_ARDUINO_CORE_SOURCES = ["wiring.c", "wiring_digital.c"]
-
-
-def build_arduino(req: CompileReq, spec: dict, stem: str = "main") -> dict:
-    """Compile an Arduino sketch for an ATtiny with the ATTinyCore.
-
-    The sketch is expected to define setup() and loop(). A main() wrapper and
-    the ATTinyCore's wiring/digital C sources are compiled alongside it, giving
-    the standard Arduino GPIO API (pinMode, digitalWrite, digitalRead, delay,
-    millis).
+def build_arduino(req: CompileReq, spec: dict, stem: str = "main",
+                  generated: str | None = None) -> dict:
+    """Compile an Arduino sketch for `spec` (an arduino_build.BOARDS entry).
 
     Returns the same response shape as build_avr: base64 image, filename,
-    bytes, log, memory.
+    bytes, log, memory -- plus `prototypes` (what the .ino preprocessing
+    declared on the sketch's behalf) and `libraries` (which bundled libraries
+    it pulled in). `generated` is the source a pseudocode program lowered to,
+    echoed back as `c` exactly as the other pseudocode routes echo theirs.
     """
     refusal = reject_path_options(req.options)
     if refusal:
         return refusal
+    if req.format not in ("ihx", "hex", "bin"):
+        return {"success": False, "error": "format must be ihx, hex or bin"}
 
     bin_dir = stage_avr()
     if bin_dir is None:
         return {"success": False, "stage": "compile",
                 "error": "no AVR toolchain available; the avr/ bundle is not "
-                         "vendored in this deployment and no avr-gcc is on PATH"}
-
-    core_dir = os.path.join(SRC_ARDUINO_CORE, "cores", "tiny")
-    variant_dir = os.path.join(SRC_ARDUINO_CORE, "variants", spec["variant"])
-    if not os.path.isdir(core_dir) or not os.path.isdir(variant_dir):
-        return {"success": False, "stage": "compile",
-                "error": "ATTinyCore sources not found in this deployment; "
-                         "the arduino-core/ directory is missing or incomplete"}
+                         "vendored in this deployment and no avr-gcc is on PATH",
+                "c": generated}
 
     deps = os.path.join(os.path.dirname(bin_dir), "lib-deps")
     env = dict(os.environ)
     if os.path.isdir(deps):
         env["LD_LIBRARY_PATH"] = deps + os.pathsep + env.get("LD_LIBRARY_PATH", "")
 
-    f_cpu = req.fosc or spec["default_clock"]
-
-    work = os.path.join(tempfile.gettempdir(), f"build-{uuid.uuid4().hex}")
-    os.makedirs(work, exist_ok=True)
+    # The board's clock unless the caller NAMED one. `fosc` defaults to the
+    # 8051's 11.0592 MHz crystal, so reading it unconditionally built every
+    # sketch that did not mention a clock for an 11 MHz Uno: it compiled, ran
+    # on the real 16 MHz board, and every delay() was 31% short.
+    f_cpu = req.fosc if "fosc" in req.model_fields_set else None
 
     try:
-        # Write user sketch
-        sketch_code = req.code
-        if "#include <Arduino.h>" not in sketch_code and '#include "Arduino.h"' not in sketch_code:
-            sketch_code = '#include <Arduino.h>\n' + sketch_code
-        sketch_src = os.path.join(work, "sketch.c")
-        with open(sketch_src, "w", encoding="utf-8") as fh:
-            fh.write(sketch_code)
-
-        # Write main() wrapper
-        main_src = os.path.join(work, "main_wrap.c")
-        with open(main_src, "w", encoding="utf-8") as fh:
-            fh.write(_ARDUINO_MAIN_C)
-
-        gcc = os.path.join(bin_dir, "avr-gcc")
-        common_flags = [
-            f"-mmcu={spec['mcu']}", "-Os", "-std=gnu99", "-Wall",
-            "-Wno-implicit-fallthrough", "-Wno-sign-compare",
-            "-ffunction-sections", "-fdata-sections",
-            f"-DF_CPU={int(f_cpu)}UL",
-            f"-DCLOCK_SOURCE=0",
-            f"-DARDUINO=10819",
-            f"-DARDUINO_{spec['board']}",
-            "-DARDUINO_ARCH_AVR",
-            f"-I{core_dir}", f"-I{variant_dir}",
-        ]
-        for name, value in req.defines.items():
-            if not name.replace("_", "").isalnum():
-                shutil.rmtree(work, ignore_errors=True)
-                return {"success": False, "error": f"bad define name: {name!r}"}
-            common_flags.append(f"-D{name}" if value is None else f"-D{name}={value}")
-
-        if req.symbols or req.disassemble:
-            common_flags.append("-gdwarf-2")
-
-        # Compile each source to .o
-        objects = []
-        log_parts = []
-
-        # Core sources
-        for src_name in _ARDUINO_CORE_SOURCES:
-            src_path = os.path.join(core_dir, src_name)
-            obj_path = os.path.join(work, src_name.replace(".c", ".o"))
-            cmd = [gcc] + common_flags + ["-c", src_path, "-o", obj_path]
-            result = subprocess.run(cmd, capture_output=True, text=True,
-                                    timeout=COMPILE_TIMEOUT, cwd=work, env=env)
-            log_parts.append((result.stdout or "") + (result.stderr or ""))
-            if result.returncode != 0:
-                log = "\n".join(log_parts).replace(work + os.sep, "").replace(core_dir + os.sep, "core/")
-                shutil.rmtree(work, ignore_errors=True)
-                return {"success": False, "error": log.strip() or "core compilation failed",
-                        "log": log, "stage": "compile"}
-            objects.append(obj_path)
-
-        # Sketch
-        sketch_obj = os.path.join(work, "sketch.o")
-        cmd = [gcc] + common_flags + ["-c", sketch_src, "-o", sketch_obj]
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=COMPILE_TIMEOUT, cwd=work, env=env)
-        log_parts.append((result.stdout or "") + (result.stderr or ""))
-        if result.returncode != 0:
-            log = "\n".join(log_parts).replace(work + os.sep, "")
-            shutil.rmtree(work, ignore_errors=True)
-            return {"success": False, "error": log.strip() or "sketch compilation failed",
-                    "log": log, "stage": "compile"}
-        objects.append(sketch_obj)
-
-        # main() wrapper
-        main_obj = os.path.join(work, "main_wrap.o")
-        cmd = [gcc] + common_flags + ["-c", main_src, "-o", main_obj]
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=COMPILE_TIMEOUT, cwd=work, env=env)
-        log_parts.append((result.stdout or "") + (result.stderr or ""))
-        if result.returncode != 0:
-            log = "\n".join(log_parts).replace(work + os.sep, "")
-            shutil.rmtree(work, ignore_errors=True)
-            return {"success": False, "error": log.strip() or "main wrapper compilation failed",
-                    "log": log, "stage": "compile"}
-        objects.append(main_obj)
-
-        # Link
-        elf = os.path.join(work, "main.elf")
-        link_cmd = [gcc, f"-mmcu={spec['mcu']}", "-Os",
-                    "-Wl,--gc-sections", "-o", elf] + objects
-        result = subprocess.run(link_cmd, capture_output=True, text=True,
-                                timeout=COMPILE_TIMEOUT, cwd=work, env=env)
-        log_parts.append((result.stdout or "") + (result.stderr or ""))
-        if result.returncode != 0 or not os.path.exists(elf):
-            log = "\n".join(log_parts).replace(work + os.sep, "")
-            shutil.rmtree(work, ignore_errors=True)
-            return {"success": False, "error": log.strip() or "link failed",
-                    "log": log, "stage": "link"}
-
-        log = "\n".join(log_parts).replace(work + os.sep, "").replace(core_dir + os.sep, "core/")
-
-        # objcopy → hex or bin
-        objcopy = os.path.join(bin_dir, "avr-objcopy")
-        if req.format == "bin":
-            out = os.path.join(work, "main.bin")
-            name = f"{stem}.bin"
-            copy_args = ["-O", "binary"]
-        else:
-            out = os.path.join(work, "main.hex")
-            name = f"{stem}.hex"
-            copy_args = ["-O", "ihex"]
-        subprocess.run([objcopy, *copy_args, "-R", ".eeprom", elf, out],
-                       capture_output=True, timeout=10, env=env)
-        if not os.path.exists(out):
-            return {"success": False, "error": "avr-objcopy produced no image",
-                    "log": log}
-        with open(out, "rb") as fh:
-            blob = fh.read()
-
-        # Memory report
-        mem = ""
-        try:
-            sized = subprocess.run(
-                [os.path.join(bin_dir, "avr-size"), f"--mcu={spec['mcu']}",
-                 "--format=avr", elf],
-                capture_output=True, text=True, timeout=10, env=env)
-            mem = sized.stdout or ""
-        except (OSError, subprocess.SubprocessError):
-            pass
-
-        return {
-            "success": True,
-            "c": None,
-            "translated": None,
-            "unresolved": None,
-            "warnings": None,
-            "disassembly": None,
-            "listing": None,
-            "base64": base64.b64encode(blob).decode("ascii"),
-            "filename": name,
-            "bytes": len(blob),
-            "log": log,
-            "memory": mem,
-            "symbols": None,
-            "symbols_error": None,
-            "toolchain": "avr-gcc+ATTinyCore",
-            "mcu": spec["mcu"],
-            "f_cpu": int(f_cpu),
-        }
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+        out = arduino_build.build(
+            req.code, spec, bin_dir=bin_dir, env=env, f_cpu=f_cpu,
+            defines=req.defines, fmt=req.format, stem=stem,
+            timeout=COMPILE_TIMEOUT, disassemble=req.disassemble,
+            symbols=req.symbols)
+    except arduino_build.ArduinoBuildError as exc:
+        return {"success": False, "error": str(exc), "log": exc.log or str(exc),
+                "stage": exc.stage, "c": generated}
+    out["c"] = generated
+    return out
 
 
 def build_arm(req: CompileReq, spec: dict, generated_c: str | None,
@@ -1486,6 +1516,166 @@ def _fosc_from_source(code: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def build_riscv(req: CompileReq, spec: dict, generated_c: str | None,
+                stem: str = "main") -> dict:
+    """Compile C for RV32IM by running shecc as WebAssembly (see riscv_cc.py).
+
+    Same base response shape as the other toolchains — base64 image, filename,
+    bytes, log, memory — plus ``entry`` and an ``image`` of {entry, segments}
+    (each segment base64). The image is not a flashable HEX/binary: it is the
+    PT_LOAD picture an emulated RV32 machine boots, so there is no objcopy and
+    no symbol/disassembly path (shecc ships neither).
+    """
+    refusal = reject_path_options(req.options)
+    if refusal:
+        return refusal
+
+    if not riscv_cc.available():
+        return {"success": False, "stage": "compile",
+                "error": "no RISC-V compiler available; riscv/riscv-cc.wasm is "
+                         "not vendored in this deployment, or wasmtime is not "
+                         "installed",
+                "c": generated_c}
+
+    try:
+        ok, elf, log = riscv_cc.compile_c(req.code)
+    except riscv_cc.RiscvUnavailable as exc:
+        return {"success": False, "stage": "compile",
+                "error": f"the RISC-V compiler could not run: {exc}",
+                "c": generated_c}
+    if not ok:
+        return {"success": False, "stage": "compile", "error": log or "compilation failed",
+                "log": log, "c": generated_c}
+
+    try:
+        image = riscv_cc.elf32_to_image(elf)
+    except ValueError as exc:
+        return {"success": False, "stage": "compile",
+                "error": f"the compiler produced no loadable image: {exc}",
+                "log": log, "c": generated_c}
+
+    total = sum(len(s["bytes"]) for s in image["segments"])
+    mem = (f"RV32 image: {total} bytes across {len(image['segments'])} segment(s), "
+           f"entry 0x{image['entry']:x}")
+    return {
+        "success": True,
+        "c": generated_c,
+        "translated": None,
+        "unresolved": None,
+        "warnings": None,
+        "disassembly": None,
+        "listing": None,
+        "base64": base64.b64encode(elf).decode("ascii"),
+        "filename": f"{stem}.elf",
+        "bytes": len(elf),
+        "log": log,
+        "memory": mem,
+        "symbols": None,
+        "symbols_error": None,
+        "toolchain": "shecc",
+        "mcu": spec["mcu"],
+        "entry": image["entry"],
+        # The loadable image, ready for the RV32 machine: each segment's bytes
+        # base64-encoded at its virtual address. A client without an ELF parser
+        # uses this directly; one with a parser can re-derive it from base64.
+        "image": {
+            "entry": image["entry"],
+            "segments": [
+                {"addr": s["addr"], "bytes": base64.b64encode(s["bytes"]).decode("ascii")}
+                for s in image["segments"]
+            ],
+        },
+    }
+
+
+def build_riscv_gcc(req: CompileReq, spec: dict, generated_c: str | None,
+                    stem: str = "main") -> dict:
+    """Compile ARBITRARY C for RV32 with the native gcc + picolibc bundle.
+
+    The full-C companion to build_riscv (shecc's subset): floats, malloc,
+    qsort, math.h, string.h. Same {entry, segments} image an emulated RV32IM
+    machine boots — the difference is the compiler. Freestanding: the tiny
+    startup + picolibc console live in riscv-gcc/runtime/ over the machine's
+    ECALL ABI, so there is no hosted libc syscall layer and no execution here.
+    """
+    refusal = reject_path_options(req.options)
+    if refusal:
+        return refusal
+
+    bin_dir = stage_riscv_gcc()
+    if bin_dir is None:
+        return {"success": False, "stage": "compile",
+                "error": "no RISC-V gcc toolchain available; the riscv-gcc/ bundle "
+                         "is not vendored in this deployment and no "
+                         "riscv64-unknown-elf-gcc is on PATH",
+                "c": generated_c}
+
+    root = os.path.dirname(bin_dir)
+    runtime = os.path.join(root, "runtime")
+    picoinc = os.path.join(root, "picolibc", "include")
+    picolib = os.path.join(root, "picolibc", "lib")
+    deps = os.path.join(root, "lib-deps")
+    env = dict(os.environ)
+    if os.path.isdir(deps):
+        env["LD_LIBRARY_PATH"] = deps + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+
+    work = os.path.join(tempfile.gettempdir(), f"build-{uuid.uuid4().hex}")
+    os.makedirs(work, exist_ok=True)
+    try:
+        src = os.path.join(work, "main.c")
+        with open(src, "w", encoding="utf-8") as handle:
+            handle.write(req.code)
+        elf = os.path.join(work, f"{stem}.elf")
+        cmd = [os.path.join(bin_dir, "riscv64-unknown-elf-gcc"),
+               "-march=rv32imac", "-mabi=ilp32", "-Os",
+               "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
+               "-nostdlib", "-isystem", picoinc,
+               "-T", os.path.join(runtime, "riscv-cc.ld"),
+               os.path.join(runtime, "crt0.S"), os.path.join(runtime, "console.c"), src]
+        for name, val in (req.defines or {}).items():
+            cmd.append(f"-D{name}" + (f"={val}" if val is not None else ""))
+        cmd += list(req.options or [])
+        cmd += ["-L" + picolib, "-lc", "-lm", "-lgcc", "-o", elf]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=COMPILE_TIMEOUT, cwd=work, env=env)
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": f"compile timed out after {COMPILE_TIMEOUT}s"}
+        log = (proc.stdout + proc.stderr).replace(work + os.sep, "")
+        if proc.returncode != 0 or not os.path.exists(elf):
+            return {"success": False, "stage": "compile",
+                    "error": log or "compilation failed", "log": log, "c": generated_c}
+        with open(elf, "rb") as handle:
+            elf_bytes = handle.read()
+        try:
+            image = riscv_cc.elf32_to_image(elf_bytes)
+        except ValueError as exc:
+            return {"success": False, "stage": "compile",
+                    "error": f"the compiler produced no loadable image: {exc}",
+                    "log": log, "c": generated_c}
+        total = sum(len(s["bytes"]) for s in image["segments"])
+        mem = (f"RV32 image: {total} bytes across {len(image['segments'])} segment(s), "
+               f"entry 0x{image['entry']:x}")
+        return {
+            "success": True, "c": generated_c, "translated": None, "unresolved": None,
+            "warnings": None, "disassembly": None, "listing": None,
+            "base64": base64.b64encode(elf_bytes).decode("ascii"),
+            "filename": f"{stem}.elf", "bytes": len(elf_bytes), "log": log, "memory": mem,
+            "symbols": None, "symbols_error": None,
+            "toolchain": "riscv64-unknown-elf-gcc", "mcu": spec["mcu"],
+            "entry": image["entry"],
+            "image": {
+                "entry": image["entry"],
+                "segments": [
+                    {"addr": s["addr"], "bytes": base64.b64encode(s["bytes"]).decode("ascii")}
+                    for s in image["segments"]
+                ],
+            },
+        }
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def build(req: CompileReq) -> dict:
     """Compile and return the JSON-shaped result. Shared by both endpoints."""
     if len(req.code.encode("utf-8")) > MAX_SOURCE_BYTES:
@@ -1518,6 +1708,13 @@ def build(req: CompileReq) -> dict:
         req = req.model_copy(update={"fosc": None})
         if chip.toolchain == "avr-gcc":
             return build_avr(req, AVR_TARGETS[chip.key], generated_c, None, stem)
+        if chip.toolchain == "arduino-core":
+            # The emitted sketch is compiled exactly as a hand-written one
+            # is; the board is the DEVICE line's (the Nano's variant is not
+            # the Uno's), and F_CPU is the board's, which is why the Arduino
+            # emitter ignores CLOCK.
+            return build_arduino(req, ARDUINO_TARGETS[chip.key], stem,
+                                 generated=generated_c)
         if chip.toolchain == "arm-none-eabi-gcc":
             return build_arm(req, ARM_TARGETS[chip.key], generated_c, stem)
         if chip.toolchain == "sdcc-mcs51" and chip.key in TARGETS:
@@ -1547,15 +1744,14 @@ def build(req: CompileReq) -> dict:
         keil_warnings = result.warnings
         req = req.model_copy(update={"code": generated_c})
     elif req.language.lower() in ("arduino", "ino"):
-        # Arduino sketch: compile with ATTinyCore for a tiny target.
-        # The target field selects the MCU; only those with ATTinyCore variant
-        # support are accepted.
+        # Arduino sketch: real C++ against the vendored core the target
+        # names -- ArduinoCore-avr for the ATmegas, ATTinyCore for the tinys.
         spec = ARDUINO_TARGETS.get(req.target.lower())
         if spec is None:
             known = sorted(ARDUINO_TARGETS)
             return {"success": False,
-                    "error": f"Arduino language requires a supported ATtiny target; "
-                             f"got '{req.target}'. Known: {', '.join(known)}"}
+                    "error": f"the Arduino language has no board '{req.target}'. "
+                             f"Known: {', '.join(known)}"}
         return build_arduino(req, spec, stem)
     elif req.language.lower() != "c":
         return {"success": False,
@@ -1574,7 +1770,9 @@ def build(req: CompileReq) -> dict:
             return {"success": False,
                     "error": "the Keil C51 dialect is 8051-only; it cannot be "
                              f"compiled for {avr['mcu']}"}
-        return build_avr(req, avr, generated_c, req.fosc)
+        return build_avr(req, avr, generated_c,
+                         req.fosc if "fosc" in req.model_fields_set
+                         else avr["default_clock"])
 
     arm = ARM_TARGETS.get(req.target.lower())
     if arm is not None:
@@ -1599,11 +1797,20 @@ def build(req: CompileReq) -> dict:
                     "error": "the Keil C51 dialect is 8051-only; it cannot be "
                              "compiled for the Z80"}
         return build_z80(req, z80, generated_c, stem)
+    riscv = RISCV_TARGETS.get(req.target.lower())
+    if riscv is not None:
+        if keil_changes:
+            return {"success": False,
+                    "error": "the Keil C51 dialect is 8051-only; it cannot be "
+                             "compiled for RISC-V"}
+        if riscv.get("toolchain") == "riscv64-unknown-elf-gcc":
+            return build_riscv_gcc(req, riscv, generated_c, stem)
+        return build_riscv(req, riscv, generated_c, stem)
 
     target = TARGETS.get(req.target.lower())
     if target is None:
         known = sorted(list(TARGETS) + list(AVR_TARGETS) + list(ARM_TARGETS)
-                       + list(EATER_TARGETS) + list(Z80_TARGETS))
+                       + list(EATER_TARGETS) + list(Z80_TARGETS) + list(RISCV_TARGETS))
         return {"success": False,
                 "error": f"unknown target '{req.target}'; known: {', '.join(known)}"}
 
@@ -1782,9 +1989,18 @@ def build(req: CompileReq) -> dict:
 
 
 @app.post("/compile")
-async def compile_source(req: CompileReq):
-    """Compile and return the image base64-encoded inside JSON."""
-    return build(req)
+async def compile_source(req: CompileReq, request: Request = None):
+    """Compile and return the image base64-encoded inside JSON.
+
+    Over HTTP this is behind a best-effort per-instance rate limit + concurrency
+    cap (see _guarded_build): the endpoint hands untrusted source to real
+    compilers. FastAPI always injects the live Request for an HTTP call; a
+    DIRECT in-process call (tests, the CI service job) passes no request and is
+    trusted — it skips the guard and compiles straight away.
+    """
+    if request is None:
+        return build(req)
+    return _guarded_build(req, request)
 
 
 class DisassembleReq(BaseModel):
@@ -2524,6 +2740,30 @@ async def health():
         except Exception:  # noqa: BLE001 - absence is reported, not raised
             avr_version = ""
 
+    # The Arduino route needs two more compilers proper than C does: cc1plus
+    # for the sketch and core, lto1 for the -flto link. Probed the way cc1 is
+    # above, because the driver answering --version says nothing about them.
+    arduino_cpp = None
+    if avr_bin and avr_version and not avr_version.startswith("BROKEN"):
+        try:
+            missing = []
+            for prog in ("cc1plus", "lto1"):
+                path = subprocess.run(
+                    [os.path.join(avr_bin, "avr-gcc"), f"-print-prog-name={prog}"],
+                    capture_output=True, text=True, timeout=10,
+                    env=health_env).stdout.strip()
+                if not (path and os.path.exists(path)) or subprocess.run(
+                        [path, "--version"], capture_output=True, timeout=10,
+                        env=health_env, stdin=subprocess.DEVNULL).returncode != 0:
+                    missing.append(prog)
+            with open(os.path.join(SRC_ARDUINO_CORE, "VERSION")) as fh:
+                cores = [line.split()[0] + " " + line.split()[-1].strip("()")
+                         for line in fh if line.startswith(("ArduinoCore", "ATTiny"))]
+            arduino_cpp = (f"BROKEN: {', '.join(missing)} will not start" if missing
+                           else "; ".join(cores))
+        except Exception:  # noqa: BLE001 - absence is reported, not raised
+            arduino_cpp = None
+
     # ARM side — same pattern as AVR.
     arm_bin = stage_arm()
     arm_version = ""
@@ -2568,13 +2808,34 @@ async def health():
         except Exception:  # noqa: BLE001
             cc65_version = ""
 
+    # RISC-V — both routes, reported like the others (never fails the check).
+    # shecc runs as wasm under wasmtime; the full-C target is a native bundle
+    # probed the same way as ARM/AVR.
+    riscv_wasm_ok = riscv_cc.available()
+    riscv_gcc_bin = stage_riscv_gcc()
+    riscv_gcc_version = ""
+    if riscv_gcc_bin:
+        try:
+            deps = os.path.join(os.path.dirname(riscv_gcc_bin), "lib-deps")
+            henv = dict(os.environ)
+            if os.path.isdir(deps):
+                henv["LD_LIBRARY_PATH"] = deps + os.pathsep + henv.get("LD_LIBRARY_PATH", "")
+            riscv_gcc_version = subprocess.run(
+                [os.path.join(riscv_gcc_bin, "riscv64-unknown-elf-gcc"), "--version"],
+                capture_output=True, text=True, timeout=10, env=henv).stdout
+        except Exception:  # noqa: BLE001 - absence is reported, not raised
+            riscv_gcc_version = ""
+
     return {
         "ok": True,
         "version": os.environ.get("VERCEL_GIT_COMMIT_SHA", "")[:7] or "unknown",
         "sdcc": version.strip().splitlines()[0] if version else "",
         "avr_gcc": avr_version.strip().splitlines()[0] if avr_version else None,
+        "arduino_cpp": arduino_cpp,
         "arm_gcc": arm_version.strip().splitlines()[0] if arm_version else None,
         "cc65": cc65_version.strip().splitlines()[0] if cc65_version else None,
+        "riscv_gcc": riscv_gcc_version.strip().splitlines()[0] if riscv_gcc_version else None,
+        "riscv_wasm": "shecc (wasm)" if riscv_wasm_ok else None,
         "targets": {name: cfg["description"] for name, cfg in TARGETS.items()},
         "avr_targets": ({name: cfg["description"] for name, cfg in AVR_TARGETS.items()}
                         if avr_bin else {}),
@@ -2591,6 +2852,7 @@ async def health():
                            for name, cfg in EATER_TARGETS.items()}
                           if cc65_bin else {}),
         "z80_targets": {name: cfg["description"] for name, cfg in Z80_TARGETS.items()},
+        "riscv_targets": {name: cfg["description"] for name, cfg in RISCV_TARGETS.items()},
         "devices": sorted(stc_pseudocode.TARGETS),
         "assemble_targets": sorted(ASSEMBLE_TARGETS.keys()),
     }
@@ -2707,7 +2969,7 @@ PAGE = r"""<!doctype html>
       <option value=pseudocode>Pseudocode</option>
       <option value=c selected>C</option>
       <option value=keil>Keil C51</option>
-      <option value=arduino>Arduino (ATtiny)</option>
+      <option value=arduino>Arduino sketch (C++)</option>
     </select>
   </label>
   <label>target
@@ -2722,6 +2984,14 @@ PAGE = r"""<!doctype html>
       <optgroup label="AVR (avr-gcc)">
         <option value=atmega328p>ATmega328P &mdash; Uno / Nano</option>
         <option value=atmega168p>ATmega168P</option>
+        <option value=atmega2560>ATmega2560 &mdash; Mega</option>
+        <option value=attiny85>ATtiny85</option>
+        <option value=attiny88>ATtiny88</option>
+      </optgroup>
+      <optgroup label="Arduino boards (sketch)">
+        <option value=arduino-uno>Arduino Uno</option>
+        <option value=arduino-nano>Arduino Nano</option>
+        <option value=arduino-mega>Arduino Mega 2560</option>
       </optgroup>
     </select>
   </label>
@@ -2826,7 +3096,10 @@ $('go').onclick = async () => {
         code: $('code').value,
         language: $('language').value,
         target: $('target').value,
-        fosc: parseInt($('fosc').value, 10) || null,
+        // Omitted, not null, when the field is off: a sketch is built for
+        // its board's crystal unless a clock is SENT, and this field's
+        // default is the 8051's 11.0592 MHz.
+        fosc: $('fosc').disabled ? undefined : (parseInt($('fosc').value, 10) || null),
         format,
         disassemble: true,
       })
@@ -2954,7 +3227,8 @@ $('copy').onclick = async () => {
   setTimeout(() => { $('copy').textContent = previous; }, 1200);
 };
 
-const STARTERS = {c: $('code').value, pseudocode: __PSEUDO_EXAMPLE__};
+const STARTERS = {c: $('code').value, pseudocode: __PSEUDO_EXAMPLE__,
+                  arduino: __ARDUINO_EXAMPLE__, keil: $('code').value};
 let lastLanguage = $('language').value;
 $('language').onchange = () => {
   const next = $('language').value;
@@ -2963,7 +3237,11 @@ $('language').onchange = () => {
     $('code').value = STARTERS[next];
   }
   lastLanguage = next;
-  $('fosc').disabled = (next === 'pseudocode');   // pseudocode carries CLOCK
+  // pseudocode carries CLOCK; a sketch is built for its board's crystal.
+  $('fosc').disabled = (next === 'pseudocode' || next === 'arduino');
+  if (next === 'arduino' && !/^(arduino-|atmega|attiny)/.test($('target').value)) {
+    $('target').value = 'arduino-uno';
+  }
 };
 $('language').onchange();
 
@@ -2997,10 +3275,52 @@ $('code').addEventListener('keydown', event => {
 """
 
 
+# The page's starter for `language: "arduino"`: the C++ the C route could
+# never take -- a class, String, Serial -- so choosing the language shows why
+# it exists.
+ARDUINO_EXAMPLE = """\
+// An Arduino sketch: real C++ against the Arduino core.
+class Blinker {
+ public:
+  Blinker(uint8_t pin, unsigned long period) : pin_(pin), period_(period) {}
+  void begin() { pinMode(pin_, OUTPUT); }
+  void update() {
+    if (millis() - last_ >= period_) {
+      last_ = millis();
+      digitalWrite(pin_, !digitalRead(pin_));
+      report(last_);          // defined below: its prototype is generated
+    }
+  }
+ private:
+  uint8_t pin_;
+  unsigned long period_;
+  unsigned long last_ = 0;
+};
+
+Blinker led(LED_BUILTIN, 500);
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println(F("hello from C++"));
+  led.begin();
+}
+
+void loop() {
+  led.update();
+}
+
+void report(unsigned long t) {
+  Serial.println(String("toggled at ") + t + " ms");
+}
+"""
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     # RCDATA inside <textarea> tolerates a bare "<", but "&" would be read as
     # an entity -- and the example has "&=" in it. Escape properly.
     return (PAGE.replace("__EXAMPLE__", html.escape(EXAMPLE))
                 .replace("__PSEUDO_EXAMPLE__", json.dumps(stc_pseudocode.EXAMPLE))
+                .replace("__ARDUINO_EXAMPLE__",
+                         json.dumps(ARDUINO_EXAMPLE).replace("</", "<\\/"))
                 .replace("__ABOUT__", about_html()))

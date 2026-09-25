@@ -61,6 +61,30 @@ jobs:
       - name: Build the vendored bundle
         run: ./scripts/fetch-avr-gcc.sh
 
+      # The script leaves cc1/cc1plus/lto1 xz-compressed, as committed (the
+      # 225 MB Vercel limit); every check below executes or inspects them, so
+      # they are decompressed in place first, exactly as stage_avr() does.
+      # The committed bundle must be what the script builds, or CI is testing a
+      # different toolchain from the one that deploys. Until 2026-09-24 it was
+      # not: iotn88.h and libattiny88.a had been added by hand from another
+      # avr-libc (same code, different metadata). Everything is compared byte
+      # for byte except the three .xz files, whose bytes depend on the local
+      # liblzma; those are compared DECOMPRESSED, after the next step.
+      - name: The rebuilt bundle is the committed bundle
+        run: git diff --exit-code --stat -- avr vendor/avr ':(exclude)*.xz'
+
+      - name: Decompress the compilers, as staging does
+        run: python3 bundle_xz.py materialize avr
+
+      - name: The committed compressed compilers decompress to the rebuilt ones
+        run: |
+          set -euo pipefail
+          d="avr/lib/gcc/avr/$(cat avr/GCC_VERSION)"
+          for prog in cc1 cc1plus lto1; do
+            git show "HEAD:$d/$prog.xz" | xz -dc | cmp - "$d/$prog"
+            echo "  $prog: committed .xz == rebuilt"
+          done
+
       # Where the toolchain ACTUALLY looks, printed before anything asserts.
       # Debian bakes absolute paths into gcc and relocates them relative to
       # argv[0]; guessing which ones survive a move has cost two CI rounds
@@ -123,17 +147,31 @@ jobs:
       - name: Bundle size and GLIBC floor
         run: |
           du -sh avr
-          echo "cc1 needs at most:"
-          strings "avr/lib/gcc/avr/$(cat avr/GCC_VERSION)/cc1" \
-            | grep -oE 'GLIBC_2\.[0-9]+' | sort -V | tail -1
           # Vercel runs Amazon Linux 2023 (glibc 2.34). Anything above that
           # will not start there, and this is the only place it gets caught.
-          need="$(strings "avr/lib/gcc/avr/$(cat avr/GCC_VERSION)/cc1" \
-                   | grep -oE 'GLIBC_2\.[0-9]+' | sort -V | tail -1 | cut -d_ -f2)"
-          if [ "$(printf '%s\n2.34\n' "$need" | sort -V | tail -1)" != "2.34" ]; then
-            echo "::error::cc1 needs GLIBC $need, above Vercel's 2.34"
-            exit 1
-          fi
+          # All three compilers proper: cc1 (C), cc1plus (the Arduino route's
+          # C++) and lto1 (its -flto link) are separate programs, and a C
+          # compile that works proves nothing about the other two.
+          for prog in cc1 cc1plus lto1; do
+            f="avr/lib/gcc/avr/$(cat avr/GCC_VERSION)/$prog"
+            test -x "$f" || { echo "::error::$prog missing from the bundle"; exit 1; }
+            need="$(strings "$f" | grep -oE 'GLIBC_2\.[0-9]+' | sort -V | tail -1 | cut -d_ -f2)"
+            echo "$prog needs at most GLIBC $need"
+            if [ "$(printf '%s\n2.34\n' "$need" | sort -V | tail -1)" != "2.34" ]; then
+              echo "::error::$prog needs GLIBC $need, above Vercel's 2.34"
+              exit 1
+            fi
+          done
+
+      # The rebuilt bundle (not the committed one) compiles real Arduino C++:
+      # app.py stages whatever is in avr/, which this job just regenerated.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: The rebuilt bundle compiles Arduino C++ for every board
+        run: |
+          pip install --quiet pytest fastapi pydantic
+          python3 -m pytest -q test_arduino_cpp.py
 
       # avr/ is gitignored, so this is how a verified bundle gets off the
       # runner without 45 MB of binaries landing in git history.
@@ -142,6 +180,101 @@ jobs:
           name: avr-toolchain
           path: avr/
           retention-days: 14
+
+  # The full-C RISC-V bundle (riscv-gcc/): native gcc + picolibc for the
+  # riscv32-gcc target. Unlike avr-bundle this VERIFIES THE COMMITTED bundle
+  # rather than rebuilding it (~250 MB of Debian debs per run) — the bundle
+  # ships in git and Vercel deploys it as-is, so the checks that matter are:
+  # every non-glibc dep travels with it, nothing needs GLIBC > 2.34, it
+  # compiles real C, and it stays within the deploy budget.
+  # scripts/fetch-riscv-gcc.sh reproduces it from source out of band.
+  riscv-gcc-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The check CI cannot make by running things: the runner HAS libstdc++,
+      # libisl, etc., so a bundle that forgot to vendor one compiles here and
+      # dies on Vercel with "error while loading shared libraries". Static.
+      - name: Every non-glibc dependency travels with the bundle
+        run: python3 ./scripts/elf-needed.py --check riscv-gcc
+
+      - name: Nothing needs GLIBC above Vercel's 2.34
+        run: |
+          set -euo pipefail
+          worst=2.0
+          for f in $(find riscv-gcc/bin riscv-gcc/lib/gcc riscv-gcc/lib/riscv64-unknown-elf/bin riscv-gcc/lib-deps -type f); do
+            need="$(objdump -T "$f" 2>/dev/null | grep -oE 'GLIBC_2\.[0-9]+' | sort -V | tail -1 | cut -d_ -f2 || true)"
+            [ -n "$need" ] && [ "$(printf '%s\n%s\n' "$worst" "$need" | sort -V | tail -1)" = "$need" ] && worst="$need"
+          done
+          echo "highest GLIBC required across the bundle: $worst"
+          if [ "$(printf '%s\n2.34\n' "$worst" | sort -V | tail -1)" != "2.34" ]; then
+            echo "::error::the bundle needs GLIBC $worst, above Vercel's 2.34"; exit 1
+          fi
+
+      - name: It compiles real C (floats, malloc, qsort) to an rv32 ELF
+        run: |
+          set -euo pipefail
+          B="$PWD/riscv-gcc"
+          cat > /tmp/full.c <<'C'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <math.h>
+          static int cmp(const void*a,const void*b){return *(const int*)a-*(const int*)b;}
+          int main(void){int v[3]={3,1,2};qsort(v,3,sizeof(int),cmp);
+            char*p=malloc(8);p[0]='x';printf("%d%d%d %.3f %c\n",v[0],v[1],v[2],sqrt(2.0),p[0]);free(p);return 0;}
+          C
+          LD_LIBRARY_PATH="$B/lib-deps" "$B/bin/riscv64-unknown-elf-gcc" \
+            -march=rv32imac -mabi=ilp32 -Os -Wall -Werror -nostdlib \
+            -isystem "$B/picolibc/include" -T "$B/runtime/riscv-cc.ld" \
+            "$B/runtime/crt0.S" "$B/runtime/console.c" /tmp/full.c \
+            -L"$B/picolibc/lib" -lc -lm -lgcc -o /tmp/full.elf
+          test -s /tmp/full.elf
+          # e_machine (offset 18, LE) must be 243 (RISC-V)
+          python3 - <<'PY'
+          b=open('/tmp/full.elf','rb').read()
+          assert b[:4]==b'\x7fELF' and b[4]==1 and (b[18]|b[19]<<8)==243, "not an rv32 ELF32"
+          print("rv32 ELF32 OK,", len(b), "bytes")
+          PY
+
+      - name: Bundle size stays within the deploy budget
+        run: |
+          set -euo pipefail
+          kb=$(du -sk riscv-gcc arm avr cc65 | awk '{s+=$1} END{print s}')
+          mb=$((kb/1024))
+          echo "committed toolchain bundles total: ${mb} MB"
+          # Vercel's function ceiling is 250 MB unzipped (bundles + python + app).
+          # Keep the toolchains comfortably under it; the riscv-gcc bundle must
+          # not have ballooned (a lost --strip-debug, an extra multilib).
+          if [ "$mb" -gt 170 ]; then
+            echo "::error::toolchain bundles are ${mb} MB (>170); trim riscv-gcc"; exit 1
+          fi
+
+      # The budget above counts four toolchain directories; Vercel counts the
+      # whole deployment against a hard 225 MB: tracked files + the installed
+      # Python dependencies + a fixed runtime overhead. Calibrated from two
+      # real deploys on 2026-09-24: 171.67 MB tracked + 47.43 MB of deps was
+      # REFUSED at 235.56 MB, so the overhead is ~16.5 MB and tracked + deps
+      # must stay under ~208.5 MB. Measuring the deps (not assuming them) is
+      # what makes a requirements.txt bump -- wasmtime alone is 32 MB -- trip
+      # this instead of a deploy.
+      - name: The whole deployment fits Vercel's 225 MB function limit
+        run: |
+          set -euo pipefail
+          tracked=$(git ls-files -z | xargs -0 stat -c '%s %F' | awk '$2=="regular"{s+=$1} END{print s}')
+          python3 -m pip install -q --target /tmp/deploy-deps \
+            --platform manylinux2014_x86_64 --python-version 3.12 \
+            --only-binary=:all: -r requirements.txt
+          deps=$(du -sb /tmp/deploy-deps | cut -f1)
+          total=$(( (tracked + deps) / 1000000 ))
+          echo "tracked $((tracked/1000000)) MB + python deps $((deps/1000000)) MB = ${total} MB (limit 203; Vercel refuses above ~208)"
+          if [ "$total" -gt 203 ]; then
+            echo "::error::tracked files + python deps are ${total} MB; with ~16.5 MB of runtime overhead the deployment would exceed Vercel's 225 MB. Compress a binary with bundle_xz.py, trim a bundle, or drop a dependency."
+            exit 1
+          fi
 
   # The pytest suite at the repository root: the dialect, every PART, the
   # display verbs, the Arcade back end, the five assembler chains, UF2,
@@ -162,9 +295,31 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install --quiet pytest fastapi pydantic
+      # wasmtime runs the vendored shecc.wasm for the RISC-V target; installing
+      # it here means test_riscv_build.py actually exercises that path rather
+      # than skipping it (qemu-riscv32 is absent, so only its run subtest skips).
+      - run: pip install --quiet pytest fastapi pydantic wasmtime
       - name: The root pytest suite
         run: python3 -m pytest -q test_*.py
+
+  # Arduino C++ that RUNS. test_arduino_cpp.py proves sketches link; this
+  # builds them through compile_source and executes them in avr8js, asserting
+  # on what the simulated chip transmitted and how often its LED toggled --
+  # at the board's own crystal, so an image built for the wrong F_CPU fails.
+  arduino-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: pip install --quiet fastapi pydantic
+      - run: npm install --no-save avr8js@0.21.1
+      - name: Sketches run in avr8js and print what they should
+        run: python3 ./scripts/test-arduino-run.py
 
   # The static site. It claims to run the project's own transpiler in the
   # browser rather than a JavaScript copy of it, and the only way to know
@@ -239,12 +394,14 @@ jobs:
           else:
               print(f"  ok  C -> {r['bytes']} B")
 
-          # Arduino core C++ must still be refused, and say what to use instead.
+          # Arduino core C++ builds (it was refused, naming arduino-cli, until
+          # the bundle kept cc1plus and the core was vendored). This job has a
+          # SYSTEM gcc-avr as well; the image must come from the core route.
           r = run(code=open("scripts/golden/arduino.bw").read(), language="pseudocode")
-          if r.get("success") or "arduino-cli" not in (r.get("error") or ""):
-              fails.append(f"arduino core should be refused: {r.get('error')}")
+          if not r.get("success") or r.get("toolchain") != "avr-gcc+ArduinoCore-avr":
+              fails.append(f"arduino core should build: {r.get('error')}")
           else:
-              print("  ok  arduino core refused, names the toolchain")
+              print(f"  ok  arduino core C++ -> {r['filename']} {r['bytes']} B")
 
           if fails:
               print("\n".join("  FAIL " + f for f in fails)); sys.exit(1)

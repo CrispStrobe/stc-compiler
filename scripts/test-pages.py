@@ -102,6 +102,15 @@ if index.exists():
           "cdn.jsdelivr.net/pyodide/v" in page and "/latest/" not in page)
     check("the transpiler runs in the page, not on a server",
           "bw_transpile" in page and "loadPyodide" in page)
+    # RISC-V C compiles AND runs in the page, with no server. The live path is
+    # exercised by scripts/check-pages.js; this is the staleness gate that the
+    # wiring is present and pinned (a branch ref would drift silently).
+    check("the page offers a RISC-V C mode that compiles and runs locally",
+          'id=rvmode' in page and 'id=rvrun' in page
+          and 'compileRiscvC' in page and 'RiscV32Machine' in page)
+    check("the RISC-V engine is loaded from bw-board at a pinned commit, not a branch",
+          "cdn.jsdelivr.net/gh/CrispStrobe/bw-board@" in page
+          and bool(re.search(r"BW_BOARD_PIN\s*=\s*['\"][0-9a-f]{40}['\"]", page)))
     # Does the page's script actually parse?
     #
     # The Python that runs in Pyodide is embedded in a JavaScript template

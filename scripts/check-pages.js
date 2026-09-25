@@ -185,6 +185,34 @@ const { chromium } = require('playwright');
   ok('a bad checksum still throws in the browser', /checksum/.test(threw || ''),
      String(threw));
 
+  // --- RISC-V C: compiled AND run in the page, no server ------------------
+  //
+  // The one target that never touches the hosted API. Ticking "RISC-V C" and
+  // pressing Compile & Run imports the bw-board engine (shecc→wasm compiler +
+  // RV32 machine) from jsDelivr — reachable here, as Pyodide already proves —
+  // compiles the default C, and boots it. We assert the program's own output,
+  // so this exercises the whole client-side path end to end, not just that a
+  // button exists. Left for last: it hides #go and disables #example.
+  await page.check('#rvmode');
+  await page.waitForTimeout(200);
+  await page.click('#rvrun');
+  let rvout = '';
+  try {
+    await page.waitForFunction(
+      () => /fib\(9\) = 34/.test(document.getElementById('out').textContent),
+      { timeout: 45000 });
+    rvout = await page.textContent('#out');
+  } catch (e) {
+    rvout = 'TIMEOUT: ' + (await page.textContent('#out')).slice(0, 120)
+          + ' [status: ' + (await page.textContent('#status')) + ']';
+  }
+  ok('RISC-V C compiles and runs in the browser, no server',
+     /hello from RISC-V, no server/.test(rvout) && /fib\(9\) = 34/.test(rvout),
+     rvout.slice(0, 100));
+  ok('...and the status says it ran with no server',
+     /no server/.test(await page.textContent('#status'))
+     && (await page.getAttribute('#status', 'class')) === 'ok');
+
   ok('no uncaught page errors', errors.length === 0, errors.slice(0, 2).join(' | '));
 
   await browser.close();
