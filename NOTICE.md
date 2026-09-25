@@ -10,7 +10,7 @@ their own upstream licenses.
 
 | Vendored artifact | Upstream project | License |
 |---|---|---|
-| `bin/sdcc`, `bin/sdcpp`, `bin/sdas8051`, `bin/sdld`, `bin/packihx`, `bin/makebin` | [SDCC — Small Device C Compiler](https://sdcc.sourceforge.net/) | **GPL-2.0-or-later** |
+| `bin/sdcc`, `bin/sdcpp`, `bin/sdas8051`, `bin/sdld`, `bin/sdasz80`, `bin/sdldz80`, `bin/packihx`, `bin/makebin` | [SDCC — Small Device C Compiler](https://sdcc.sourceforge.net/) | **GPL-2.0-or-later** |
 | `share/sdcc/include/**`, `share/sdcc/lib/**` | SDCC runtime headers and libraries | **GPL-2.0-or-later with a linking exception** (see below) |
 | `avr/bin/**`, `avr/lib/gcc/**`, `avr/libexec/**` | [GCC](https://gcc.gnu.org/) for AVR + GNU binutils | **GPL-3.0-or-later**, runtime under the **GCC Runtime Library Exception** |
 | `avr/lib/avr/include/**`, `avr/lib/avr/lib*/**` | [avr-libc](https://github.com/avrdudes/avr-libc) | **BSD-3-Clause** |

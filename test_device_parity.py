@@ -90,6 +90,17 @@ class TestDeviceParity(unittest.TestCase):
             sp.parse(_blink("EATER6502", 1000000, "PA0"))
         self.assertIn("no pseudocode generator", str(caught.exception))
 
+    # ---- Z80 ----
+    def test_z80_refuses_rather_than_emitting_the_wrong_architecture(self):
+        """The Z80 bench's pins are bits of a 74HC374 latch on I/O port 0,
+        not SFRs and not AVR ports. There is no generator for that here, so
+        the DEVICE line refuses -- while the C lane it points at is real and
+        is proven by test_z80_build.py."""
+        with self.assertRaises(sp.PseudocodeError) as caught:
+            sp.parse(_blink("Z80", 7372800, "OUT0"))
+        self.assertIn("no pseudocode generator", str(caught.exception))
+        self.assertIn('target="z80"', str(caught.exception))
+
     # ---- micro:bit + Pico ----
     def test_microbit(self):
         prog = sp.parse("DEVICE MICROBIT\nPIN led = P0 OUTPUT\n\n"

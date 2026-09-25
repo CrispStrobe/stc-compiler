@@ -11,8 +11,9 @@
 # requirement at GLIBC_2.29, which runs on Vercel's Amazon Linux 2023
 # (glibc 2.34). Bookworm's sdcc 4.5.0 needs GLIBC_2.36 and would not start.
 #
-# We keep only what the mcs51 (8051) target needs. The full SDCC install is
-# ~150 MB, almost all of it pic16 libraries and docs we will never touch.
+# We keep what the mcs51 (8051) AND z80 targets need. The full SDCC install
+# is ~150 MB, almost all of it pic16 libraries and docs we will never touch;
+# the z80 half adds 280 KB (crt0.rel + z80.lib).
 #
 # Run this from the repo root:  ./scripts/fetch-sdcc.sh
 #
@@ -39,14 +40,17 @@ for deb in "$WORK"/*.deb; do
     || ar p "$deb" data.tar.zst | tar --zstd -x -C "$WORK/x"
 done
 
-say "Assembling the mcs51-only bundle ..."
+say "Assembling the mcs51 + z80 bundle ..."
 rm -rf "$ROOT/bin" "$ROOT/share"
 mkdir -p "$ROOT/bin" "$ROOT/share/sdcc/include" "$ROOT/share/sdcc/lib"
 
-# sdcc fork/execs exactly three helpers: sdcpp (preprocessor), sdas8051
-# (assembler) and sdld (linker). Verify with `sdcc -V`. packihx and makebin
-# are optional output converters we expose as response formats.
-for b in sdcc sdcpp sdas8051 sdld packihx makebin; do
+# sdcc fork/execs exactly three helpers PER PORT: sdcpp (preprocessor), an
+# assembler and a linker. Verify with `sdcc -V`. mcs51 uses sdas8051+sdld,
+# z80 uses sdasz80+sdldz80 -- one sdcc binary drives both, because the
+# Debian build has every port compiled in (`sdcc --version` lists them).
+# packihx and makebin are optional output converters we expose as response
+# formats; the z80 lane uses makebin for its raw 32 KB ROM.
+for b in sdcc sdcpp sdas8051 sdld sdasz80 sdldz80 packihx makebin; do
   cp "$WORK/x/usr/bin/$b" "$ROOT/bin/$b"
   chmod +x "$ROOT/bin/$b"
 done
@@ -59,6 +63,13 @@ cp "$S"/include/*.h "$ROOT/share/sdcc/include/"
 for m in small medium large huge; do
   cp -R "$S/lib/$m" "$ROOT/share/sdcc/lib/"
 done
+# The z80 runtime: crt0.rel (reset vector at $0000, SP, gsinit, call _main)
+# and z80.lib (the integer/long/float helpers the code generator calls).
+# 280 KB. Without it `sdcc -mz80` compiles and then links against whatever
+# /usr/share/sdcc a DEVELOPER happens to have -- which is not a thing that
+# exists on Vercel, so the hosted z80 C target would 404 at link time while
+# passing every local test. Measured 2026-09-05.
+cp -R "$S/lib/z80" "$ROOT/share/sdcc/lib/"
 
 # GPLv2 section 1 requires the licence to travel with the binaries.
 mkdir -p "$ROOT/vendor/sdcc"
@@ -76,3 +87,5 @@ du -sh "$ROOT/bin" "$ROOT/share" | sed 's/^/    /'
 printf '    %s total\n' "$(du -sh "$ROOT/bin" "$ROOT/share" | awk '{s+=$1} END {print s"M (approx)"}')"
 echo
 echo "stc12.h present: $(test -f "$ROOT/share/sdcc/include/mcs51/stc12.h" && echo yes || echo NO)"
+echo "z80 crt0 present: $(test -f "$ROOT/share/sdcc/lib/z80/crt0.rel" && echo yes || echo NO)"
+echo "z80.lib present:  $(test -f "$ROOT/share/sdcc/lib/z80/z80.lib" && echo yes || echo NO)"
