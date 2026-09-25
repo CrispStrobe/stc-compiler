@@ -265,6 +265,39 @@ CODAL_SOURCE = """\
     bl MicroBitDisplay_enable
 """
 
+# RP2040 is SRAM-only: rp2040js loads the image at 0x20000000 and jumps there,
+# so pico-sram.ld's ENTRY(main) with main FIRST in .text.startup is the whole
+# contract — no vector table.
+VECTOR_LOOP_RP2040 = """\
+.syntax unified
+.cpu cortex-m0plus
+.thumb
+
+.section .text.startup
+.global main
+.type main, %function
+main:
+    b .                 @ infinite loop
+"""
+
+# STM32F030 is a REAL flash image at 0x08000000: word 0 = initial SP, word 1 =
+# reset vector, KEEP(*(.vectors)) pinned at flash start by stm32f030-flash.ld.
+VECTOR_LOOP_STM32 = """\
+.syntax unified
+.cpu cortex-m0
+.thumb
+
+.section .vectors, "a"
+.word 0x20001000        @ initial SP (top of 4K SRAM)
+.word main + 1          @ reset vector (thumb bit)
+
+.section .text.startup
+.global main
+.type main, %function
+main:
+    b .                 @ infinite loop
+"""
+
 
 class TestArmAssemble(unittest.TestCase):
     def _arm(self):
@@ -341,6 +374,62 @@ class TestArmAssemble(unittest.TestCase):
         r = assemble.assemble_arm(VECTOR_LOOP_NRF, "cortex-m4",
                                   bin_dir, env, ld)
         self.assertEqual(r["toolchain"], "arm-none-eabi-gcc")
+
+    # ---- rp2040 + stm32f030: the two ARM assemble targets N4 adds ----------
+    def _arm_target(self, target):
+        """(bin_dir, env, mcu, ld) drawn from the SAME maps the router uses, so
+        a wrong mcu/ld map value fails these tests too, not just a missing one."""
+        from app import ARM_MCU_FOR_TARGET, ARM_LD_FOR_TARGET
+        bin_dir, env, _ = self._arm()
+        return bin_dir, env, ARM_MCU_FOR_TARGET[target], ARM_LD_FOR_TARGET[target]
+
+    def test_rp2040_registered_as_arm(self):
+        import os
+        from app import ASSEMBLE_TARGETS, ARM_MCU_FOR_TARGET, ARM_LD_FOR_TARGET
+        self.assertEqual(ASSEMBLE_TARGETS.get("rp2040"), "arm")
+        self.assertEqual(ARM_MCU_FOR_TARGET.get("rp2040"), "cortex-m0plus")
+        self.assertTrue(ARM_LD_FOR_TARGET.get("rp2040", "").endswith("pico-sram.ld"))
+        self.assertTrue(os.path.exists(ARM_LD_FOR_TARGET["rp2040"]))
+
+    def test_rp2040_assembles_to_ihex(self):
+        import base64
+        bin_dir, env, mcu, ld = self._arm_target("rp2040")
+        r = assemble.assemble_arm(VECTOR_LOOP_RP2040, mcu, bin_dir, env, ld)
+        self.assertTrue(r["success"], r.get("log") or r.get("errors"))
+        content = base64.b64decode(r["base64"]).decode("ascii", errors="replace")
+        self.assertTrue(content.startswith(":"), "output should be Intel HEX")
+        self.assertGreater(r["bytes"], 0)
+
+    def test_rp2040_bad_source_fails(self):
+        # Mutation: the success assertion is not vacuous — a broken source is
+        # a reported failure, not a silent pass. (Cortex-M0+ has no such insn.)
+        bin_dir, env, mcu, ld = self._arm_target("rp2040")
+        r = assemble.assemble_arm(BAD_ARM, mcu, bin_dir, env, ld)
+        self.assertFalse(r["success"])
+        self.assertGreater(len(r["errors"]), 0)
+
+    def test_stm32f030_registered_as_arm(self):
+        import os
+        from app import ASSEMBLE_TARGETS, ARM_MCU_FOR_TARGET, ARM_LD_FOR_TARGET
+        self.assertEqual(ASSEMBLE_TARGETS.get("stm32f030"), "arm")
+        self.assertEqual(ARM_MCU_FOR_TARGET.get("stm32f030"), "cortex-m0")
+        self.assertTrue(ARM_LD_FOR_TARGET.get("stm32f030", "").endswith("stm32f030-flash.ld"))
+        self.assertTrue(os.path.exists(ARM_LD_FOR_TARGET["stm32f030"]))
+
+    def test_stm32f030_assembles_to_ihex(self):
+        import base64
+        bin_dir, env, mcu, ld = self._arm_target("stm32f030")
+        r = assemble.assemble_arm(VECTOR_LOOP_STM32, mcu, bin_dir, env, ld)
+        self.assertTrue(r["success"], r.get("log") or r.get("errors"))
+        content = base64.b64decode(r["base64"]).decode("ascii", errors="replace")
+        self.assertTrue(content.startswith(":"), "output should be Intel HEX")
+        self.assertGreater(r["bytes"], 0)
+
+    def test_stm32f030_bad_source_fails(self):
+        bin_dir, env, mcu, ld = self._arm_target("stm32f030")
+        r = assemble.assemble_arm(BAD_ARM, mcu, bin_dir, env, ld)
+        self.assertFalse(r["success"])
+        self.assertGreater(len(r["errors"]), 0)
 
     def test_health_lists_nrf52833(self):
         from app import ASSEMBLE_TARGETS
