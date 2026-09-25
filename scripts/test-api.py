@@ -608,13 +608,9 @@ check("micro:bit: pins report a neutral location",
       str(tr.get("pins", {}).get("btn")))
 
 # /download hands back the SOURCE for a target that cannot be built here --
-# a .py or a .ino is the deliverable, not a 400.
-for source, want_name, want_tool in ((MICROBIT, "main.py", "uflash"),
-                                     (EXAMPLE_ARDUINO := """DEVICE ARDUINO-UNO:
-  PIN led = D13 OUTPUT
-  WHEN started:
-    turn on led
-""", "main.ino", "arduino-cli")):
+# a .py is the deliverable, not a 400. (An Arduino board was the second case
+# until 2026-09-24; it builds now, and is checked with the Arduino route below.)
+for source, want_name, want_tool in ((MICROBIT, "main.py", "uflash"),):
     request = urllib.request.Request(
         f"{BASE}/download", json.dumps({"code": source, "language": "pseudocode"}).encode(),
         {"Content-Type": "application/json"})
@@ -647,7 +643,7 @@ request = urllib.request.Request(
     {"Content-Type": "application/json"})
 try:
     with urllib.request.urlopen(request, timeout=120) as response:
-        check("NAME renames the download", 'filename="blink.ino"'
+        check("NAME renames the download", 'filename="blink.hex"'
               in response.headers.get("Content-Disposition", ""),
               response.headers.get("Content-Disposition", ""))
 except urllib.error.HTTPError as exc:
@@ -672,8 +668,8 @@ check("a path traversal in NAME is refused",
 check("the UI treats source-only as a result, not a failure",
       "source only, needs" in page and "data.c && data.toolchain" in page)
 
-# ---- Arduino (ATTinyCore) language route -------------------------------------
-print("\n--- Arduino (ATTinyCore) language route ---")
+# ---- Arduino language route ---------------------------------------------------
+print("\n--- Arduino language route ---")
 
 ARDUINO_BLINK = """\
 void setup() {
@@ -730,12 +726,58 @@ if result.get("success"):
     check("arduino attiny85 hex checksums pass",
           len(errs85) == 0, f"{len(errs85)} errors" if errs85 else "")
 
-# Wrong target: arduino + atmega328p should fail with a clear message
+# An unknown board is refused naming the ones there are.
 result, _ = post({"code": ARDUINO_BLINK, "language": "arduino",
-                   "target": "atmega328p"})
-check("arduino rejects non-ATtiny target",
-      result.get("success") is False and "ATtiny" in (result.get("error") or ""),
+                   "target": "esp32"})
+check("arduino rejects an unknown board, listing the known",
+      result.get("success") is False and "arduino-uno" in (result.get("error") or ""),
       (result.get("error") or "")[:80])
+
+# ---- real Arduino C++ on the ATmegas (ArduinoCore-avr) ----
+ARDUINO_CPP = """\
+class Counter {
+ public:
+  explicit Counter(int s) : n(s) {}
+  int next() { return n++; }
+ private:
+  int n;
+};
+Counter c(1);
+String label = "n=";
+void setup() { Serial.begin(115200); pinMode(LED_BUILTIN, OUTPUT); }
+void loop() { report(c.next()); delay(100); }
+void report(int v) { Serial.println(label + String(v) + " " + String(2.5, 2)); }
+"""
+for board, mcu, variant in (("arduino-uno", "atmega328p", "standard"),
+                            ("arduino-nano", "atmega328p", "eightanaloginputs"),
+                            ("arduino-mega", "atmega2560", "mega")):
+    result, _ = post({"code": ARDUINO_CPP, "language": "arduino", "target": board})
+    check(f"arduino C++ (Serial/String/class) builds for {board}",
+          result.get("success") is True
+          and result.get("toolchain") == "avr-gcc+ArduinoCore-avr"
+          and result.get("mcu") == mcu and result.get("variant") == variant
+          and result.get("f_cpu") == 16000000
+          and "void report(int v);" in (result.get("prototypes") or []),
+          str(result.get("error") or result.get("toolchain"))[:120])
+
+result, _ = post({"code": "#include <Wire.h>\nvoid setup() { Wire.begin(); }\nvoid loop() {}\n",
+                  "language": "arduino", "target": "arduino-uno"})
+check("a bundled library (Wire) is found from its #include",
+      result.get("success") is True and result.get("libraries") == ["Wire"],
+      str(result.get("error") or result.get("libraries"))[:120])
+
+result, _ = post({"code": "void setup() {\n  nope();\n}\nvoid loop() {}\n",
+                  "language": "arduino", "target": "arduino-uno"})
+check("a sketch error names the sketch's own line",
+      result.get("success") is False and "main.ino:2" in (result.get("error") or ""),
+      (result.get("error") or "")[:120])
+
+# The Arduino DEVICE compiles now (it was transpile-only, naming arduino-cli).
+result, _ = post({"code": NAMED, "language": "pseudocode"})
+check("DEVICE ARDUINO-UNO compiles to an image",
+      result.get("success") is True and result.get("filename") == "blink.hex"
+      and "#include <Arduino.h>" in (result.get("c") or ""),
+      str(result.get("error") or result.get("filename"))[:120])
 
 # Arduino with explicit #include
 ARDUINO_EXPLICIT = '#include <Arduino.h>\n' + ARDUINO_BLINK

@@ -89,10 +89,12 @@ EXPECTED = {
     "attiny85": Case("PB3", 8000000, BUILDS),
     "attiny88": Case("PB0", 8000000, BUILDS),
 
-    # ---- Arduino core: transpiles here, built by the IDE ----
-    "arduino-uno":  Case("D13", 16000000, TRANSPILE_ONLY, toolchain="arduino-cli"),
-    "arduino-nano": Case("D13", 16000000, TRANSPILE_ONLY, toolchain="arduino-cli"),
-    "arduino-mega": Case("D13", 16000000, TRANSPILE_ONLY, toolchain="arduino-cli"),
+    # ---- Arduino core: emitted as core C++, built against ArduinoCore-avr ----
+    # TRANSPILE_ONLY (needs arduino-cli) until 2026-09-24, when the service
+    # gained cc1plus and the vendored core (arduino_build.py).
+    "arduino-uno":  Case("D13", 16000000, BUILDS),
+    "arduino-nano": Case("D13", 16000000, BUILDS),
+    "arduino-mega": Case("D13", 16000000, BUILDS),
 
     # ---- MicroPython: interpreted on the device, nothing to compile ----
     "microbit":  Case("P0", None, TRANSPILE_ONLY, toolchain="uflash"),

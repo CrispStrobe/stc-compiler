@@ -29,6 +29,33 @@ The compile side of the STC12 work in
 and the BrickWright block-to-silicon back end: the browser generates source,
 POSTs it here, gets back an image, and flashes it over Web Serial or WebUSB.
 
+### Which version is authoritative?
+
+It depends on what a consumer uses. A source-level oracle, local script or
+copied source module is reproducible only when it names the **full Git commit
+SHA** it read and checks the resulting bytes or behaviour. The public service
+is different: production is deployed deliberately rather than on every push,
+so `main` may be newer than the code serving
+`https://stc-compiler.vercel.app`. For a live compile, the authority is the
+deployed revision and toolchain versions returned by `GET /health`, together
+with the API behaviour the consumer actually exercised. A push to `main` is
+not evidence that production changed.
+
+A generated firmware receipt therefore records both sides: the deployed
+revision and toolchain identity, plus hashes of the input and output. A sibling
+test that reads this repository directly instead records the exact source SHA.
+When adopting a change downstream, update the applicable receipt or pin and run
+the consumer gate; do not substitute the latest branch name for either kind of
+evidence.
+
+Brickwright Lite's `flasher.js` is now an exact, path-scoped generated copy of
+this repository's `docs/flash.js`, pinned to the full source commit as
+`stc-compiler-flasher`. Its sync and CI gates require that commit's checkout,
+canonical origin, source body and both shipped mirrors to agree before writes
+or release. The scope matters: other stc-compiler consumers may legitimately
+name different source, deployed-service or generated-artifact revisions under
+the authority split above.
+
 It is a separate deployment from `legacy-lego-compiler` on purpose. SDCC is
 GPL-2.0-or-later; that repository's story is MIT plus MPL/BSD, and there is no
 reason to entangle the two.
@@ -42,7 +69,7 @@ Three lanes, which is worth holding in mind because the endpoints follow it:
 ```
                      ┌─ emit_c ────────▶ C ──▶ sdcc / avr-gcc / arm-gcc / cc65 ──▶ image
 pseudocode ─parse─▶ AST ─ emit (MicroPython) ─▶ .py   (interpreted on the device)
-                     ├─ emit (Arduino C++) ──▶ .ino  (built by the IDE)
+                     ├─ emit (Arduino C++) ──▶ .ino ──▶ avr-gcc + Arduino core ──▶ image
                      ├─ emit (TypeScript) ───▶ .ts   (built by PXT / MakeCode)
                      └─ emit_pseudocode ─────▶ text  (the round trip)
 
@@ -113,10 +140,11 @@ curl -X POST https://stc-compiler.vercel.app/download \
 # -> main.hex
 ```
 
-For a target this service cannot build — a micro:bit, an Arduino sketch, a
-MakeCode Arcade game — the **source** is the file: `main.py`, `main.ino` or
-`main.ts`, returned 200 with `X-Source-Only` naming the toolchain it would
-have needed. A genuine error (a bad pin, an unknown target) is still a 400
+For a target this service cannot build — a micro:bit, a Pico, a MakeCode
+Arcade game — the **source** is the file: `main.py` or `main.ts`, returned 200
+with `X-Source-Only` naming the toolchain it would have needed. (An Arduino
+board was on this list until 2026-09-24; it now builds, and `/download` hands
+back its `.hex`. `/transpile` still returns the `.ino`.) A genuine error (a bad pin, an unknown target) is still a 400
 with the message. The difference is whether there is usable output, not
 whether a compiler ran.
 
@@ -223,9 +251,12 @@ carries one linked, flashable image.
 
 ### `GET /health`
 
-Reports every toolchain's version (SDCC, avr-gcc, arm-none-eabi-gcc, ca65),
-every compile target, every assemble target, and every pseudocode device. Also
-the cheapest way to see whether a cold start staged the toolchains correctly.
+Reports the deployed Git revision as `version`, every toolchain's version
+(SDCC, avr-gcc, arm-none-eabi-gcc, ca65), every compile target, every assemble
+target, and every pseudocode device. It is the identity receipt for the live
+service as well as the cheapest way to see whether a cold start staged the
+toolchains correctly. The revision is the deployment's commit, which may lag
+`main` because deployments are manual.
 
 ### `GET /` · `GET /docs`
 
@@ -283,6 +314,41 @@ end** knows, which the service can **compile**, and which a browser can
 | `rp2040` | arm-none-eabi-gcc | Cortex-M0+, SRAM image (`pico-sram.ld`) |
 | `stm32f030` | arm-none-eabi-gcc | Cortex-M0, real flash image at `0x08000000` (`stm32f030-flash.ld`) |
 | `eater6502` | cc65 | 65C02, 32 KB ROM at `$8000` (`eater.cfg`) |
+| `riscv32` | shecc (as wasm) | RV32IM, ELF32 image for an emulated console — no native toolchain, no flashing |
+| `riscv32-gcc` | native gcc + picolibc (`riscv-gcc/`) | RV32IMAC, **full C** (floats, malloc, qsort, math.h) — ELF32 image for the same emulated console |
+
+`riscv32` is the odd one out: it hosts no native compiler. It runs
+[shecc](https://github.com/sysprog21/shecc) — a small self-hosting C compiler
+with an RV32IM backend — as WebAssembly under `wasmtime` (`riscv_cc.py`), the
+*same* `riscv/riscv-cc.wasm` the browser page and the BrickWright RISC-V console
+use, so one artifact serves all three. shecc emits a Linux ELF32; the response
+carries the ELF (`base64`) plus an `image` of `{entry, segments}` (each segment
+base64) an emulated RV32 machine boots — there is no hardware to flash. It is a
+C *subset* (educational), not a full C compiler. See
+[`riscv/riscv-cc.PROVENANCE.md`](riscv/riscv-cc.PROVENANCE.md).
+
+**And it is the one target the page compiles *and runs* with no server at all.**
+Tick **RISC-V C** on the [page](https://crispstrobe.github.io/stc-compiler/),
+write C, and **▶ Compile & Run** compiles it to an RV32 image and boots it on an
+emulated RV32IM machine entirely in the browser — nothing is posted anywhere.
+That mode reuses the [bw-board](https://github.com/CrispStrobe/bw-board) engine —
+the `shecc`→wasm compiler *and* the RV32 machine — loaded from jsDelivr at a
+pinned commit (`BW_BOARD_PIN` in `docs/index.html`); it is the same wasm the
+hosted target runs. `scripts/check-pages.js` exercises the whole client-side path
+(compile → run → the program's output) in a real browser.
+
+**When shecc's subset is not enough, `riscv32-gcc` is the full-C path.** It runs
+a native `riscv64-unknown-elf-gcc` + picolibc bundle — vendored in `riscv-gcc/`
+the same way the ARM and AVR bundles are (Debian bullseye, one multilib, DWARF
+stripped, ~46 MB), staged into `/tmp` on Vercel — so arbitrary C compiles:
+`printf("%f")`, `malloc`, `qsort`, `<math.h>`, `<string.h>`. It returns the same
+`{entry, segments}` image for the emulated RV32 console (no flashing); the
+freestanding startup + picolibc console (`riscv-gcc/runtime/`) sit over the
+machine's ECALL ABI. This is a hosted (server-side) target — it needs a native
+compiler, so unlike `riscv32` it does not run in the browser page.
+`scripts/fetch-riscv-gcc.sh` reproduces the bundle; the `riscv-gcc-bundle` CI job
+guards that every dependency travels with it, nothing needs GLIBC > 2.34, and it
+stays within the deploy budget.
 
 The 8051 targets compile `-mmcs51 --std-c99`; adding a part is three lines in
 `TARGETS` in [`app.py`](app.py). **For a pseudocode program the `DEVICE` line
@@ -290,9 +356,50 @@ selects these limits**, not the request's `target` field — so an image that
 outgrows an STC89's 8 KB is refused by the linker instead of being handed back. Keil translation is 8051-only by definition
 and is refused for any other target rather than silently miscompiled.
 
-`language: "arduino"` is a fifth route: an Arduino-API sketch compiled against
-a vendored **ATTinyCore** subset, for `attiny85` and `attiny88` only. That is
-the one place a real Arduino core is linked server-side; see the licensing
+`language: "arduino"` is a fifth route: an Arduino **sketch**, compiled as real
+C++ — `Serial`, `String`, classes, templates, `F()` — against the same core
+source the Arduino IDE uses, vendored in `arduino-core/` by
+`scripts/fetch-arduino-core.sh` at pinned commits:
+
+| `target` | core | variant |
+|---|---|---|
+| `arduino-uno`, `atmega328p` | ArduinoCore-avr 1.8.8 | `standard` |
+| `arduino-nano` | ArduinoCore-avr 1.8.8 | `eightanaloginputs` (adds A6/A7) |
+| `atmega168p` | ArduinoCore-avr 1.8.8 | `standard` |
+| `arduino-mega`, `atmega2560` | ArduinoCore-avr 1.8.8 | `mega` |
+| `arduboy` | ArduinoCore-avr 1.8.8 + Arduboy2 6.0.0 | `leonardo` (ATmega32U4, 28 KB for the sketch) |
+| `attiny85`, `attiny88` | ATTinyCore (2.0 line) | `tinyx5`, `tinyx8` |
+
+The pipeline is the IDE's ([`arduino_build.py`](arduino_build.py)): the sketch
+gets `#include <Arduino.h>` and prototypes for its functions (so `loop()` may
+call a function defined below it), each behind `#line` so a diagnostic names
+`main.ino:<line>` — the line you wrote; the core is built with its own
+platform flags, `-flto` included, cached per board and clock so a warm
+instance compiles only the sketch, and linked as an archive (`core.a`) as the
+IDE does, so a core object such as Tone's timer interrupt is only in the image
+when the sketch uses it. An `#include` pulls in a library: the core's own
+(`Wire.h`, `SPI.h`, `EEPROM.h`, `SoftwareSerial.h`), `Servo.h` (on the ATtinys
+`Servo_ATTinyCore.h`), `LiquidCrystal.h`, `Adafruit_NeoPixel.h`, on the
+ATtinys also `tinyNeoPixel.h`, and for the Arduboy `Arduboy2.h` and
+`ArduboyTones.h`. `F_CPU`
+is the board's (16 MHz, 8 MHz for the ATtinys) unless `fosc` is given. The
+response adds `prototypes` (what was declared for you), `libraries`,
+`variant` and `board`.
+
+With `symbols: true` a sketch build also returns a symbol table: the sketch's
+own globals (`variables`, in the same shape the pseudocode builds use, so a
+debugger's variables view reads them), its functions (demangled), and a
+`main.ino` line table, plus `optimized_out` for any global the sketch declares
+that the optimiser removed. To make that table possible the sketch itself is
+compiled without LTO in a symbols build (gcc 5.4 writes no line program for
+LTO'd code and inlines `setup`/`loop` into `main`), so the image differs from a
+build without symbols -- a table is only ever valid for the image it came with.
+A build without symbols is byte-identical to before.
+
+Not offered: other libraries (there is no library manager — an
+`#include <IRremote.h>` fails naming what *is* available), and C++
+past what gcc-avr 5.4 knows (`gnu++11` for ArduinoCore-avr, as its
+platform.txt asks; `gnu++1z` for ATTinyCore, which asks for 17). Licensing
 posture in [`NOTICE.md`](NOTICE.md).
 
 The `stm32f030` image is a genuine flash image — vectors first, initial SP in
@@ -308,7 +415,7 @@ Nineteen `DEVICE` names across six architectures:
 | STC 8051 | `stc12c5a60s2` `stc12c5a16s2` `stc15f2k60s2` `stc15w408as` `stc89c52` `stc89c52rc` | C | **yes** |
 | bare AVR | `atmega328p` `atmega168p` | C | **yes** |
 | bare AVR (tiny) | `attiny85` `attiny88` | C | **yes** (no `print` — no USART) |
-| Arduino core | `arduino-uno` `arduino-nano` `arduino-mega` | C++ `.ino` | no — needs `arduino-cli` |
+| Arduino core | `arduino-uno` `arduino-nano` `arduino-mega` | C++ `.ino` | **yes** — against ArduinoCore-avr |
 | MicroPython | `microbit` (`micro-bit`) | `.py` | nothing to compile |
 | MicroPython | `pico` (`rp2040`) | `.py` | nothing to compile |
 | 6502 | `eater6502` | — | no pseudocode generator — see *Known gaps* |
@@ -612,10 +719,13 @@ On the Uno the same two names are refused for an unrelated reason — the DIP
 package does not bring them out at all — and the two messages are deliberately
 different, because one sends you to the package and the other to the schematic.
 
-**Core C++ transpiles here; it does not compile here.** SDCC cannot build it
-and `arduino-cli` plus the AVR core is ~250 MB against Vercel's 250 MB
-function limit. `POST /compile` with an Arduino `DEVICE` is refused, naming
-the toolchain it would need, and returns the generated source anyway.
+**Core C++ compiles here.** `POST /compile` with an Arduino `DEVICE` builds
+the emitted sketch through the `language: "arduino"` route — the same C++
+front end and vendored ArduinoCore-avr a hand-written sketch gets — and
+returns the image with the generated `.ino` in `c`. `arduino-cli` is still
+not used: with its tool downloads it is ~250 MB against Vercel's 250 MB
+function limit, and all it would add over `arduino_build.py` is a library
+manager.
 
 ### Bare AVR
 
@@ -888,10 +998,11 @@ the copies it knows about; it cannot check that the set is complete, because
 it *is* the set.
 
 That covers more than it sounds like: a micro:bit needs no compiler
-(MicroPython is interpreted on the device) and an Arduino sketch is built by
-the IDE, so for those targets the page is the whole toolchain. **Compile to
+(MicroPython is interpreted on the device) and a Pico's MicroPython is too,
+so for those targets the page is the whole toolchain. **Compile to
 .hex** posts to the hosted API for the parts that genuinely need SDCC,
-avr-gcc, arm-none-eabi-gcc or cc65, and says so.
+avr-gcc (an Arduino board's sketch included), arm-none-eabi-gcc or cc65, and
+says so.
 
 CI starts a browser and transpiles every example in it, because "the page
 loads" and "CPython starts in it and emits MicroPython" are different claims.
@@ -985,10 +1096,11 @@ uf2.py                 binary -> UF2 container
 keil-shim/             our replacements for Keil-only headers
   generate-compat.py   REGENERATES keil-compat.h — never hand-edit that file
 bin/ share/            vendored SDCC        (~8 MB)
-avr/                   vendored avr-gcc     (39 MB)
+avr/                   vendored avr-gcc, C and C++ (40 MB; cc1/cc1plus/lto1 as .xz, see bundle_xz.py)
 arm/                   vendored arm-none-eabi-gcc (43 MB)
 cc65/                  vendored cc65        (3.7 MB)
-arduino-core/          minimal ATTinyCore subset (LGPL, server-side only)
+arduino-core/          ArduinoCore-avr + ATTinyCore (LGPL, server-side only)
+arduino_build.py       the `arduino` route: .ino preprocessing, core cache, link
 docs/                  the GitHub Pages app + mirrored modules
 vendor/                upstream VERSION and copyright files
 test_*.py              the pytest suite (see Tests)
@@ -1086,11 +1198,9 @@ for **every** part in `AVR_TARGETS` under `-Werror`, `scripts/elf-needed.py`
 asserts every non-glibc dependency travels with the bundle, and the job checks
 the GLIBC floor and uploads the verified bundle as an artifact.
 
-The Arduino core is deliberately **not** vendored in full: it is LGPL-2.1, and
-static linking it into an image this service hands back engages the relink
-obligation. avr-libc is BSD-3-Clause and avr-gcc's runtime carries the GCC
-Runtime Library Exception, so compiled output is unencumbered. The one
-exception is the minimal ATTinyCore subset in `arduino-core/`, whose posture is
+avr-libc is BSD-3-Clause and avr-gcc's runtime carries the GCC Runtime
+Library Exception, so C images are unencumbered. A sketch built by the
+`arduino` route links the LGPL-2.1 Arduino core as well; that posture is
 argued in full in [`NOTICE.md`](NOTICE.md).
 
 ### This service does not produce the same firmware as a local build
