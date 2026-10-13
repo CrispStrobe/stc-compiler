@@ -59,6 +59,65 @@ class TestSevenSeg8(unittest.TestCase):
         c = self._c("    show number 1234 on display\n")
         self.assertIn("bw_display_show_number(1234)", c)
 
+    def test_show_number_runs(self):
+        """The emitted bw_<part>_show_number, executed (Lite task B14).
+
+        The helper is cut out of the emitted C with its font and frame
+        buffer, built by the host compiler with SDCC's 16-bit int
+        (`#define int short`), and run: the frame buffer must read
+        right-aligned with the minus DIRECTLY before the most significant
+        digit. MEASURED before the fix: -42 gave "    - 42" (the sign one
+        digit too far left) and -1234567 is out of int range here, so the
+        7-digit case is the block path's (CrispStrobe/extensions stc12.js).
+        """
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+        cc = shutil.which("cc") or shutil.which("gcc")
+        if not cc:
+            self.skipTest("no host C compiler to run the emitted helper")
+        c = self._c("    show number -42 on display\n")
+        font = re.search(r"static const __code unsigned char bw_7seg_font\[16\] = \{.*?\};",
+                         c, re.S).group(0).replace("__code ", "")
+        helper = re.search(r"static void bw_display_show_number\(int n\)\n\{.*?\n\}\n",
+                           c, re.S).group(0)
+        cases = [-42, 42, -7, 0, -1, -32768, 32767, -9999]
+        prog = "\n".join([
+            "#include <stdio.h>",
+            "#define int short",
+            font,
+            "static unsigned char bw_display_fb[8];",
+            helper,
+            "#undef int",
+            "static const int cases[] = {%s};" % ", ".join(str(n) for n in cases),
+            "int main(void) {",
+            "    unsigned k, d;",
+            "    for (k = 0; k < sizeof cases / sizeof cases[0]; k++) {",
+            "        bw_display_show_number((short)cases[k]);",
+            "        for (d = 0; d < 8; d++) {",
+            "            unsigned char b = bw_display_fb[d], g = '?', j;",
+            "            if (b == 0) g = ' ';",
+            "            else if (b == 0x40) g = '-';",
+            "            else for (j = 0; j < 10; j++) if (bw_7seg_font[j] == b) g = '0' + j;",
+            "            putchar(g);",
+            "        }",
+            "        putchar('\\n');",
+            "    }",
+            "    return 0;",
+            "}",
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            src, exe = f"{tmp}/show.c", f"{tmp}/show"
+            with open(src, "w") as f:
+                f.write(prog)
+            subprocess.run([cc, "-o", exe, src], check=True, capture_output=True)
+            out = subprocess.run([exe], check=True, capture_output=True, text=True).stdout
+        self.assertEqual(out.split("\n")[:len(cases)], [
+            "     -42", "      42", "      -7", "       0",
+            "      -1", "  -32768", "   32767", "   -9999",
+        ])
+
     def test_show_digit(self):
         c = self._c("    show digit 0 = value 5 on display\n")
         self.assertIn("bw_display_show_digit", c)
