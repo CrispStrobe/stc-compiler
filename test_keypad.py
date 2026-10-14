@@ -100,6 +100,59 @@ DEVICE STC89C52RC:
 """
 
 
+class TestKeypadPortModes(unittest.TestCase):
+    """The scan only works on quasi-bidirectional pins (Lite task B18).
+
+    A row driven low pulls a column low through a pressed key against the
+    column's WEAK pull-up. MEASURED before the fix (Lite, the 79-a2-sampler
+    bench, SDCC + emu8051): this emitter set every PART-claimed pin
+    push-pull on the parts that have port modes, keypad included, so on the
+    STC12C5A60S2 and STC15F2K60S2 all sixteen keys read as none (the
+    STC89C52RC, which has no port modes, read all sixteen). The keypad's
+    pins now keep their reset mode; the display beside it is unchanged.
+    """
+
+    BENCH = """\
+DEVICE {device}:
+  CLOCK 11059200
+  PART keys = KEYPAD4X4 ROWS P1.7 P1.6 P1.5 P1.4 COLS P1.3 P1.2 P1.1 P1.0
+  PART display = SEVENSEG8 SEGMENTS P0 SELECT P2.2 P2.3 P2.4
+
+  WHEN started:
+    FOREVER:
+      IF a key is pressed THEN:
+        show number keys on display
+      wait 30 ms
+"""
+
+    def test_keypad_pins_are_not_push_pull(self):
+        for device in ("STC12C5A60S2", "STC15F2K60S2"):
+            with self.subTest(device=device):
+                c, _ = sp.transpile(self.BENCH.format(device=device))
+                self.assertNotIn("P1M0", c)
+                self.assertNotIn("P1M1", c)
+                # the display's pins still drive push-pull
+                self.assertIn("P0M0 |=  0xFF;", c)
+                self.assertIn("P2M0 |=  0x1C;", c)
+
+    def test_other_pins_on_the_keypad_port_still_push_pull(self):
+        src = """\
+DEVICE STC12C5A60S2:
+  CLOCK 11059200
+  PART keys = KEYPAD4X4 ROWS P1.7 P1.6 P1.5 P1.4 COLS P1.3 P1.2 P1.1 P2.0
+  PIN led = P1.0 OUTPUT
+
+  WHEN started:
+    FOREVER:
+      IF a key is pressed THEN:
+        turn on led
+      wait 30 ms
+"""
+        c, _ = sp.transpile(src)
+        self.assertIn("P1M0 |=  0x01;", c)
+        self.assertNotIn("P2M0", c)
+
+
 class TestKeypadHats(unittest.TestCase):
     """`WHEN key N pressed` + the reporter sugar (A2-BOARD-SUPPORT fan-out).
 

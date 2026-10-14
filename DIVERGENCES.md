@@ -92,7 +92,7 @@ in RAM, 8 digits → 8 ms full cycle = 125 Hz. Built-in 0-F font in __code.
 bw_ms++ stays first in the ISR per requirement #1. 8051 family only.
 
 New vocabulary → C, all writing the RAM frame buffer only:
-- `show number N on display` → `bw_<n>_show_number(N)` (integer, right-aligned)
+- `show number N on display` → `bw_<n>_show_number(N)` (a `long` since Lite B18 — SDCC's `int` wrapped at 16 bits; right-aligned, the low eight digits)
 - `show digit D = value V on display` → `bw_<n>_show_digit(D, V)` (one tube, 0-F)
 - `set digit D to segments <byte> on display` → `bw_<n>_set_segments(D, segs)` (raw)
 - `clear display` → `bw_<n>_clear()`

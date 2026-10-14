@@ -60,15 +60,18 @@ class TestSevenSeg8(unittest.TestCase):
         self.assertIn("bw_display_show_number(1234)", c)
 
     def test_show_number_runs(self):
-        """The emitted bw_<part>_show_number, executed (Lite task B14).
+        """The emitted bw_<part>_show_number, executed (Lite tasks B14, B18).
 
         The helper is cut out of the emitted C with its font and frame
-        buffer, built by the host compiler with SDCC's 16-bit int
-        (`#define int short`), and run: the frame buffer must read
-        right-aligned with the minus DIRECTLY before the most significant
-        digit. MEASURED before the fix: -42 gave "    - 42" (the sign one
-        digit too far left) and -1234567 is out of int range here, so the
-        7-digit case is the block path's (CrispStrobe/extensions stc12.js).
+        buffer, built by the host compiler with SDCC's widths (int 16 bits,
+        long 32), and run: the frame buffer must read right-aligned with the
+        minus DIRECTLY before the most significant digit, and the number
+        must not wrap at 16 bits. MEASURED before B14: -42 gave "    - 42"
+        (the sign one digit too far left). MEASURED before B18 (on the A2
+        bench in Lite, SDCC + emu8051): the helper took an `int`, so 32768
+        showed "  -32768", 65536 "       0" and 12345678 "   24910". A
+        number wider than the display shows its low eight digits and no
+        minus, as the stc12 block (CrispStrobe/extensions) does.
         """
         import re
         import shutil
@@ -80,21 +83,36 @@ class TestSevenSeg8(unittest.TestCase):
         c = self._c("    show number -42 on display\n")
         font = re.search(r"static const __code unsigned char bw_7seg_font\[16\] = \{.*?\};",
                          c, re.S).group(0).replace("__code ", "")
-        helper = re.search(r"static void bw_display_show_number\(int n\)\n\{.*?\n\}\n",
+        helper = re.search(r"static void bw_display_show_number\((?:int|long) n\)\n\{.*?\n\}\n",
                            c, re.S).group(0)
-        cases = [-42, 42, -7, 0, -1, -32768, 32767, -9999]
+        # SDCC's widths on a host whose int is 32 bits: long -> int32_t
+        # first (so the int macro below cannot reach it), then int -> short.
+        helper = re.sub(r"\bunsigned long\b", "uint32_t", helper)
+        helper = re.sub(r"\blong\b", "int32_t", helper)
+        helper = re.sub(r"\b0UL\b", "((uint32_t)0)", helper)
+        helper = re.sub(r"\b0xFFFFUL\b", "((uint32_t)0xFFFF)", helper)
+        cases = [
+            (-42, "     -42"), (42, "      42"), (-7, "      -7"), (0, "       0"),
+            (-1, "      -1"), (-32768, "  -32768"), (32767, "   32767"), (-9999, "   -9999"),
+            (32768, "   32768"), (-32769, "  -32769"), (65535, "   65535"),
+            (65536, "   65536"), (99999, "   99999"), (12345678, "12345678"),
+            (99999999, "99999999"), (-1234567, "-1234567"), (-9999999, "-9999999"),
+            (-12345678, "12345678"), (100000000, "00000000"), (123456789, "23456789"),
+            (2147483647, "47483647"), (-2147483648, "47483648"),
+        ]
         prog = "\n".join([
             "#include <stdio.h>",
+            "#include <stdint.h>",
             "#define int short",
             font,
             "static unsigned char bw_display_fb[8];",
             helper,
             "#undef int",
-            "static const int cases[] = {%s};" % ", ".join(str(n) for n in cases),
+            "static const int64_t cases[] = {%s};" % ", ".join(f"{n}LL" for n, _ in cases),
             "int main(void) {",
             "    unsigned k, d;",
             "    for (k = 0; k < sizeof cases / sizeof cases[0]; k++) {",
-            "        bw_display_show_number((short)cases[k]);",
+            "        bw_display_show_number((int32_t)cases[k]);",
             "        for (d = 0; d < 8; d++) {",
             "            unsigned char b = bw_display_fb[d], g = '?', j;",
             "            if (b == 0) g = ' ';",
@@ -113,10 +131,8 @@ class TestSevenSeg8(unittest.TestCase):
                 f.write(prog)
             subprocess.run([cc, "-o", exe, src], check=True, capture_output=True)
             out = subprocess.run([exe], check=True, capture_output=True, text=True).stdout
-        self.assertEqual(out.split("\n")[:len(cases)], [
-            "     -42", "      42", "      -7", "       0",
-            "      -1", "  -32768", "   32767", "   -9999",
-        ])
+        got = out.split("\n")[:len(cases)]
+        self.assertEqual(list(zip([n for n, _ in cases], got)), cases)
 
     def test_show_digit(self):
         c = self._c("    show digit 0 = value 5 on display\n")
