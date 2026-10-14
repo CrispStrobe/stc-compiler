@@ -183,5 +183,9 @@ permissive terms) — see picolibc-riscv64-unknown-elf.copyright. The bundle is 
 SUBSET (one multilib, DWARF stripped), not a modification: no binary is patched.
 EOF
 
+# cc1 (~19 MB) is committed xz-compressed for Vercel's deployment limit;
+# stage_riscv_gcc() decompresses it in /tmp (bundle_xz.py).
+python3 "$ROOT/bundle_xz.py" compress "$ROOT/riscv-gcc/lib/gcc/riscv64-unknown-elf/8.3.0" cc1
+
 say "Done. Bundle at riscv-gcc/ ($(du -sh "$ROOT/riscv-gcc" | cut -f1))."
 say "Build flags: -march=${GCC_MARCH} -mabi=${GCC_MABI}"

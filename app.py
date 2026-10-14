@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import stat
+import struct
 import sys
 import subprocess
 import tempfile
@@ -26,6 +27,7 @@ import riscv_cc
 import stc_disasm
 import arduino_build
 import bundle_xz
+import esp8266_image
 import stc_pseudocode
 import stc_symtab
 
@@ -313,6 +315,25 @@ RISCV_TARGETS = {
         "description": "RISC-V RV32IMAC — full C via native gcc + picolibc; emulated console",
     },
 }
+
+# ESP8266 (Xtensa LX106). Hand-written C against our own blob-free runtime
+# (esp8266/, from CrispStrobe/esp8266js — see esp8266/PROVENANCE.md): no
+# Espressif SDK, no Arduino core, no mask ROM. The program is a sketch —
+# setup()/loop() over an Arduino-style layer (#include <Arduino.h>) — linked
+# with the runtime and libgcc only, and turned into a flash image (.bin) by
+# esp8266_image.py. There is no hardware flow here: the image boots in the
+# emulator, which is what the response is for.
+ESP8266_TARGETS = {
+    "esp8266": {
+        "mcu": "lx106", "toolchain": "xtensa-lx106-elf-gcc",
+        "description": "ESP8266 (LX106) — C against the blob-free bw8266 runtime "
+                       "and Arduino-style layer; emulated",
+    },
+}
+SRC_XTENSA_GCC = os.path.join(BASE_DIR, "xtensa-lx106-gcc")
+XTENSA_GCC_STAGE = "/tmp/xtensa-lx106-gcc"
+XTENSA_GCC_STAGE_BIN = os.path.join(XTENSA_GCC_STAGE, "bin")
+SRC_ESP8266_RUNTIME = os.path.join(BASE_DIR, "esp8266")
 
 # The full-C RISC-V bundle: native gcc + picolibc, staged like the ARM bundle.
 SRC_RISCV_GCC = os.path.join(BASE_DIR, "riscv-gcc")
@@ -621,6 +642,8 @@ def stage_riscv_gcc() -> str | None:
                     shutil.copytree(source, destination, symlinks=True)
                 elif os.path.isfile(source) and not os.path.exists(destination):
                     shutil.copy2(source, destination)
+            # cc1 is committed xz-compressed (Vercel's size limit, bundle_xz.py).
+            bundle_xz.materialize(RISCV_GCC_STAGE)
             for sub in ("bin",
                         os.path.join("lib", "riscv64-unknown-elf", "bin"),
                         os.path.join("lib", "gcc")):
@@ -631,6 +654,37 @@ def stage_riscv_gcc() -> str | None:
             return RISCV_GCC_STAGE_BIN
 
     found = shutil.which("riscv64-unknown-elf-gcc")
+    return os.path.dirname(found) if found else None
+
+
+def stage_xtensa_gcc() -> str | None:
+    """Directory holding xtensa-lx106-elf-gcc, or None if unavailable.
+
+    Same cold-start staging as stage_riscv_gcc: the xtensa-lx106-gcc/ bundle
+    ships in git, is copied into /tmp (read-only deployment dir, executable
+    bit stripped), and its xz-compressed cc1 is decompressed there as the AVR
+    bundle's are (bundle_xz.py). The driver finds cc1/collect2/as/ld relative
+    to argv[0]. Falls back to a system xtensa-lx106-elf-gcc for local dev.
+    """
+    if sys.platform.startswith("linux") and os.path.isdir(SRC_XTENSA_GCC):
+        staged = os.path.join(XTENSA_GCC_STAGE_BIN, "xtensa-lx106-elf-gcc")
+        if not os.path.exists(staged):
+            os.makedirs(XTENSA_GCC_STAGE, exist_ok=True)
+            for part in os.listdir(SRC_XTENSA_GCC):
+                source = os.path.join(SRC_XTENSA_GCC, part)
+                destination = os.path.join(XTENSA_GCC_STAGE, part)
+                if os.path.isdir(source) and not os.path.isdir(destination):
+                    shutil.copytree(source, destination, symlinks=True)
+                elif os.path.isfile(source) and not os.path.exists(destination):
+                    shutil.copy2(source, destination)
+            bundle_xz.materialize(XTENSA_GCC_STAGE)
+            for sub in ("bin", "libexec", os.path.join("xtensa-lx106-elf", "bin")):
+                for root, _dirs, _files in os.walk(os.path.join(XTENSA_GCC_STAGE, sub)):
+                    _make_executable(root)
+        if os.path.exists(staged) and _can_execute(staged):
+            return XTENSA_GCC_STAGE_BIN
+
+    found = shutil.which("xtensa-lx106-elf-gcc")
     return os.path.dirname(found) if found else None
 
 
@@ -1676,6 +1730,83 @@ def build_riscv_gcc(req: CompileReq, spec: dict, generated_c: str | None,
         shutil.rmtree(work, ignore_errors=True)
 
 
+def build_esp8266(req: CompileReq, spec: dict, generated_c: str | None,
+                  stem: str = "main") -> dict:
+    """Compile a C sketch for the ESP8266 against the blob-free bw8266 runtime.
+
+    The flags are the ones CrispStrobe/esp8266js's own CI builds its sketches
+    with: freestanding, no start files, no C library, long calls and text
+    literals for the LX106, -Werror. The link is runtime.c + arduino.c + the
+    sketch + libgcc and nothing else, and the ELF becomes a flash image
+    (boot image + any flash-mapped code) via esp8266_image.py.
+    """
+    refusal = reject_path_options(req.options)
+    if refusal:
+        return refusal
+
+    bin_dir = stage_xtensa_gcc()
+    if bin_dir is None:
+        return {"success": False, "stage": "compile",
+                "error": "no ESP8266 gcc toolchain available; the xtensa-lx106-gcc/ "
+                         "bundle is not vendored in this deployment and no "
+                         "xtensa-lx106-elf-gcc is on PATH",
+                "c": generated_c}
+
+    rt = SRC_ESP8266_RUNTIME
+    work = os.path.join(tempfile.gettempdir(), f"build-{uuid.uuid4().hex}")
+    os.makedirs(work, exist_ok=True)
+    try:
+        src = os.path.join(work, "main.c")
+        with open(src, "w", encoding="utf-8") as handle:
+            handle.write(req.code)
+        elf = os.path.join(work, f"{stem}.elf")
+        cmd = [os.path.join(bin_dir, "xtensa-lx106-elf-gcc"),
+               "-Os", "-ffreestanding", "-nostdlib", "-nostartfiles",
+               "-mlongcalls", "-mtext-section-literals",
+               "-Wall", "-Wextra", "-Werror",
+               "-I", rt, "-I", os.path.join(rt, "arduino"),
+               "-T", os.path.join(rt, "bw8266.ld"), "-L", rt]
+        for name, val in (req.defines or {}).items():
+            cmd.append(f"-D{name}" + (f"={val}" if val is not None else ""))
+        cmd += list(req.options or [])
+        cmd += [os.path.join(rt, "runtime.c"), os.path.join(rt, "arduino", "arduino.c"),
+                src, "-lgcc", "-o", elf]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=COMPILE_TIMEOUT, cwd=work)
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": f"compile timed out after {COMPILE_TIMEOUT}s"}
+        log = (proc.stdout + proc.stderr).replace(work + os.sep, "").replace(rt + os.sep, "")
+        if proc.returncode != 0 or not os.path.exists(elf):
+            return {"success": False, "stage": "compile",
+                    "error": log or "compilation failed", "log": log, "c": generated_c}
+        with open(elf, "rb") as handle:
+            elf_bytes = handle.read()
+        try:
+            out = esp8266_image.elf2image(elf_bytes)
+        except (ValueError, struct.error) as exc:
+            return {"success": False, "stage": "link",
+                    "error": f"the linked program is not a placeable ESP8266 image: {exc}",
+                    "log": log, "c": generated_c}
+        image = out["image"]
+        ram = sum(n for _a, n in out["segments"])
+        mem = (f"ESP8266 image: {len(image)} bytes (boot image {out['boot_length']} B, "
+               f"{len(out['segments'])} RAM segment(s) {ram} B"
+               + (f", {sum(n for _a, n, _o in out['mapped'])} B flash-mapped" if out["mapped"] else "")
+               + f"), entry 0x{out['entry']:x}; ELF {len(elf_bytes)} B")
+        return {
+            "success": True, "c": generated_c, "translated": None, "unresolved": None,
+            "warnings": None, "disassembly": None, "listing": None,
+            "base64": base64.b64encode(image).decode("ascii"),
+            "filename": f"{stem}.bin", "bytes": len(image), "log": log, "memory": mem,
+            "symbols": None, "symbols_error": None,
+            "toolchain": "xtensa-lx106-elf-gcc", "mcu": spec["mcu"],
+            "entry": out["entry"], "elf_bytes": len(elf_bytes),
+        }
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def build(req: CompileReq) -> dict:
     """Compile and return the JSON-shaped result. Shared by both endpoints."""
     if len(req.code.encode("utf-8")) > MAX_SOURCE_BYTES:
@@ -1807,10 +1938,19 @@ def build(req: CompileReq) -> dict:
             return build_riscv_gcc(req, riscv, generated_c, stem)
         return build_riscv(req, riscv, generated_c, stem)
 
+    esp = ESP8266_TARGETS.get(req.target.lower())
+    if esp is not None:
+        if keil_changes:
+            return {"success": False,
+                    "error": "the Keil C51 dialect is 8051-only; it cannot be "
+                             "compiled for the ESP8266"}
+        return build_esp8266(req, esp, generated_c, stem)
+
     target = TARGETS.get(req.target.lower())
     if target is None:
         known = sorted(list(TARGETS) + list(AVR_TARGETS) + list(ARM_TARGETS)
-                       + list(EATER_TARGETS) + list(Z80_TARGETS) + list(RISCV_TARGETS))
+                       + list(EATER_TARGETS) + list(Z80_TARGETS) + list(RISCV_TARGETS)
+                       + list(ESP8266_TARGETS))
         return {"success": False,
                 "error": f"unknown target '{req.target}'; known: {', '.join(known)}"}
 
@@ -2859,6 +2999,8 @@ async def health():
                           if cc65_bin else {}),
         "z80_targets": {name: cfg["description"] for name, cfg in Z80_TARGETS.items()},
         "riscv_targets": {name: cfg["description"] for name, cfg in RISCV_TARGETS.items()},
+        "esp8266_targets": ({name: cfg["description"] for name, cfg in ESP8266_TARGETS.items()}
+                            if stage_xtensa_gcc() else {}),
         "devices": sorted(stc_pseudocode.TARGETS),
         "assemble_targets": sorted(ASSEMBLE_TARGETS.keys()),
     }

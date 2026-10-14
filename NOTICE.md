@@ -27,6 +27,8 @@ their own upstream licenses.
 | `riscv/riscv-cc.wasm` | [shecc](https://github.com/sysprog21/shecc) — RV32IM C compiler, built to `wasm32-wasi` | **BSD-2-Clause** |
 | `riscv-gcc/bin/**`, `riscv-gcc/lib/gcc/**`, `riscv-gcc/lib/riscv64-unknown-elf/bin/**` | [GCC](https://gcc.gnu.org/) for `riscv64-unknown-elf` + GNU binutils | **GPL-3.0-or-later**, runtime under the **GCC Runtime Library Exception** |
 | `riscv-gcc/picolibc/**` | [picolibc](https://github.com/picolibc/picolibc) — the C library | **BSD-2/3-Clause** (a few files under other permissive terms) |
+| `xtensa-lx106-gcc/**` | [GCC](https://gcc.gnu.org/) 10.3 for `xtensa-lx106-elf` + GNU binutils, prebuilt by [esp-quick-toolchain](https://github.com/earlephilhower/esp-quick-toolchain) | **GPL-3.0-or-later**, `libgcc.a` and headers under the **GCC Runtime Library Exception** |
+| `esp8266/**`, `scripts/fixtures/esp8266/**` | the blob-free bw8266 runtime and Arduino-style layer from [CrispStrobe/esp8266js](https://github.com/CrispStrobe/esp8266js) | **MIT** (`esp8266/LICENSE`) |
 | `riscv-gcc/lib-deps/**` | the shared libraries the compiler links (GMP, MPFR, MPC, ISL, zlib) | LGPL-3.0-or-later / zlib, as each upstream states |
 
 ### Provenance
@@ -41,6 +43,8 @@ source, in `vendor/<name>/`:
 | arm-none-eabi | Debian bullseye `gcc-arm-none-eabi`, `binutils-arm-none-eabi`, unmodified | `vendor/arm/VERSION` + two `.copyright` files |
 | cc65 | **built from upstream source**, commit `547d923` — not a Debian package | `vendor/cc65/VERSION`, `vendor/cc65/LICENSE` |
 | shecc | **built from upstream source**, commit `362b94b`, cross-compiled to `wasm32-wasi` — byte-reproducible, see `riscv/riscv-cc.PROVENANCE.md` | `vendor/shecc/VERSION`, `vendor/shecc/LICENSE` |
+| xtensa-lx106-gcc | esp-quick-toolchain release `3.1.0-gcc10.3`, archive pinned by SHA-256, unmodified — only the C driver, cc1, collect2, as, ld, libgcc and freestanding headers kept | `xtensa-lx106-gcc/PROVENANCE.md`; reproduced by `scripts/fetch-xtensa-lx106-gcc.sh` |
+| bw8266 runtime | CrispStrobe/esp8266js `firmware/` at commit `66cdf43`, unmodified | `esp8266/PROVENANCE.md` |
 | riscv-gcc | Debian bullseye `gcc-riscv64-unknown-elf`, `binutils-riscv64-unknown-elf`, `picolibc-riscv64-unknown-elf`, unmodified — trimmed to the rv32imac/ilp32 multilib, DWARF stripped | `vendor/riscv-gcc/VERSION` + three `.copyright` files |
 
 `scripts/fetch-sdcc.sh`, `scripts/fetch-avr-gcc.sh`,

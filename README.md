@@ -317,6 +317,7 @@ end** knows, which the service can **compile**, and which a browser can
 | `z80` (`z80-bench`) | sdcc `-mz80` | Z80 bench, ROM `$0000-$7FFF`, RAM `$8000-$FFFF` (`--code-loc 0x0200 --data-loc 0x8000`) |
 | `riscv32` | shecc (as wasm) | RV32IM, ELF32 image for an emulated console — no native toolchain, no flashing |
 | `riscv32-gcc` | native gcc + picolibc (`riscv-gcc/`) | RV32IMAC, **full C** (floats, malloc, qsort, math.h) — ELF32 image for the same emulated console |
+| `esp8266` | xtensa-lx106-elf-gcc (`xtensa-lx106-gcc/`) | ESP8266 (LX106), a C sketch (`setup()`/`loop()`, `#include <Arduino.h>`) against the blob-free bw8266 runtime (`esp8266/`) — flash image `main.bin` for the emulator |
 
 `riscv32` is the odd one out: it hosts no native compiler. It runs
 [shecc](https://github.com/sysprog21/shecc) — a small self-hosting C compiler
@@ -350,6 +351,16 @@ compiler, so unlike `riscv32` it does not run in the browser page.
 `scripts/fetch-riscv-gcc.sh` reproduces the bundle; the `riscv-gcc-bundle` CI job
 guards that every dependency travels with it, nothing needs GLIBC > 2.34, and it
 stays within the deploy budget.
+
+**`esp8266`** compiles a C sketch with a carved esp-quick-toolchain GCC 10.3
+(`xtensa-lx106-gcc/`, ~7.5 MB, binaries xz-compressed) against our own blob-free
+runtime from [esp8266js](https://github.com/CrispStrobe/esp8266js) (`esp8266/`):
+no Espressif SDK, no Arduino core, no mask ROM — the link is the runtime, the
+Arduino-style layer, the sketch and `libgcc`. The ELF becomes a flash image
+(boot image with the 0xE9 header, plus any flash-mapped code at its offset) via
+`esp8266_image.py`, a byte-identical port of the fork's `tools/elf2image.js`
+(checked against the real JS in CI). See `xtensa-lx106-gcc/PROVENANCE.md` and
+`esp8266/PROVENANCE.md`.
 
 The 8051 targets compile `-mmcs51 --std-c99`; adding a part is three lines in
 `TARGETS` in [`app.py`](app.py). **For a pseudocode program the `DEVICE` line
