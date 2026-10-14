@@ -313,6 +313,8 @@ end** knows, which the service can **compile**, and which a browser can
 | `attiny85` `attiny88` | avr-gcc | 8 KB |
 | `rp2040` | arm-none-eabi-gcc | Cortex-M0+, SRAM image (`pico-sram.ld`) |
 | `stm32f030` | arm-none-eabi-gcc | Cortex-M0, real flash image at `0x08000000` (`stm32f030-flash.ld`) |
+| `stm32g030` | arm-none-eabi-gcc | Cortex-M0+, real flash image at `0x08000000` (`stm32g030-flash.ld`) |
+| `stm32f103` | arm-none-eabi-gcc | Cortex-M3 (Blue Pill), real flash image at `0x08000000` (`stm32f103-flash.ld`) |
 | `eater6502` | cc65 | 65C02, 32 KB ROM at `$8000` (`eater.cfg`) |
 | `z80` (`z80-bench`) | sdcc `-mz80` | Z80 bench, ROM `$0000-$7FFF`, RAM `$8000-$FFFF` (`--code-loc 0x0200 --data-loc 0x8000`) |
 | `riscv32` | shecc (as wasm) | RV32IM, ELF32 image for an emulated console — no native toolchain, no flashing |
@@ -414,9 +416,9 @@ past what gcc-avr 5.4 knows (`gnu++11` for ArduinoCore-avr, as its
 platform.txt asks; `gnu++1z` for ATTinyCore, which asks for 17). Licensing
 posture in [`NOTICE.md`](NOTICE.md).
 
-The `stm32f030` image is a genuine flash image — vectors first, initial SP in
-word 0 and the reset handler in word 1 — not a bare `.text` blob, which is
-what makes it bootable and what `scripts/test-api.py` asserts about it.
+The `stm32f030`, `stm32g030`, and `stm32f103` images are genuine flash images —
+vectors first, initial SP in word 0 and the reset handler in word 1 — not a bare
+`.text` blob, which is what makes them bootable and what `scripts/test-api.py` asserts.
 
 ### Known to the pseudocode front end
 

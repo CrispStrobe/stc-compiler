@@ -244,6 +244,16 @@ ARM_TARGETS = {
         "ld": "stm32f030-flash.ld", "origin": 0x08000000,
         "description": "STM32F030 — Cortex-M0, 16 KB flash at 0x08000000, 4 KB SRAM",
     },
+    "stm32g030": {
+        "mcu": "cortex-m0plus", "sram": 8 * 1024,
+        "ld": "stm32g030-flash.ld", "origin": 0x08000000,
+        "description": "STM32G030 — Cortex-M0+, 64 KB flash at 0x08000000, 8 KB SRAM",
+    },
+    "stm32f103": {
+        "mcu": "cortex-m3", "sram": 20 * 1024,
+        "ld": "stm32f103-flash.ld", "origin": 0x08000000,
+        "description": "STM32F103 — Cortex-M3 (Blue Pill), 64 KB flash at 0x08000000, 20 KB SRAM",
+    },
 }
 
 # 6502 compile target: the composable EATER6502 machine. The assemble path
@@ -2206,6 +2216,7 @@ ASSEMBLE_TARGETS = {
     "attiny85": "avr", "attiny88": "avr",
     # ARM → arm-none-eabi-gcc
     "nrf52833": "arm", "rp2040": "arm", "stm32f030": "arm",
+    "stm32g030": "arm", "stm32f103": "arm",
     # Z80 → sdasz80+sdldz80
     "z80": "z80",
 }
@@ -2214,6 +2225,8 @@ ARM_MCU_FOR_TARGET = {
     "nrf52833": "cortex-m4",
     "rp2040": "cortex-m0plus",   # Raspberry Pi Pico
     "stm32f030": "cortex-m0",    # STM32F0 value line
+    "stm32g030": "cortex-m0plus", # STM32G0 value line
+    "stm32f103": "cortex-m3",    # STM32F1 mainstream (Blue Pill)
 }
 
 ARM_LD_FOR_TARGET = {
@@ -2222,6 +2235,8 @@ ARM_LD_FOR_TARGET = {
     # jumps to 0x20000000), the F030 is a real flash image at 0x08000000.
     "rp2040": os.path.join(BASE_DIR, "pico-sram.ld"),
     "stm32f030": os.path.join(BASE_DIR, "stm32f030-flash.ld"),
+    "stm32g030": os.path.join(BASE_DIR, "stm32g030-flash.ld"),
+    "stm32f103": os.path.join(BASE_DIR, "stm32f103-flash.ld"),
 }
 
 AVR_MCU_FOR_TARGET = {
