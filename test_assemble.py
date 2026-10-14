@@ -298,6 +298,38 @@ main:
     b .                 @ infinite loop
 """
 
+VECTOR_LOOP_STM32G0 = """\
+.syntax unified
+.cpu cortex-m0plus
+.thumb
+
+.section .vectors, "a"
+.word 0x20002000        @ initial SP (top of 8K SRAM)
+.word main + 1          @ reset vector (thumb bit)
+
+.section .text.startup
+.global main
+.type main, %function
+main:
+    b .                 @ infinite loop
+"""
+
+VECTOR_LOOP_STM32F1 = """\
+.syntax unified
+.cpu cortex-m3
+.thumb
+
+.section .vectors, "a"
+.word 0x20005000        @ initial SP (top of 20K SRAM)
+.word main + 1          @ reset vector (thumb bit)
+
+.section .text.startup
+.global main
+.type main, %function
+main:
+    b .                 @ infinite loop
+"""
+
 
 class TestArmAssemble(unittest.TestCase):
     def _arm(self):
@@ -427,6 +459,52 @@ class TestArmAssemble(unittest.TestCase):
 
     def test_stm32f030_bad_source_fails(self):
         bin_dir, env, mcu, ld = self._arm_target("stm32f030")
+        r = assemble.assemble_arm(BAD_ARM, mcu, bin_dir, env, ld)
+        self.assertFalse(r["success"])
+        self.assertGreater(len(r["errors"]), 0)
+
+    def test_stm32g030_registered_as_arm(self):
+        import os
+        from app import ASSEMBLE_TARGETS, ARM_MCU_FOR_TARGET, ARM_LD_FOR_TARGET
+        self.assertEqual(ASSEMBLE_TARGETS.get("stm32g030"), "arm")
+        self.assertEqual(ARM_MCU_FOR_TARGET.get("stm32g030"), "cortex-m0plus")
+        self.assertTrue(ARM_LD_FOR_TARGET.get("stm32g030", "").endswith("stm32g030-flash.ld"))
+        self.assertTrue(os.path.exists(ARM_LD_FOR_TARGET["stm32g030"]))
+
+    def test_stm32g030_assembles_to_ihex(self):
+        import base64
+        bin_dir, env, mcu, ld = self._arm_target("stm32g030")
+        r = assemble.assemble_arm(VECTOR_LOOP_STM32G0, mcu, bin_dir, env, ld)
+        self.assertTrue(r["success"], r.get("log") or r.get("errors"))
+        content = base64.b64decode(r["base64"]).decode("ascii", errors="replace")
+        self.assertTrue(content.startswith(":"), "output should be Intel HEX")
+        self.assertGreater(r["bytes"], 0)
+
+    def test_stm32g030_bad_source_fails(self):
+        bin_dir, env, mcu, ld = self._arm_target("stm32g030")
+        r = assemble.assemble_arm(BAD_ARM, mcu, bin_dir, env, ld)
+        self.assertFalse(r["success"])
+        self.assertGreater(len(r["errors"]), 0)
+
+    def test_stm32f103_registered_as_arm(self):
+        import os
+        from app import ASSEMBLE_TARGETS, ARM_MCU_FOR_TARGET, ARM_LD_FOR_TARGET
+        self.assertEqual(ASSEMBLE_TARGETS.get("stm32f103"), "arm")
+        self.assertEqual(ARM_MCU_FOR_TARGET.get("stm32f103"), "cortex-m3")
+        self.assertTrue(ARM_LD_FOR_TARGET.get("stm32f103", "").endswith("stm32f103-flash.ld"))
+        self.assertTrue(os.path.exists(ARM_LD_FOR_TARGET["stm32f103"]))
+
+    def test_stm32f103_assembles_to_ihex(self):
+        import base64
+        bin_dir, env, mcu, ld = self._arm_target("stm32f103")
+        r = assemble.assemble_arm(VECTOR_LOOP_STM32F1, mcu, bin_dir, env, ld)
+        self.assertTrue(r["success"], r.get("log") or r.get("errors"))
+        content = base64.b64decode(r["base64"]).decode("ascii", errors="replace")
+        self.assertTrue(content.startswith(":"), "output should be Intel HEX")
+        self.assertGreater(r["bytes"], 0)
+
+    def test_stm32f103_bad_source_fails(self):
+        bin_dir, env, mcu, ld = self._arm_target("stm32f103")
         r = assemble.assemble_arm(BAD_ARM, mcu, bin_dir, env, ld)
         self.assertFalse(r["success"])
         self.assertGreater(len(r["errors"]), 0)

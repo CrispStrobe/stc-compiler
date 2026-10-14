@@ -848,6 +848,58 @@ try:
 except Exception as exc:
     check("stm32f030 target compiles", False, str(exc))
 
+G0_SOURCE = """
+#include <stdint.h>
+#define BW_MMIO(a) (*(volatile uint32_t *)(a))
+static void bw_fault(void) { for (;;) { } }
+int main(void) { for (;;) { } }
+__attribute__((section(".vectors"), used))
+const void *vectors[48] = {
+    (void *)0x20002000, (void *)main, [3] = (void *)bw_fault
+};
+"""
+try:
+    result, _ = post({"code": G0_SOURCE, "language": "c",
+                      "target": "stm32g030", "format": "bin"})
+    ok = result.get("success") is True
+    check("stm32g030 target compiles", ok, result.get("error", ""))
+    if ok:
+        blob = base64.b64decode(result["base64"])
+        sp = int.from_bytes(blob[0:4], "little")
+        reset = int.from_bytes(blob[4:8], "little")
+        check("stm32g030 word 0 is the initial SP", sp == 0x20002000,
+              f"0x{sp:08x}")
+        check("stm32g030 word 1 is a flash reset handler",
+              0x08000000 <= (reset & ~1) < 0x08010000, f"0x{reset:08x}")
+except Exception as exc:
+    check("stm32g030 target compiles", False, str(exc))
+
+F1_SOURCE = """
+#include <stdint.h>
+#define BW_MMIO(a) (*(volatile uint32_t *)(a))
+static void bw_fault(void) { for (;;) { } }
+int main(void) { for (;;) { } }
+__attribute__((section(".vectors"), used))
+const void *vectors[48] = {
+    (void *)0x20005000, (void *)main, [3] = (void *)bw_fault
+};
+"""
+try:
+    result, _ = post({"code": F1_SOURCE, "language": "c",
+                      "target": "stm32f103", "format": "bin"})
+    ok = result.get("success") is True
+    check("stm32f103 target compiles", ok, result.get("error", ""))
+    if ok:
+        blob = base64.b64decode(result["base64"])
+        sp = int.from_bytes(blob[0:4], "little")
+        reset = int.from_bytes(blob[4:8], "little")
+        check("stm32f103 word 0 is the initial SP", sp == 0x20005000,
+              f"0x{sp:08x}")
+        check("stm32f103 word 1 is a flash reset handler",
+              0x08000000 <= (reset & ~1) < 0x08010000, f"0x{reset:08x}")
+except Exception as exc:
+    check("stm32f103 target compiles", False, str(exc))
+
 
 # ---------------------------------------------------------------------------
 # The introspection payloads: /compile symbols and /assemble debug.

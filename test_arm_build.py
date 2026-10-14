@@ -83,6 +83,34 @@ const void *vectors[48] = {
 };
 """
 
+G0_BLINK_C = """
+#include <stdint.h>
+#define BW_MMIO(a) (*(volatile uint32_t *)(a))
+static void bw_fault(void) { for (;;) { } }
+int main(void)
+{
+    for (;;) { }
+}
+__attribute__((section(".vectors"), used))
+const void *vectors[48] = {
+    (void *)0x20002000, (void *)main, [3] = (void *)bw_fault
+};
+"""
+
+F1_BLINK_C = """
+#include <stdint.h>
+#define BW_MMIO(a) (*(volatile uint32_t *)(a))
+static void bw_fault(void) { for (;;) { } }
+int main(void)
+{
+    for (;;) { }
+}
+__attribute__((section(".vectors"), used))
+const void *vectors[48] = {
+    (void *)0x20005000, (void *)main, [3] = (void *)bw_fault
+};
+"""
+
 
 class TestArmBuild(unittest.TestCase):
     def test_blink_compiles(self):
@@ -109,6 +137,32 @@ class TestArmBuild(unittest.TestCase):
         reset = int.from_bytes(blob[4:8], "little")
         self.assertEqual(sp, 0x20001000, "word 0 is the initial SP")
         self.assertTrue(0x08000000 <= (reset & ~1) < 0x08004000,
+                        f"word 1 is a flash reset handler (0x{reset:08x})")
+
+    def test_stm32g030_compiles_with_vectors_first(self):
+        req = CompileReq(code=G0_BLINK_C, target="stm32g030")
+        result = build_arm(req, ARM_TARGETS["stm32g030"], None)
+        self.assertTrue(result["success"], result.get("error"))
+        self.assertEqual(result["origin"], 0x08000000)
+        import base64
+        blob = base64.b64decode(result["base64"])
+        sp = int.from_bytes(blob[0:4], "little")
+        reset = int.from_bytes(blob[4:8], "little")
+        self.assertEqual(sp, 0x20002000, "word 0 is the initial SP (8K SRAM)")
+        self.assertTrue(0x08000000 <= (reset & ~1) < 0x08010000,
+                        f"word 1 is a flash reset handler (0x{reset:08x})")
+
+    def test_stm32f103_compiles_with_vectors_first(self):
+        req = CompileReq(code=F1_BLINK_C, target="stm32f103")
+        result = build_arm(req, ARM_TARGETS["stm32f103"], None)
+        self.assertTrue(result["success"], result.get("error"))
+        self.assertEqual(result["origin"], 0x08000000)
+        import base64
+        blob = base64.b64decode(result["base64"])
+        sp = int.from_bytes(blob[0:4], "little")
+        reset = int.from_bytes(blob[4:8], "little")
+        self.assertEqual(sp, 0x20005000, "word 0 is the initial SP (20K SRAM)")
+        self.assertTrue(0x08000000 <= (reset & ~1) < 0x08010000,
                         f"word 1 is a flash reset handler (0x{reset:08x})")
 
     def test_entry_at_origin(self):
