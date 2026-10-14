@@ -642,6 +642,8 @@ def stage_riscv_gcc() -> str | None:
                     shutil.copytree(source, destination, symlinks=True)
                 elif os.path.isfile(source) and not os.path.exists(destination):
                     shutil.copy2(source, destination)
+            # cc1 is committed xz-compressed (Vercel's size limit, bundle_xz.py).
+            bundle_xz.materialize(RISCV_GCC_STAGE)
             for sub in ("bin",
                         os.path.join("lib", "riscv64-unknown-elf", "bin"),
                         os.path.join("lib", "gcc")):

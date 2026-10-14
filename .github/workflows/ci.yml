@@ -196,6 +196,11 @@ jobs:
         with:
           python-version: "3.11"
 
+      # cc1 is committed xz-compressed (deploy budget); decompress it as
+      # stage_riscv_gcc() does, so every check below sees the real binary.
+      - name: Decompress the compiler, as staging does
+        run: python3 bundle_xz.py materialize riscv-gcc
+
       # The check CI cannot make by running things: the runner HAS libstdc++,
       # libisl, etc., so a bundle that forgot to vendor one compiles here and
       # dies on Vercel with "error while loading shared libraries". Static.
@@ -239,6 +244,13 @@ jobs:
           assert b[:4]==b'\x7fELF' and b[4]==1 and (b[18]|b[19]<<8)==243, "not an rv32 ELF32"
           print("rv32 ELF32 OK,", len(b), "bytes")
           PY
+
+      # Back to the committed (compressed) form before anything is measured.
+      - name: Restore the committed bundle
+        run: |
+          rm -f riscv-gcc/lib/gcc/riscv64-unknown-elf/8.3.0/cc1
+          git checkout -- riscv-gcc
+          git status --porcelain -- riscv-gcc | (! grep .)
 
       - name: Bundle size stays within the deploy budget
         run: |
