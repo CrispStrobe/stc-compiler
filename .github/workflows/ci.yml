@@ -292,9 +292,14 @@ jobs:
           set -euo pipefail
           ./scripts/fetch-xtensa-lx106-gcc.sh
           git diff --exit-code --stat -- xtensa-lx106-gcc ':(exclude)*.xz'
-          git show HEAD:xtensa-lx106-gcc/libexec/gcc/xtensa-lx106-elf/10.3.0/cc1.xz | xz -dc > /tmp/cc1.committed
-          xz -dc xtensa-lx106-gcc/libexec/gcc/xtensa-lx106-elf/10.3.0/cc1.xz | cmp - /tmp/cc1.committed
-          echo "cc1: committed .xz == carved"
+          # The .xz bytes depend on the local liblzma; compare them decompressed.
+          git ls-files -- 'xtensa-lx106-gcc/*.xz' > /tmp/xz.list
+          test -s /tmp/xz.list
+          while IFS= read -r f; do
+            git show "HEAD:$f" | xz -dc | cmp - <(xz -dc "$f")
+            echo "  $f: committed == carved"
+          done < /tmp/xz.list
+          test "$(git status --porcelain -- xtensa-lx106-gcc | grep -v '\.xz$' || true)" = ""
       - name: Decompress the compiler, as staging does
         run: python3 bundle_xz.py materialize xtensa-lx106-gcc
       - name: Every non-glibc dependency travels with the bundle

@@ -10,7 +10,8 @@
 #
 # Kept (everything the `esp8266` target's freestanding C build runs):
 #   bin/xtensa-lx106-elf-gcc                       the driver
-#   libexec/gcc/xtensa-lx106-elf/10.3.0/cc1        C compiler proper (xz, see bundle_xz.py)
+#   libexec/gcc/xtensa-lx106-elf/10.3.0/cc1        C compiler proper
+# (all binaries and libgcc.a are stored as .xz, see below)
 #   libexec/gcc/xtensa-lx106-elf/10.3.0/collect2   link wrapper the driver runs
 #   libexec/gcc/xtensa-lx106-elf/10.3.0/liblto_plugin.so  the driver insists on it
 #   xtensa-lx106-elf/bin/{as,ld}                   binutils the driver runs
@@ -59,14 +60,28 @@ cp -p "$src/lib/gcc/xtensa-lx106-elf/$GCCV/libgcc.a" "$OUT/lib/gcc/xtensa-lx106-
 cp -a "$src/lib/gcc/xtensa-lx106-elf/$GCCV/include" \
       "$src/lib/gcc/xtensa-lx106-elf/$GCCV/include-fixed" \
       "$OUT/lib/gcc/xtensa-lx106-elf/$GCCV/"
+# Headers no freestanding C sketch here needs (C++/gcov/SSP/fixed-point).
+rm -rf "$OUT/lib/gcc/xtensa-lx106-elf/$GCCV/include/ssp" \
+       "$OUT/lib/gcc/xtensa-lx106-elf/$GCCV/include/"{gcov.h,unwind.h,stdfix.h}
 # GPL texts the toolchain ships, carried with the binaries.
 for lic in COPYING COPYING3 COPYING.RUNTIME COPYING.LIB COPYING3.LIB; do
   f="$(find "$src" -name "$lic" -type f | head -1 || true)"
   [ -n "$f" ] && cp "$f" "$OUT/$lic"
 done
 
-# cc1 is ~19 MB; committed xz-compressed and decompressed at staging time.
-python3 bundle_xz.py compress "$OUT/libexec/gcc/xtensa-lx106-elf/$GCCV" cc1
+# Every binary (and libgcc.a) is committed xz-compressed and decompressed at
+# staging time by bundle_xz.materialize: the deployment has ~7 MB of room
+# under Vercel's limit and the uncompressed set is 26 MB. Executables use the
+# x86 BCJ filter (cc1: 6.6 -> 6.1 MB); lzma.decompress reads either form.
+while IFS= read -r f; do
+  if [ "$(head -c4 "$f" | od -An -tx1 | tr -d ' ')" = "7f454c46" ]; then
+    xz -T1 --x86 --lzma2=preset=9e -c "$f" > "$f.xz"
+  else
+    xz -T1 -9e -c "$f" > "$f.xz"
+  fi
+  rm "$f"
+done < <(find "$OUT/bin" "$OUT/libexec" "$OUT/xtensa-lx106-elf/bin" -type f; \
+         echo "$OUT/lib/gcc/xtensa-lx106-elf/$GCCV/libgcc.a")
 
 [ -n "$keep_provenance" ] && printf '%s\n' "$keep_provenance" > "$OUT/PROVENANCE.md"
 du -sh "$OUT"

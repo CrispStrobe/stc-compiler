@@ -353,7 +353,7 @@ guards that every dependency travels with it, nothing needs GLIBC > 2.34, and it
 stays within the deploy budget.
 
 **`esp8266`** compiles a C sketch with a carved esp-quick-toolchain GCC 10.3
-(`xtensa-lx106-gcc/`, ~13 MB, `cc1` xz-compressed) against our own blob-free
+(`xtensa-lx106-gcc/`, ~7.5 MB, binaries xz-compressed) against our own blob-free
 runtime from [esp8266js](https://github.com/CrispStrobe/esp8266js) (`esp8266/`):
 no Espressif SDK, no Arduino core, no mask ROM — the link is the runtime, the
 Arduino-style layer, the sketch and `libgcc`. The ELF becomes a flash image

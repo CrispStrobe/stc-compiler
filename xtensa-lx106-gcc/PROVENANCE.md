@@ -3,8 +3,10 @@
 A minimal subset of a prebuilt GCC 10.3.0 cross compiler for the ESP8266
 (`xtensa-lx106-elf`), used as a **tool** by the `esp8266` target — the same
 precedent as `riscv-gcc/`. Nothing in it is modified; files are only omitted,
-and `cc1` is stored xz-compressed (`bundle_xz.py`) and decompressed byte for
-byte at staging time.
+and every binary plus `libgcc.a` is stored xz-compressed (`<name>.xz`;
+executables with the x86 BCJ filter) and decompressed byte for byte at
+staging time by `bundle_xz.materialize` — the deployment has only a few MB of
+room under Vercel's limit. The hashes below are of the decompressed files.
 
 ## Source
 
@@ -25,13 +27,13 @@ byte at staging time.
 | file | sha256 |
 |---|---|
 | `bin/xtensa-lx106-elf-gcc` | `f71204e140ac1a39ed7e213ff2c8d08c3e09f85b8faedca5ce130439551bc692` |
-| `libexec/gcc/xtensa-lx106-elf/10.3.0/cc1` (stored as `cc1.xz`) | `43dc5dcb7c04dfccf0786c1f694f2f660d77a8a564403b0f5771f334419743cb` (decompressed) |
+| `libexec/gcc/xtensa-lx106-elf/10.3.0/cc1` | `43dc5dcb7c04dfccf0786c1f694f2f660d77a8a564403b0f5771f334419743cb` |
 | `libexec/gcc/xtensa-lx106-elf/10.3.0/collect2` | `a90c2eb4b01ca1aec01746408d0c69998a589d6992d19b5d1c70f636d896d206` |
 | `libexec/gcc/xtensa-lx106-elf/10.3.0/liblto_plugin.so` | `e088832a2788e1e938cd14de671aad747ec90117fb54392859391e49d81e5bbb` |
 | `xtensa-lx106-elf/bin/as` | `11acd3867063dc6923fa16fc90b292562b787eae0edb018e967c1e16ea9fa89e` |
 | `xtensa-lx106-elf/bin/ld` | `33ef769995a3446ecd165c89b86e8303bd8e0061b93a060236e27590fc29cfb1` |
 | `lib/gcc/xtensa-lx106-elf/10.3.0/libgcc.a` | `27ac18239821c333475ce0121f9c9c6290eea63f1dcf59ae8d08dfcdf851c7ae` |
-| `lib/gcc/xtensa-lx106-elf/10.3.0/include/`, `include-fixed/` | GCC's own freestanding headers |
+| `lib/gcc/xtensa-lx106-elf/10.3.0/include/`, `include-fixed/` | GCC's own freestanding headers (minus ssp/, gcov.h, unwind.h, stdfix.h) |
 
 `liblto_plugin.so` is kept only because the driver refuses to link without
 it (`-fuse-linker-plugin` is its default); no LTO is used. The binaries are
