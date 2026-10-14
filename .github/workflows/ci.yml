@@ -243,7 +243,7 @@ jobs:
       - name: Bundle size stays within the deploy budget
         run: |
           set -euo pipefail
-          kb=$(du -sk riscv-gcc arm avr cc65 | awk '{s+=$1} END{print s}')
+          kb=$(du -sk riscv-gcc arm avr cc65 xtensa-lx106-gcc | awk '{s+=$1} END{print s}')
           mb=$((kb/1024))
           echo "committed toolchain bundles total: ${mb} MB"
           # Vercel's function ceiling is 250 MB unzipped (bundles + python + app).
@@ -276,6 +276,58 @@ jobs:
             exit 1
           fi
 
+  # The ESP8266 bundle (xtensa-lx106-gcc/): a carved subset of
+  # esp-quick-toolchain's prebuilt GCC 10.3, committed and deployed as-is.
+  # Verified here: it is what the fetch script carves from the pinned archive,
+  # it needs nothing but glibc <= 2.34, and it builds the runtime + a sketch.
+  xtensa-lx106-gcc-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: The committed bundle is what the fetch script carves
+        run: |
+          set -euo pipefail
+          ./scripts/fetch-xtensa-lx106-gcc.sh
+          git diff --exit-code --stat -- xtensa-lx106-gcc ':(exclude)*.xz'
+          git show HEAD:xtensa-lx106-gcc/libexec/gcc/xtensa-lx106-elf/10.3.0/cc1.xz | xz -dc > /tmp/cc1.committed
+          xz -dc xtensa-lx106-gcc/libexec/gcc/xtensa-lx106-elf/10.3.0/cc1.xz | cmp - /tmp/cc1.committed
+          echo "cc1: committed .xz == carved"
+      - name: Decompress the compiler, as staging does
+        run: python3 bundle_xz.py materialize xtensa-lx106-gcc
+      - name: Every non-glibc dependency travels with the bundle
+        run: python3 ./scripts/elf-needed.py --check xtensa-lx106-gcc
+      - name: Nothing needs GLIBC above Vercel's 2.34
+        run: |
+          set -euo pipefail
+          worst=2.0
+          for f in $(find xtensa-lx106-gcc/bin xtensa-lx106-gcc/libexec xtensa-lx106-gcc/xtensa-lx106-elf/bin -type f); do
+            need="$(objdump -T "$f" 2>/dev/null | grep -oE 'GLIBC_2\.[0-9]+' | sort -V | tail -1 | cut -d_ -f2 || true)"
+            [ -n "$need" ] && [ "$(printf '%s\n%s\n' "$worst" "$need" | sort -V | tail -1)" = "$need" ] && worst="$need"
+          done
+          echo "highest GLIBC required across the bundle: $worst"
+          if [ "$(printf '%s\n2.34\n' "$worst" | sort -V | tail -1)" != "2.34" ]; then
+            echo "::error::the bundle needs GLIBC $worst, above Vercel's 2.34"; exit 1
+          fi
+      - name: It builds the runtime and a sketch with the fork's own flags
+        run: |
+          set -euo pipefail
+          B="$PWD/xtensa-lx106-gcc"; R="$PWD/esp8266"
+          "$B/bin/xtensa-lx106-elf-gcc" -Os -ffreestanding -nostdlib -nostartfiles \
+            -mlongcalls -mtext-section-literals -Wall -Wextra -Werror \
+            -I "$R" -I "$R/arduino" -T "$R/bw8266.ld" -L "$R" -Wl,-Map,/tmp/wave.map \
+            "$R/runtime.c" "$R/arduino/arduino.c" scripts/fixtures/esp8266/wave.c -lgcc -o /tmp/wave.elf
+          # Only our objects and libgcc: no SDK or Arduino core may be linked.
+          if grep -E 'tools/sdk|libmain|libphy|libpp|libnet80211|libwpa|liblwip|cores/esp8266' /tmp/wave.map; then
+            echo "::error::the link pulled in SDK or Arduino core code"; exit 1
+          fi
+          python3 esp8266_image.py /tmp/wave.elf /tmp/wave.bin
+          python3 -c "b=open('/tmp/wave.bin','rb').read(); assert b[0]==0xE9 and b[1]>=1, b[:8]; print('image', len(b), 'bytes,', b[1], 'segments')"
+      - name: Bundle size
+        run: du -sh xtensa-lx106-gcc
+
   # The pytest suite at the repository root: the dialect, every PART, the
   # display verbs, the Arcade back end, the five assembler chains, UF2,
   # listings, ARM builds, and the device conformance matrix.
@@ -295,6 +347,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # node runs esp8266js's own tools/elf2image.js, so test_esp8266_build.py
+      # proves esp8266_image.py byte-identical to it (with CI set, a missing
+      # node or a bundle that does not stage FAILS that test instead of skipping).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
       # wasmtime runs the vendored shecc.wasm for the RISC-V target; installing
       # it here means test_riscv_build.py actually exercises that path rather
       # than skipping it (qemu-riscv32 is absent, so only its run subtest skips).
