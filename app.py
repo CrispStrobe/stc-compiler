@@ -239,19 +239,25 @@ ARM_TARGETS = {
     # The image is a REAL flash image (vectors first, SP/reset in words
     # 0/1) — see stm32f030-flash.ld. origin is the flash base; the
     # emulator boots via the vector table, so entry need not equal it.
+    # "startup" is linked in first: its Reset_Handler initialises .data/.bss
+    # before main (SRAM is garbage at power-on) and its table forwards
+    # exceptions to the program's own .vectors; "vectors" sizes that table.
     "stm32f030": {
-        "mcu": "cortex-m0", "sram": 4 * 1024,
+        "mcu": "cortex-m0", "sram": 4 * 1024, "chip": "stm32f030",
         "ld": "stm32f030-flash.ld", "origin": 0x08000000,
+        "startup": "stm32-startup.S", "vectors": 16 + 32,
         "description": "STM32F030 — Cortex-M0, 16 KB flash at 0x08000000, 4 KB SRAM",
     },
     "stm32g030": {
-        "mcu": "cortex-m0plus", "sram": 8 * 1024,
+        "mcu": "cortex-m0plus", "sram": 8 * 1024, "chip": "stm32g030",
         "ld": "stm32g030-flash.ld", "origin": 0x08000000,
+        "startup": "stm32-startup.S", "vectors": 16 + 32,
         "description": "STM32G030 — Cortex-M0+, 64 KB flash at 0x08000000, 8 KB SRAM",
     },
     "stm32f103": {
-        "mcu": "cortex-m3", "sram": 20 * 1024,
+        "mcu": "cortex-m3", "sram": 20 * 1024, "chip": "stm32f103",
         "ld": "stm32f103-flash.ld", "origin": 0x08000000,
+        "startup": "stm32-startup.S", "vectors": 16 + 60,
         "description": "STM32F103 — Cortex-M3 (Blue Pill), 64 KB flash at 0x08000000, 20 KB SRAM",
     },
 }
@@ -1083,7 +1089,14 @@ def build_arm(req: CompileReq, spec: dict, generated_c: str | None,
     # -lgcc is REQUIRED: the cooperative scheduler does 64-bit division
     # (__aeabi_uldivmod) for bw_now, and the compiler may emit other
     # runtime helpers for shifts and multiplies.
-    cmd += ["-o", elf, src, "-lgcc"]
+    startup = []
+    if spec.get("startup"):
+        startup_src = os.path.join(work, spec["startup"])
+        shutil.copy2(os.path.join(BASE_DIR, spec["startup"]), startup_src)
+        startup = [startup_src]
+        cmd += [f"-DBW_VECTOR_COUNT={int(spec['vectors'])}",
+                "-Wl,--entry=Reset_Handler"]
+    cmd += ["-o", elf, src, *startup, "-lgcc"]
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True,
@@ -1202,7 +1215,7 @@ def build_arm(req: CompileReq, spec: dict, generated_c: str | None,
             "symbols": symbols,
             "symbols_error": symbols_error,
             "toolchain": "arm-none-eabi-gcc",
-            "mcu": "rp2040",
+            "mcu": spec.get("chip", "rp2040"),
             "origin": origin,
             "entry": entry,
         }
