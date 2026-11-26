@@ -400,7 +400,8 @@ jobs:
   # browser rather than a JavaScript copy of it, and the only way to know
   # that is to start a browser and watch it happen.
   pages:
-    runs-on: ubuntu-latest
+    # Playwright 1.60 supports Ubuntu 24.04 for Chromium.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
