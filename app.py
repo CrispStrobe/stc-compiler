@@ -1622,15 +1622,16 @@ def build_z80_cpm(req: CompileReq) -> dict:
                 for addr, size in re.findall(r"^\S+\s+([0-9A-F]{8})\s+([0-9A-F]{8})\s*=", link_map.read(), re.M):
                     if int(size, 16) and int(addr, 16) + int(size, 16) > 0xD000:
                         return {"success": False, "error": "CP/M program and data exceed the $0100–$CFFF area"}
-            packed = subprocess.run(["makebin", "-p", "-s", str(0xD000), "-o", "256", "main.ihx"],
+            packed = subprocess.run(["makebin", "-p", "-s", str(0xD000), "main.ihx"],
                                     cwd=work, env=env, capture_output=True, timeout=COMPILE_TIMEOUT)
-            if packed.returncode or not packed.stdout:
+            image = packed.stdout[0x100:]
+            if packed.returncode or not image:
                 return {"success": False, "error": "SDCC did not produce a valid CP/M image",
                         "log": packed.stderr.decode("utf-8", errors="replace")}
         except (OSError, subprocess.TimeoutExpired):
             return {"success": False, "error": "CP/M compiler tools are unavailable or timed out"}
-        return {"success": True, "base64": base64.b64encode(packed.stdout).decode("ascii"),
-                "filename": "main.com", "bytes": len(packed.stdout), "origin": 0x0100,
+        return {"success": True, "base64": base64.b64encode(image).decode("ascii"),
+                "filename": "main.com", "bytes": len(image), "origin": 0x0100,
                 "toolchain": "sdcc-z80-cpm", "log": log}
 
 
