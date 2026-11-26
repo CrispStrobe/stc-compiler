@@ -308,6 +308,9 @@ Z80_TARGETS = {
 # The device id the Code tab sends is `z80`; `z80-bench` is the name the
 # gallery example carries, and callers reach for it. Same machine.
 Z80_TARGETS["z80-bench"] = Z80_TARGETS["z80"]
+Z80_TARGETS["z80-cpm"] = {
+    "description": "CP/M 2.2 program (.COM at $0100)",
+}
 # ---- RISC-V (RV32IM) compile target -----------------------------------------
 # Unlike the other toolchains this hosts no native compiler: it runs shecc
 # (github.com/sysprog21/shecc, BSD-2-Clause) as WebAssembly under wasmtime — the
@@ -1581,6 +1584,56 @@ def build_z80(req: CompileReq, spec: dict, generated_c: str | None,
         shutil.rmtree(work, ignore_errors=True)
 
 
+def build_z80_cpm(req: CompileReq) -> dict:
+    """Link a transient program for the CP/M program entry and BDOS vector."""
+    if req.language.lower() != "c" or req.format != "bin" or req.options or req.defines:
+        return {"success": False, "error": "CP/M accepts C and emits a .COM image with a fixed linker layout"}
+    stage_toolchain()
+    sdcc_dir = sdcc_bin_dir()
+    env = dict(os.environ, PATH=sdcc_dir + os.pathsep + os.environ.get("PATH", ""))
+    runtime = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpm-crt0.s")
+    with tempfile.TemporaryDirectory(prefix="bw-cpm-") as work:
+        shutil.copyfile(runtime, os.path.join(work, "crt0.s"))
+        with open(os.path.join(work, "main.c"), "w", encoding="utf-8") as source:
+            source.write(req.code)
+        log = ""
+        commands = [
+            ["sdcc", "-mz80", "--std-c99", "-S", "main.c"],
+            ["sdasz80", "-og", "main.rel", "main.asm"],
+            ["sdasz80", "-o", "crt0.rel", "crt0.s"],
+            ["sdcc", "-mz80", "--no-std-crt0", "--code-loc", "0x0100",
+             "--data-loc", "0", "crt0.rel", "main.rel", "-o", "main.ihx"],
+        ]
+        try:
+            for command in commands:
+                result = subprocess.run(command, cwd=work, env=env, capture_output=True,
+                                        text=True, timeout=COMPILE_TIMEOUT)
+                log += ((result.stdout or "") + (result.stderr or "")).replace(work + os.sep, "")
+                if result.returncode:
+                    return {"success": False, "stage": "compile", "log": log,
+                            "error": log.strip() or "SDCC could not compile the CP/M program"}
+                if command[0] == "sdcc" and command[-1] == "main.c":
+                    with open(os.path.join(work, "main.asm"), encoding="utf-8") as assembly:
+                        if re.search(r"(?i)(?<![\w.])\.(?:include|incbin|define|macro|irp|irpc|rept)\b", assembly.read()):
+                            return {"success": False, "error": "CP/M inline assembly cannot read files or expand assembler macros"}
+            with open(os.path.join(work, "main.map"), encoding="utf-8") as link_map:
+                # Leave space for the transient stack and CP/M itself, including
+                # for uninitialized data absent from the emitted HEX records.
+                for addr, size in re.findall(r"^\S+\s+([0-9A-F]{8})\s+([0-9A-F]{8})\s*=", link_map.read(), re.M):
+                    if int(size, 16) and int(addr, 16) + int(size, 16) > 0xD000:
+                        return {"success": False, "error": "CP/M program and data exceed the $0100–$CFFF area"}
+            packed = subprocess.run(["makebin", "-p", "-s", str(0xD000), "-o", "256", "main.ihx"],
+                                    cwd=work, env=env, capture_output=True, timeout=COMPILE_TIMEOUT)
+            if packed.returncode or not packed.stdout:
+                return {"success": False, "error": "SDCC did not produce a valid CP/M image",
+                        "log": packed.stderr.decode("utf-8", errors="replace")}
+        except (OSError, subprocess.TimeoutExpired):
+            return {"success": False, "error": "CP/M compiler tools are unavailable or timed out"}
+        return {"success": True, "base64": base64.b64encode(packed.stdout).decode("ascii"),
+                "filename": "main.com", "bytes": len(packed.stdout), "origin": 0x0100,
+                "toolchain": "sdcc-z80-cpm", "log": log}
+
+
 def _fosc_from_source(code: str) -> int | None:
     """The clock, read back out of the source.
 
@@ -1943,6 +1996,9 @@ def build(req: CompileReq) -> dict:
                     "error": "the Keil C51 dialect is 8051-only; it cannot be "
                              "compiled for the 6502"}
         return build_6502(req, generated_c, stem)
+
+    if req.target.lower() == "z80-cpm":
+        return build_z80_cpm(req)
 
     z80 = Z80_TARGETS.get(req.target.lower())
     if z80 is not None:

@@ -317,6 +317,7 @@ end** knows, which the service can **compile**, and which a browser can
 | `stm32f103` | arm-none-eabi-gcc | Cortex-M3 (Blue Pill), real flash image at `0x08000000` (`stm32f103-flash.ld`) |
 | `eater6502` | cc65 | 65C02, 32 KB ROM at `$8000` (`eater.cfg`) |
 | `z80` (`z80-bench`) | sdcc `-mz80` | Z80 bench, ROM `$0000-$7FFF`, RAM `$8000-$FFFF` (`--code-loc 0x0200 --data-loc 0x8000`) |
+| `z80-cpm` | sdcc `-mz80` | CP/M C program with startup at `$0100`. Request `language: "c"` and `format: "bin"` to receive a `.COM` image. |
 | `riscv32` | shecc (as wasm) | RV32IM, ELF32 image for an emulated console — no native toolchain, no flashing |
 | `riscv32-gcc` | native gcc + picolibc (`riscv-gcc/`) | RV32IMAC, **full C** (floats, malloc, qsort, math.h) — ELF32 image for the same emulated console |
 | `esp8266` | xtensa-lx106-elf-gcc (`xtensa-lx106-gcc/`) | ESP8266 (LX106), a C sketch (`setup()`/`loop()`, `#include <Arduino.h>`) against the blob-free bw8266 runtime (`esp8266/`) — flash image `main.bin` for the emulator |
