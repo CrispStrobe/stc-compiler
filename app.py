@@ -27,6 +27,7 @@ import riscv_cc
 import stc_disasm
 import arduino_build
 import bundle_xz
+import cowgol_build
 import esp8266_image
 import stc_pseudocode
 import stc_symtab
@@ -1889,6 +1890,9 @@ def build(req: CompileReq) -> dict:
     if len(req.code.encode("utf-8")) > MAX_SOURCE_BYTES:
         return {"success": False, "error": "source too large"}
 
+    if req.language.lower() in ("cowgol", "cow"):
+        return cowgol_build.build_cowgol(req)
+
     refusal = reject_escaping_includes(req.code) or reject_path_options(req.options)
     if refusal:
         return refusal
@@ -1964,7 +1968,7 @@ def build(req: CompileReq) -> dict:
     elif req.language.lower() != "c":
         return {"success": False,
                 "error": f"unknown language '{req.language}'; "
-                         f"use 'c', 'pseudocode', 'arduino', or 'keil'"}
+                         f"use 'c', 'pseudocode', 'arduino', 'keil', or 'cowgol'"}
 
     if req.format not in ("ihx", "hex", "bin"):
         return {"success": False, "error": "format must be ihx, hex or bin"}
@@ -2651,12 +2655,15 @@ async def decompile_pseudocode(req: CompileReq):
 
 
 @app.post("/transpile")
-async def transpile_only(req: CompileReq):
+async def transpile_only(req: CompileReq, request: Request = None):
     """Pseudocode in, C out. No compiler involved -- useful for seeing exactly
     what the front end produced before handing it to SDCC."""
     refusal = too_large(req.code)
     if refusal:
         return refusal
+    if req.language.lower() in ("cowgol", "cow"):
+        cowgol_request = req.model_copy(update={"target": "cowgol-cgen", "format": "c"})
+        return build(cowgol_request) if request is None else _guarded_build(cowgol_request, request)
     try:
         code, program = stc_pseudocode.transpile(req.code)
     except stc_pseudocode.PseudocodeError as exc:
@@ -3067,6 +3074,7 @@ async def health():
         "cc65": cc65_version.strip().splitlines()[0] if cc65_version else None,
         "riscv_gcc": riscv_gcc_version.strip().splitlines()[0] if riscv_gcc_version else None,
         "riscv_wasm": "shecc (wasm)" if riscv_wasm_ok else None,
+        "cowgol": cowgol_build.bundle_status(),
         "targets": {name: cfg["description"] for name, cfg in TARGETS.items()},
         "avr_targets": ({name: cfg["description"] for name, cfg in AVR_TARGETS.items()}
                         if avr_bin else {}),
