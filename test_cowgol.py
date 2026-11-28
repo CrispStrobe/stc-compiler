@@ -552,9 +552,35 @@ bw_digital_toggle(19); bw_pin_mode(19, 1); bw_print_number(bw_digital_read(19));
         self.assertEqual(run["status"], 1)
         self.assertIn("reserved for serial", run["text"])
 
+    def test_blocking_delays_execute_between_actual_gpio_edges(self):
+        source = 'include "cowgol.coh"; include "brickwright.coh"; bw_pin_mode(13, 1);\n'
+        for milliseconds in (0, 1, 7):
+            source += f'bw_digital_write(13, 1); bw_delay({milliseconds}); bw_digital_write(13, 0);\n'
+        for run in self.run_program(self.compile(source), runs=2):
+            self.assertEqual((run["status"], run["text"]), (0, ""))
+            edges = [event for event in run["gpio"] if event["bank"] == "B"
+                     and event["ddr"] & 32 and (event["value"] ^ event["previous"]) & 32]
+            self.assertEqual(len(edges), 6, edges)
+            for index, milliseconds in enumerate((0, 1, 7)):
+                high, low = edges[2 * index:2 * index + 2]
+                self.assertEqual((high["value"] & 32, low["value"] & 32), (32, 0))
+                elapsed = low["cycle"] - high["cycle"]
+                self.assertGreaterEqual(elapsed, milliseconds * 16000)
+                self.assertLess(elapsed, milliseconds * 16100 + 1000)
+
+    def test_negative_delay_stops_before_later_gpio_writes(self):
+        for milliseconds in (-1, -2147483648):
+            with self.subTest(milliseconds=milliseconds):
+                source = 'include "cowgol.coh"; include "brickwright.coh";\n'
+                source += f'bw_pin_mode(13, 1); bw_delay({milliseconds}); bw_digital_write(13, 1);\n'
+                run = self.run_program(self.compile(source))[0]
+                self.assertEqual(run["status"], 1)
+                self.assertIn("delay requires nonnegative milliseconds", run["text"])
+                self.assertEqual(run["registers"]["B"]["port"] & 32, 0)
+
     def test_unimplemented_peripherals_and_static_workspace_overflow_are_refused(self):
         for body, diagnostic in (
-            ('include "brickwright.coh"; bw_delay(1);', "cowgol_bw_delay"),
+            ('include "brickwright.coh"; bw_print_number(bw_millis());', "cowgol_bw_millis"),
             ('include "brickwright.coh"; bw_analog_write(3, 100);', "cowgol_bw_analog_write"),
             ('include "brickwright.coh"; bw_canvas_clear(0);', "cowgol_bw_canvas_clear"),
             ('var large: uint8[1600]; MemSet(&large[0], 1, @bytesof large); print_i8(large[0]);', "data"),

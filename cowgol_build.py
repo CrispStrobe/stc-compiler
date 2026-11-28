@@ -34,7 +34,7 @@ TARGETS = {
                 "family": "cgen", "format": "elf", "extension": "elf", "cross": "riscv32"},
     "eater6502": {"description": "Cowgol for Brickwright EATER6502 (65C02 ROM, ACIA console and VIA GPIO)",
                   "family": "eater6502", "format": "bin", "extension": "bin", "origin": 0x8000},
-    "atmega328p": {"description": "Cowgol via C for 16 MHz ATmega328P / Uno (UART and digital GPIO)",
+    "atmega328p": {"description": "Cowgol via C for 16 MHz ATmega328P / Uno (UART, digital GPIO and blocking millisecond delays)",
                    "family": "cgen", "format": "hex", "extension": "hex", "cross": "atmega328p"},
 }
 ALIASES = {"cgen": "cowgol-cgen", "cowgol-c": "cowgol-cgen", "cowgol-z80-cpm": "z80-cpm",

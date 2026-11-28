@@ -16,7 +16,7 @@ user programs on the server.
 | `cowgol-cgen` | `c` | `main.c` | Standalone generated C for a little-endian host |
 | `riscv32` | `elf` | `main.elf` plus loadable `image` | Cowgol C backend → pinned GCC/picolibc → Brickwright RV32IMAC console machine |
 | `eater6502` | `bin` | `main.bin`, exactly 32768 bytes | Native 65C02 ROM for the canonical Brickwright EATER6502 map; ACIA console and VIA digital GPIO |
-| `atmega328p` | `hex` | `main.hex`, validated Intel HEX | Cowgol C backend → AVR GCC/avr-libc → 16 MHz Uno, 9600-baud UART and digital GPIO |
+| `atmega328p` | `hex` | `main.hex`, validated Intel HEX | Cowgol C backend → AVR GCC/avr-libc → 16 MHz Uno, 9600-baud UART, digital GPIO and blocking delays |
 
 `cowgol-c`, `cgen`, `cowgol-z80-cpm`, `8080-cpm`, `cowgol-8080-cpm`, and
 `i8086-dos` are aliases; `arduino-uno` selects `atmega328p`. Requesting an unrelated machine such as an STC part
@@ -151,9 +151,17 @@ GPIO. Modes `0` input, `1` output and `2` input with pull-up are supported.
 Read observes `PIN`; write and toggle change `PORT`, the output latch.
 Invalid modes and pin numbers print a diagnostic and stop with failure status.
 
+`bw_delay(milliseconds)` accepts a signed int32 count. Each positive millisecond
+executes 16,000 CPU cycles plus a small loop overhead; zero returns without
+waiting. Negative counts print a diagnostic and stop with failure status.
+This synchronous delay keeps interrupts disabled and supplies a minimum wait
+at the fixed 16 MHz clock. It does not supply a scheduler or a `bw_millis` clock.
+Compiler-service tests measure the actual GPIO edges around 0, 1 and 7 ms waits
+after repeated cold starts, as well as refusal of negative delays.
+
 Arrays, records, pointers, nested calls, integer division, allocation/free and
 empty arguments are available through the full compiler. Filesystem includes
-are refused before compilation. Timing, analog/PWM and graphics callbacks
+are refused before compilation. Clock queries, analog/PWM and graphics callbacks
 remain unresolved linker errors. This port is fixed to the declared chip and
 clock; no other AVR board or Arduino core is inferred. Tests execute from
 nonzero SRAM and measure the fixture's stack use; arbitrary pointer writes
