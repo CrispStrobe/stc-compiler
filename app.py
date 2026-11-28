@@ -3241,6 +3241,7 @@ PAGE = r"""<!doctype html>
         <option value=z80-cpm>Z80 CP/M (.COM)</option>
         <option value=i8080-cpm>8080 CP/M (.COM)</option>
         <option value=dos>8086 DOS (.EXE)</option>
+        <option value=riscv32>RISC-V RV32 console (.ELF)</option>
         <option value=cowgol-cgen>Standalone C source</option>
       </optgroup>
     </select>
@@ -3251,6 +3252,7 @@ PAGE = r"""<!doctype html>
       <option value=hex>.hex (packihx)</option>
       <option value=ihx>.ihx (raw)</option>
       <option value=bin>.bin</option>
+      <option value=elf>.elf (Cowgol RISC-V)</option>
       <option value=c>.c (Cowgol source export)</option>
     </select>
   </label>
@@ -3360,7 +3362,7 @@ $('go').onclick = async () => {
       image = {bytes: bytesFromBase64(data.base64), filename: data.filename};
       $('status').className = 'ok';
       $('status').textContent = data.bytes + ' bytes → ' + data.filename;
-      $('out').textContent = (format === 'bin')
+      $('out').textContent = (format === 'bin' || format === 'elf')
         ? hexdump(image.bytes)
         : new TextDecoder().decode(image.bytes);
       $('asm').textContent = data.disassembly || '';
@@ -3370,7 +3372,7 @@ $('go').onclick = async () => {
       $('mem').textContent = data.memory || '(none)';
       $('log').textContent = data.log || '(no warnings)';
       $('dl').disabled = false;
-      $('copy').disabled = (format === 'bin');
+      $('copy').disabled = (format === 'bin' || format === 'elf');
     } else if (data.c && data.toolchain) {
       // Transpiled fine; this service just cannot BUILD it -- a micro:bit is
       // interpreted, an Arduino sketch needs the Arduino build system. The
@@ -3481,10 +3483,10 @@ $('copy').onclick = async () => {
 const STARTERS = {c: $('code').value, pseudocode: __PSEUDO_EXAMPLE__,
                   arduino: __ARDUINO_EXAMPLE__, keil: $('code').value,
                   cowgol: 'include "cowgol.coh";\nprint("Hello from Cowgol!\\n");\n'};
-const cowgolTargets = new Set(['z80-cpm', 'i8080-cpm', 'dos', 'cowgol-cgen']);
+const cowgolTargets = new Set(['z80-cpm', 'i8080-cpm', 'dos', 'riscv32', 'cowgol-cgen']);
 function syncCowgolFormat() {
   if ($('language').value === 'cowgol') {
-    $('format').value = $('target').value === 'cowgol-cgen' ? 'c' : 'bin';
+    $('format').value = $('target').value === 'cowgol-cgen' ? 'c' : $('target').value === 'riscv32' ? 'elf' : 'bin';
   }
 }
 $('target').onchange = syncCowgolFormat;
@@ -3504,7 +3506,7 @@ $('language').onchange = () => {
   }
   if (next === 'cowgol' && !cowgolTargets.has($('target').value)) $('target').value = 'z80-cpm';
   if (next !== 'cowgol' && cowgolTargets.has($('target').value)) $('target').value = 'stc12c5a60s2';
-  if (next !== 'cowgol' && $('format').value === 'c') $('format').value = 'hex';
+  if (next !== 'cowgol' && ['c', 'elf'].includes($('format').value)) $('format').value = 'hex';
   syncCowgolFormat();
   if (next === 'arduino' && !/^(arduino-|atmega|attiny)/.test($('target').value)) {
     $('target').value = 'arduino-uno';

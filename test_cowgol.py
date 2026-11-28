@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from unittest.mock import patch
 
 import cowgol_build as cowgol
 
+BW_BOARD_PIN = "d21d6d8b819263eb08231134b7556efa82289a90"
 
 HELLO = '''include "cowgol.coh";
 var total: uint16 := 0;
@@ -73,12 +75,71 @@ class CowgolBoundaryTests(unittest.TestCase):
         self.assertIsNotNone(cowgol.reject_source("#" * (cowgol.MAX_SOURCE_BYTES + 1), "cgen"))
         self.assertIsNotNone(cowgol.reject_source("\0", "cgen"))
 
+    def test_riscv_refuses_filesystem_header_before_compiling(self):
+        result = cowgol.build_cowgol(request(target="riscv32", format="elf", code='include "file.coh";'))
+        self.assertFalse(result["success"])
+        self.assertEqual(result["stage"], "source")
+
+    def test_riscv_elf_validation_counts_uninitialized_workspace(self):
+        # One code segment with eight initialized bytes and eight BSS bytes.
+        image = bytearray(0x108)
+        image[:7] = b"\x7fELF\x01\x01\x01"
+        struct.pack_into("<HHIIIIIHHHHHH", image, 16,
+                         2, 243, 1, 0x1000, 52, 0, 0, 52, 32, 1, 0, 0, 0)
+        struct.pack_into("<IIIIIIII", image, 52, 1, 0x100, 0x1000, 0x1000, 8, 16, 5, 0x100)
+        image[0x100:] = b"12345678"
+        parsed = cowgol.riscv_image(image)
+        self.assertEqual(parsed["entry"], 0x1000)
+        self.assertEqual(base64.b64decode(parsed["segments"][0]["bytes"]), b"12345678" + bytes(8))
+        invalid = []
+        huge_bss = image.copy()
+        struct.pack_into("<I", huge_bss, 52 + 20, cowgol.RISCV_STATIC_END - 0x1000 + 1)
+        invalid.append(huge_bss)
+        bss_entry = image.copy()
+        struct.pack_into("<I", bss_entry, 24, 0x1008)
+        invalid.append(bss_entry)
+        wrong_cpu = image.copy()
+        struct.pack_into("<H", wrong_cpu, 18, 40)
+        invalid.append(wrong_cpu)
+        wrong_endian = image.copy()
+        wrong_endian[5] = 2
+        invalid.append(wrong_endian)
+        wrong_physical = image.copy()
+        struct.pack_into("<I", wrong_physical, 52 + 12, 0x2000)
+        invalid.append(wrong_physical)
+        truncated = image[:-1]
+        invalid.append(truncated)
+        overlap = image.copy()
+        struct.pack_into("<H", overlap, 44, 2)
+        overlap[84:116] = overlap[52:84]
+        invalid.append(overlap)
+        for candidate in invalid:
+            with self.subTest(header=candidate[:84].hex()), self.assertRaises(ValueError):
+                cowgol.riscv_image(candidate)
+
     def test_missing_bundle_is_reported_without_c_fallback(self):
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"COWGOL_BUNDLE": temporary}):
             self.assertEqual(cowgol.bundle_status()["targets"], {})
             result = cowgol.build_cowgol(request())
             self.assertFalse(result["success"])
             self.assertEqual(result["stage"], "toolchain")
+
+    def test_missing_riscv_gcc_does_not_hide_the_installed_c_export(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"COWGOL_BUNDLE": temporary}):
+            directory = Path(temporary)
+            for name in ("bin/cowfe-cgen", "bin/cowbe-cgen", "bin/cowlink-cgen", "rt/cgen/cowgol.coh",
+                         "rt/cgen/brickwright.coh", "rt/common.coh", "rt/cgen/cowgol.h",
+                         "rt/cgen/brickwright.h", "rt/cgen/brickwright-console.h"):
+                output = directory / name
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text("test bundle marker")
+            (directory / "manifest.json").write_text(json.dumps({"schema": 1,
+                "source_commit": "1" * 40, "targets": ["cowgol-cgen", "riscv32"]}))
+            with patch.object(cowgol, "_riscv_toolchain", return_value=None):
+                self.assertEqual(set(cowgol.bundle_status()["targets"]), {"cowgol-cgen"})
+                result = cowgol.build_cowgol(request(target="riscv32", format="elf"))
+                self.assertEqual(result["stage"], "toolchain")
+                self.assertIn("riscv-gcc/picolibc", result["error"])
 
     def test_corrupt_bundle_fails_content_hash(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -224,6 +285,105 @@ print_i8(large[53999]);
                 result = cowgol.build_cowgol(request(target=target, code=source))
                 self.assertFalse(result["success"])
                 self.assertIn("static workspace exceed", result["error"])
+
+
+class CowgolRiscVCompilerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if "riscv32" not in cowgol.bundle_status()["targets"]:
+            if os.environ.get("REQUIRE_COWGOL_TOOLCHAIN") == "1":
+                raise AssertionError("CI requires the Cowgol RISC-V target and pinned GCC runtime")
+            raise unittest.SkipTest("Cowgol RISC-V bundle is not installed")
+
+    def compile(self, source=HELLO):
+        result = cowgol.build_cowgol(request(target="riscv32", format="elf", code=source))
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["target"], "riscv32")
+        self.assertEqual(result["format"], "elf")
+        self.assertEqual(result["toolchain"], "cowgol-riscv32")
+        self.assertEqual(result["artifact_kind"], "executable")
+        self.assertEqual(result["filename"], "main.elf")
+        self.assertEqual(result["entry"], result["image"]["entry"])
+        elf = base64.b64decode(result["base64"], validate=True)
+        self.assertEqual(len(elf), result["bytes"])
+        self.assertEqual(cowgol.riscv_image(elf), result["image"])
+        self.assertLessEqual(result["memory_end"], cowgol.RISCV_STATIC_END)
+        return result
+
+    def run_program(self, result):
+        board = os.environ.get("COWGOL_BW_BOARD")
+        node = shutil.which("node")
+        if not node or not board or not (Path(board) / "src/riscv32-machine.js").is_file():
+            if os.environ.get("REQUIRE_COWGOL_TOOLCHAIN") == "1":
+                self.fail("CI requires node and COWGOL_BW_BOARD for actual RV32 execution")
+            self.skipTest("set COWGOL_BW_BOARD to the pinned machine checkout to execute RV32 output")
+        self.assertEqual(subprocess.check_output(["git", "-C", board, "rev-parse", "HEAD"], text=True).strip(),
+                         BW_BOARD_PIN, "the execution oracle must match Brickwright's exact machine pin")
+        with tempfile.TemporaryDirectory() as temporary:
+            image_file = Path(temporary) / "image.json"
+            image_file.write_text(json.dumps(result["image"]))
+            process = subprocess.run([node, str(Path(__file__).parent / "scripts/run-cowgol-riscv.mjs"), str(image_file)],
+                                     capture_output=True, text=True, timeout=20, check=True)
+            return process.stdout
+
+    def test_full_cowgol_compiles_and_executes_on_the_brickwright_machine(self):
+        source = '''include "cowgol.coh";
+include "brickwright.coh";
+include "malloc.coh";
+include "argv.coh";
+var values: int32[3];
+values[0] := 20;
+values[1] := 22;
+values[2] := values[0] + values[1];
+var quotient: uint32;
+var remainder: uint32;
+(quotient, remainder) := divmodu32(85, 2);
+var memory := Alloc(8);
+[memory] := 17;
+ArgvInit();
+if ArgvNext() != nil then
+    ExitWithError();
+end if;
+bw_print_text("RISC-V Cowgol");
+bw_print_number(values[2]);
+bw_print_number(quotient as int32);
+bw_print_number(remainder as int32);
+bw_print_number([memory] as int32);
+Free(memory);
+bw_print_number(-2147483647 as int32 - 1);
+bw_print_number(2147483647 as int32);
+'''
+        output = self.run_program(self.compile(source))
+        self.assertEqual(output.strip().splitlines(),
+                         ["RISC-V Cowgol", "42", "42", "1", "17", "-2147483648", "2147483647"])
+
+    def test_ordinary_console_cowgol_runs_without_portable_bridge(self):
+        self.assertEqual(self.run_program(self.compile()).strip(), "Cowgol 42")
+
+    def test_unsupported_riscv_host_operations_fail_at_link(self):
+        for call in ("bw_digital_write(1 as int32, 1 as int32)", "bw_delay(1 as int32)",
+                     "bw_canvas_clear(0 as int32)"):
+            with self.subTest(call=call):
+                result = cowgol.build_cowgol(request(target="riscv32", format="elf", code=
+                    'include "cowgol.coh";\ninclude "brickwright.coh";\n' + call + ";"))
+                self.assertFalse(result["success"])
+                self.assertEqual(result["stage"], "compile")
+                self.assertIn("cowgol_" + call.split("(")[0], result.get("log", ""))
+
+    def test_riscv_refuses_source_layout_overflow_before_narrowing(self):
+        # Array indices and lengths are uint16 in this bootstrap. Multiple
+        # simultaneously-live arrays exercise the linked workspace bound
+        # without relying on an out-of-range source array length.
+        source = 'include "cowgol.coh";\n'
+        source += "\n".join(f"var large{i}: uint8[65000];" for i in range(64))
+        source += "\n" + "\n".join(f"MemSet(&large{i}[0], 42, @bytesof large{i});" for i in range(64))
+        source += "\nvar index := get_char() as uint16;\n"
+        source += "\n".join(f"print_i8(large{i}[index]);" for i in range(64))
+        result = cowgol.build_cowgol(request(target="riscv32", format="elf", code=source))
+        self.assertFalse(result["success"])
+        self.assertEqual(result["stage"], "compile")
+        self.assertRegex((result.get("error", "") + result.get("log", "")).lower(),
+                         "workspace|array|overflow|too large")
 
 
 if __name__ == "__main__":

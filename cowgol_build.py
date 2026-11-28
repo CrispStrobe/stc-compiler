@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 import time
@@ -29,6 +30,8 @@ TARGETS = {
                   "family": "cpm", "format": "bin", "extension": "com", "origin": 0x100},
     "dos": {"description": "Cowgol for 8086 DOS (small-model MZ executable)",
             "family": "msdos", "format": "bin", "extension": "exe"},
+    "riscv32": {"description": "Cowgol via C for Brickwright RV32IMAC (console ELF)",
+                "family": "cgen", "format": "elf", "extension": "elf", "cross": "riscv32"},
 }
 ALIASES = {"cgen": "cowgol-cgen", "cowgol-c": "cowgol-cgen", "cowgol-z80-cpm": "z80-cpm",
            "8080-cpm": "i8080-cpm", "cowgol-8080-cpm": "i8080-cpm", "i8086-dos": "dos"}
@@ -45,7 +48,9 @@ def reject_source(source, family):
         return {"success": False, "stage": "source", "error": "Cowgol source cannot contain NUL"}
     tokens = [match for match in TOKENS.finditer(source)
               if not match.group().isspace() and not match.group().startswith("#")]
-    allowed = INCLUDES
+    # The RV32 console machine has no filesystem. Do not expose a header
+    # whose POSIX calls have no implementation in its embedded runtime.
+    allowed = INCLUDES - {"file.coh"} if family == "riscv32" else INCLUDES
     for index, token in enumerate(tokens):
         word = token.group().lower()
         error = None
@@ -72,11 +77,33 @@ def _required(spec):
     files = tools + [f"rt/{family}/cowgol.coh", f"rt/{family}/brickwright.coh", "rt/common.coh"]
     if family == "cgen":
         files += ["rt/cgen/cowgol.h", "rt/cgen/brickwright.h"]
+        if spec.get("cross") == "riscv32":
+            files.append("rt/cgen/brickwright-console.h")
     else:
         files.append(f"rt/{family}/cowgol.coo")
         tools += (["bin/nasm", "bin/djlink"] if family == "msdos" else ["bin/zmac"])
         files += tools[3:]
     return files, tools
+
+
+def _riscv_toolchain():
+    """Reuse the service's pinned GCC staging, including compressed cc1.
+
+    Import lazily: app imports this module while registering its routes.
+    Merely having a GCC executable does not supply the machine runtime or
+    picolibc, so require those parts before advertising this target.
+    """
+    from app import stage_riscv_gcc
+    try:
+        binary_directory = stage_riscv_gcc()
+    except OSError:
+        return None
+    if not binary_directory:
+        return None
+    root = Path(binary_directory).parent
+    required = ("bin/riscv64-unknown-elf-gcc", "runtime/crt0.S", "runtime/console.c",
+                "runtime/riscv-cc.ld", "picolibc/include/stdio.h", "picolibc/lib/libc.a")
+    return root if all((root / name).is_file() for name in required) else None
 
 
 def bundle_status():
@@ -88,7 +115,9 @@ def bundle_status():
         available = {}
         for name, spec in TARGETS.items():
             files, _tools = _required(spec)
-            if name in manifest.get("targets", []) and all((directory / path).is_file() for path in files):
+            if (name in manifest.get("targets", [])
+                    and all((directory / path).is_file() for path in files)
+                    and (not spec.get("cross") or _riscv_toolchain() is not None)):
                 available[name] = spec["description"]
         return {"available": bool(available), "source": manifest.get("source_repository"),
                 "commit": manifest["source_commit"], "targets": available,
@@ -154,6 +183,50 @@ def cpm_memory(listing, image_bytes):
     return values
 
 
+RISCV_RAM_END = 0x400000
+RISCV_STATIC_END = RISCV_RAM_END - 0x8000  # runtime reserves 32 KiB for the stack
+
+
+def riscv_image(artifact):
+    """Validate the complete RV32 ELF before allocating any load segment.
+
+    This matches Brickwright's four-MiB RISC-V machine. Static workspace is
+    included through p_memsz, even when it occupies no bytes in the ELF file.
+    The linker reserves the top 32 KiB for the runtime stack; segment growth
+    must not silently consume that reservation.
+    """
+    if (len(artifact) < 52 or artifact[:7] != b"\x7fELF\x01\x01\x01"
+            or struct.unpack_from("<HHI", artifact, 16) != (2, 243, 1)):
+        raise ValueError("Cowgol RISC-V compiler did not produce a little-endian RV32 executable ELF")
+    entry, phoff = struct.unpack_from("<II", artifact, 24)
+    ehsize, phentsize, phnum = struct.unpack_from("<HHH", artifact, 40)
+    if ehsize != 52 or phentsize != 32 or not 0 < phnum <= 32 or phoff < 52 or phoff + phnum * phentsize > len(artifact):
+        raise ValueError("Cowgol RISC-V ELF has an invalid program-header table")
+    loads = []
+    for index in range(phnum):
+        kind, offset, address, physical, file_size, memory_size, flags, alignment = struct.unpack_from(
+            "<IIIIIIII", artifact, phoff + index * phentsize)
+        if kind != 1:
+            continue
+        if (physical != address or not memory_size or file_size > memory_size or offset + file_size > len(artifact)
+                or address < 0x1000 or address + memory_size > RISCV_STATIC_END):
+            raise ValueError("Cowgol RISC-V code and static workspace exceed the $001000–$3F7FFF area or contain invalid segment sizes")
+        if alignment > 1 and (alignment & (alignment - 1) or (address - offset) % alignment):
+            raise ValueError("Cowgol RISC-V ELF has an invalid segment alignment")
+        loads.append((address, memory_size, offset, file_size, flags))
+    loads.sort()
+    if (not loads or entry & 1
+            or not any(address <= entry < address + size and flags & 1
+                       for address, _memory, _offset, size, flags in loads)):
+        raise ValueError("Cowgol RISC-V ELF entry is outside executable code")
+    if any(left[0] + left[1] > right[0] for left, right in zip(loads, loads[1:])):
+        raise ValueError("Cowgol RISC-V ELF has overlapping load segments")
+    return {"entry": entry, "segments": [
+        {"addr": address, "bytes": base64.b64encode(
+            artifact[offset:offset + size] + bytes(memory - size)).decode("ascii")}
+        for address, memory, offset, size, _flags in loads]}
+
+
 def build_cowgol(req):
     target = ALIASES.get(req.target.lower(), req.target.lower())
     spec = TARGETS.get(target)
@@ -165,13 +238,15 @@ def build_cowgol(req):
         return {"success": False, "stage": "options", "error": "hosted Cowgol accepts no custom options or defines"}
     if req.disassemble or req.symbols:
         return {"success": False, "stage": "options", "error": "Cowgol debug symbols and disassembly are not available yet"}
-    refusal = reject_source(req.code, spec["family"])
+    refusal = reject_source(req.code, spec.get("cross", spec["family"]))
     if refusal:
         return refusal
     status = bundle_status()
     if target not in status["targets"]:
-        return {"success": False, "stage": "toolchain", "toolchain": "cowgol-" + spec["family"],
-                "error": f"Cowgol toolchain for {target} is not installed; run scripts/build-cowgol-bundle.py"}
+        installation = ("install the Cowgol bundle and the service's riscv-gcc/picolibc runtime"
+                        if spec.get("cross") == "riscv32" else "run scripts/build-cowgol-bundle.py")
+        return {"success": False, "stage": "toolchain", "toolchain": "cowgol-" + spec.get("cross", spec["family"]),
+                "error": f"Cowgol toolchain for {target} is not installed; {installation}"}
     try:
         bundle = _stage_bundle(bundle_root())
         with tempfile.TemporaryDirectory(prefix="cowgol-request-") as temporary:
@@ -180,37 +255,64 @@ def build_cowgol(req):
             source.write_text(req.code, encoding="utf-8")
             family = spec["family"]
             started, logs = time.monotonic(), []
+            private_roots = [work, bundle]
 
-            def run(command):
+            def run(command, env=None):
                 with tempfile.TemporaryFile() as log:
                     remaining = max(0.01, TIMEOUT - (time.monotonic() - started))
                     process = subprocess.run([str(arg) for arg in command], stdin=subprocess.DEVNULL,
                                              stdout=log, stderr=subprocess.STDOUT, cwd=work,
-                                             timeout=remaining)
+                                             timeout=remaining, env=env)
                     log.seek(0)
                     text = log.read(65536).decode("utf-8", "replace")
-                logs.append(text.replace(str(work) + os.sep, "").replace(str(bundle) + os.sep, ""))
+                for private_root in private_roots:
+                    text = text.replace(str(private_root) + os.sep, "")
+                logs.append(text)
                 if process.returncode:
                     raise RuntimeError(f"{Path(command[0]).name} exited with status {process.returncode}")
 
-            run([bundle / f"bin/cowfe-{family}", f"-I{bundle / 'rt' / family}/", f"-I{bundle / 'rt'}/", source, cob])
+            # cowfe prepends include paths. Target overrides (notably cgen's
+            # allocator) must be searched before the portable fallback.
+            run([bundle / f"bin/cowfe-{family}", f"-I{bundle / 'rt'}/", f"-I{bundle / 'rt' / family}/", source, cob])
             run([bundle / f"bin/cowbe-{family}", cob, coo])
             output = work / f"main.{spec['extension']}"
             memory_layout = None
+            image = None
             if family == "cgen":
-                run([bundle / "bin/cowlink-cgen", "-o", output, coo])
-                generated = output.read_text()
+                c_source = work / "main.c"
+                run([bundle / "bin/cowlink-cgen", "-o", c_source, coo])
+                generated = c_source.read_text()
                 prefix = '#include "cowgol.h"\n'
                 if not generated.startswith(prefix):
                     raise ValueError("unexpected Cowgol C output: missing runtime header")
                 # Always declare the bridge: unused prototypes have no linker
                 # cost; detecting a particular source spelling is unnecessary.
                 notice = (bundle / "licenses/Cowgol-BSD-2-Clause.txt").read_text().replace("*/", "* /")
-                generated = ("/* Cowgol cgen output. Runtime: BSD-2-Clause.\n" + notice + "\n*/\n"
+                definitions = ("#define COWGOL_NO_POSIX 1\n#define COWGOL_NO_ARGS 1\n"
+                               "#define COWGOL_RAM_SIZE 65536\n") if spec.get("cross") else ""
+                generated = ("/* Cowgol cgen output. Runtime: BSD-2-Clause.\n" + notice + "\n*/\n" + definitions
                              + (bundle / "rt/cgen/cowgol.h").read_text() + "\n"
                              + (bundle / "rt/cgen/brickwright.h").read_text() + "\n"
                              + generated[len(prefix):])
-                output.write_text(generated)
+                if spec.get("cross") == "riscv32":
+                    generated += "\n" + (bundle / "rt/cgen/brickwright-console.h").read_text()
+                c_source.write_text(generated)
+                if spec.get("cross") == "riscv32":
+                    cross_root = _riscv_toolchain()
+                    if cross_root is None:
+                        raise ValueError("Cowgol RISC-V GCC and picolibc runtime are not installed")
+                    private_roots.append(cross_root)
+                    runtime = cross_root / "runtime"
+                    env = dict(os.environ)
+                    deps = cross_root / "lib-deps"
+                    if deps.is_dir():
+                        env["LD_LIBRARY_PATH"] = str(deps) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+                    run([cross_root / "bin/riscv64-unknown-elf-gcc", "-std=gnu99",
+                         "-march=rv32imac", "-mabi=ilp32", "-Os", "-fwrapv", "-fno-strict-aliasing",
+                         "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections", "-nostdlib",
+                         "-isystem", cross_root / "picolibc/include", "-T", runtime / "riscv-cc.ld",
+                         runtime / "crt0.S", runtime / "console.c", c_source,
+                         "-L" + str(cross_root / "picolibc/lib"), "-lc", "-lm", "-lgcc", "-o", output], env=env)
             else:
                 assembly = work / ("main.asm" if family == "msdos" else "main.z80")
                 run([bundle / f"bin/cowlink-{family}", "-o", assembly, coo, bundle / f"rt/{family}/cowgol.coo"])
@@ -232,17 +334,26 @@ def build_cowgol(req):
             artifact = output.read_bytes()
             if family == "msdos" and artifact[:2] != b"MZ":
                 raise ValueError("Cowgol DOS linker did not produce an MZ executable")
+            if spec.get("cross") == "riscv32":
+                image = riscv_image(artifact)
             response = {"success": True, "base64": base64.b64encode(artifact).decode("ascii"),
                         "filename": output.name, "bytes": len(artifact), "log": "".join(logs),
-                        "language": "cowgol", "target": target, "toolchain": "cowgol-" + family,
-                        "compiler_commit": status["commit"], "artifact_kind": "source" if family == "cgen" else "executable"}
+                        "language": "cowgol", "target": target, "format": spec["format"],
+                        "toolchain": "cowgol-" + spec.get("cross", family),
+                        "compiler_commit": status["commit"],
+                        "artifact_kind": "source" if family == "cgen" and not spec.get("cross") else "executable"}
             if "origin" in spec:
                 response["origin"] = spec["origin"]
                 response["memory_end"] = memory_layout["lomem"]
                 response["memory"] = (f"CP/M image {len(artifact)} bytes, stack 128 bytes, "
                                       f"static workspace {memory_layout['lomem'] - memory_layout['ws']} bytes; "
                                       f"end ${memory_layout['lomem']:04X} (limit $D000)")
-            if family == "cgen":
+            if image is not None:
+                response.update(entry=image["entry"], image=image, mcu="rv32imac",
+                                memory_end=max(segment["addr"] + len(base64.b64decode(segment["bytes"]))
+                                               for segment in image["segments"]),
+                                memory="RV32 console: code and static workspace below $3F8000; 64 KiB Cowgol arena; 32 KiB stack reservation")
+            if family == "cgen" and not spec.get("cross"):
                 response.update(c=artifact.decode("utf-8"), source_language="c")
             return response
     except subprocess.TimeoutExpired:

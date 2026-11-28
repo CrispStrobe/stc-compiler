@@ -14,12 +14,14 @@ user programs on the server.
 | `i8080-cpm` | `bin` | `main.com`, origin `256` | Intel 8080 CP/M; also runs on Z80 CP/M |
 | `dos` | `bin` | `main.exe` | 8086 DOS small-model MZ executable |
 | `cowgol-cgen` | `c` | `main.c` | Standalone generated C for a little-endian host |
+| `riscv32` | `elf` | `main.elf` plus loadable `image` | Cowgol C backend → pinned GCC/picolibc → Brickwright RV32IMAC console machine |
 
 `cowgol-c`, `cgen`, `cowgol-z80-cpm`, `8080-cpm`, `cowgol-8080-cpm`, and
 `i8086-dos` are aliases. Requesting an unrelated machine such as an STC part
 returns a target error; it does not feed generic C to an incompatible chip.
-The C runtime uses 64-bit pointer slots and libc. The existence of a C output
-does not qualify it for every SDCC, AVR or cc65 board.
+The C runtime uses 64-bit pointer slots and libc. The RV32 route supplies a
+tested 32-bit runtime profile; C output alone does not qualify other SDCC,
+AVR or cc65 boards.
 
 Example request:
 
@@ -40,6 +42,35 @@ must prove that code, the 128-byte transient stack and static workspace fit
 below `$D000`; a short image with an oversized uninitialized array is refused.
 DOS returns a complete MZ image. Cowgol debug symbols and
 disassembly are currently unsupported and explicit requests for them fail.
+
+The RISC-V route compiles the original Cowgol program through cgen and the
+service's existing `riscv-gcc` bundle. It returns `toolchain: "cowgol-riscv32"`,
+`artifact_kind: "executable"`, `mcu: "rv32imac"`, the ELF in `base64`, and the
+same `{entry, segments: [{addr, bytes}]}` image used by Brickwright's RISC-V
+loader (`bytes` is base64). It is an executable compiled via C, not a new
+Cowgol assembly backend or a physical RISC-V board port.
+
+Every ELF load segment is checked before allocation: ELF32 little-endian,
+RISC-V executable type, bounded program headers and file ranges, no overlap,
+valid alignment, and an even entry inside file-backed executable code.
+Code and static workspace, including BSS, must fit `$001000–$3F7FFF` in the
+four-MiB machine. The top 32 KiB is reserved for the runtime stack. Returned
+segments include zero-filled BSS, and `memory_end` reports the highest loaded
+address plus one. Runtime pointer operations are still ordinary Cowgol;
+this static bound is not a dynamic memory-safety guarantee.
+
+Cowgol's current object/layout format has a separate 16-bit size limit.
+Oversized array extents, array byte sizes and accumulated static workspaces
+are rejected before narrowing, including when generating C; a larger guest
+RAM does not remove that compiler-format limit.
+
+The RV32 embedded console profile disables POSIX and process arguments,
+uses a 64 KiB Cowgol arena, and retains the compiler's signed-wrap and
+aliasing flags. `argv.coh` observes an empty argument list; `malloc.coh`
+uses the target's picolibc allocator. `file.coh` is rejected because this
+console machine has no filesystem. Input follows the existing RV32 runtime
+and returns EOF. GPIO, timers and canvas callbacks remain unresolved linker
+errors. The service never executes the produced ELF.
 
 For C output, the response includes both the base64 artifact and `c` text,
 with `source_language: "c"`. Its runtime and Brickwright host declarations
@@ -70,6 +101,10 @@ Cowgol compiler path; it does not silently substitute the pseudocode subset.
   newline. Signed integer limits are tested on each emulator. Canvas, GPIO,
   clock and delay APIs are not invented for these operating-system targets;
   asking for them produces a compiler diagnostic.
+- RV32 implements the same two portable console calls through its actual
+  ECALL console. Arrays, pointers, allocation and integer division compile
+  through the full Cowgol compiler even when the Blocks converter refuses
+  that source. CI executes those constructs on Brickwright's machine.
 
 ## Build and install
 
@@ -89,6 +124,18 @@ file. DJLINK's C++ support libraries are linked statically so serverless hosts
 do not need a system libstdc++; the bundle retains Cowgol, zmac, NASM, DJLINK
 and GCC runtime licence notices.
 
+To build only the C export and RISC-V compiler stages, without the legacy
+assemblers or full compiler build dependencies:
+
+```sh
+python3 scripts/build-cowgol-bundle.py --targets cowgol-cgen riscv32
+```
+
+That subset requires Python, a host C compiler, and Git if a checkout is not
+supplied. The manifest advertises only selected targets. RV32 also requires
+the already-vendored GCC, picolibc and console runtime; health omits RV32 if
+those are absent. The default remains all five targets.
+
 For a reproducible source checkout and machine execution tests:
 
 ```sh
@@ -96,6 +143,7 @@ python3 scripts/build-cowgol-bundle.py --source /path/to/pinned/cowgol --oracles
 REQUIRE_COWGOL_TOOLCHAIN=1 \
 COWGOL_CPMEMU=/path/to/pinned/cowgol/bin/cpmemu \
 COWGOL_EMU2=/path/to/pinned/cowgol/bin/emu2 \
+COWGOL_BW_BOARD=/path/to/pinned/bw-board \
 python3 -m unittest -v test_cowgol
 ```
 
@@ -106,9 +154,15 @@ the service. The service checks the manifest hashes before staging tools into
 an executable temporary directory, which also handles deployments that lose
 file execute bits.
 
+The machine oracle uses `CrispStrobe/bw-board` at
+`d21d6d8b819263eb08231134b7556efa82289a90`, the current Brickwright pin,
+and Node 22. The RV32 runner needs no npm packages and is outside the deployed
+bundle. The tests check the checkout's exact commit before running programs.
+
 The dedicated Cowgol GitHub Actions job builds on Debian Bullseye and uploads
 `cowgol-bundle-linux-x64.tar.gz`. It executes the emitted CP/M and DOS programs
-in independent machine emulators and compiles/runs the C output. The emulators
+in independent machine emulators, boots RV32 output on Brickwright's machine,
+and compiles/runs the C output. The emulators
 are test tools outside the deployed bundle. CI with
 `REQUIRE_COWGOL_TOOLCHAIN=1` fails if any compiler or execution oracle is absent.
 

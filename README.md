@@ -97,7 +97,7 @@ silicon.
   "fosc":    11059200,         // emitted as -DFOSC_HZ / -DF_CPU; null to omit
   "defines": { "DEBUG": "1" }, // extra -D flags; null value = bare define
   "options": ["--opt-code-size"], // raw compiler flags
-  "format":  "hex",            // hex (packihx) | ihx (raw) | bin (makebin)
+  "format":  "hex",            // hex | ihx | bin; Cowgol also uses c or elf
   "disassemble": false,        // also return an 8051 listing
   "symbols":     false         // also return a debug symbol table (see below)
 }
@@ -125,7 +125,8 @@ Failure returns `{"success": false, "error": "<compiler output>"}`, with
 Source is capped at 1 MB (4 MB across a whole project).
 
 **Cowgol** uses its real compiler for Z80/8080 CP/M `.COM` files, 8086 DOS
-`.EXE` files, and standalone C source export. Its format/target combinations,
+`.EXE` files, RISC-V console `.ELF` executables compiled via C, and standalone
+C source export. Its format/target combinations,
 portable console bridge, exact compiler source pin, installation and machine
 execution checks are documented in [Cowgol compiler service](docs/COWGOL.md).
 
