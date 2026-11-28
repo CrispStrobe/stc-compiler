@@ -24,3 +24,6 @@ build-arm/
 # Installed with --no-save for the browser check; never part of the repo.
 node_modules/
 package-lock.json
+
+# Rebuilt from the exact Cowgol fork pin; manifest and CI retain provenance.
+vendor/cowgol/

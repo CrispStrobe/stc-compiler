@@ -27,6 +27,7 @@ import riscv_cc
 import stc_disasm
 import arduino_build
 import bundle_xz
+import cowgol_build
 import esp8266_image
 import stc_pseudocode
 import stc_symtab
@@ -1889,6 +1890,9 @@ def build(req: CompileReq) -> dict:
     if len(req.code.encode("utf-8")) > MAX_SOURCE_BYTES:
         return {"success": False, "error": "source too large"}
 
+    if req.language.lower() in ("cowgol", "cow"):
+        return cowgol_build.build_cowgol(req)
+
     refusal = reject_escaping_includes(req.code) or reject_path_options(req.options)
     if refusal:
         return refusal
@@ -1964,7 +1968,7 @@ def build(req: CompileReq) -> dict:
     elif req.language.lower() != "c":
         return {"success": False,
                 "error": f"unknown language '{req.language}'; "
-                         f"use 'c', 'pseudocode', 'arduino', or 'keil'"}
+                         f"use 'c', 'pseudocode', 'arduino', 'keil', or 'cowgol'"}
 
     if req.format not in ("ihx", "hex", "bin"):
         return {"success": False, "error": "format must be ihx, hex or bin"}
@@ -2651,12 +2655,15 @@ async def decompile_pseudocode(req: CompileReq):
 
 
 @app.post("/transpile")
-async def transpile_only(req: CompileReq):
+async def transpile_only(req: CompileReq, request: Request = None):
     """Pseudocode in, C out. No compiler involved -- useful for seeing exactly
     what the front end produced before handing it to SDCC."""
     refusal = too_large(req.code)
     if refusal:
         return refusal
+    if req.language.lower() in ("cowgol", "cow"):
+        cowgol_request = req.model_copy(update={"target": "cowgol-cgen", "format": "c"})
+        return build(cowgol_request) if request is None else _guarded_build(cowgol_request, request)
     try:
         code, program = stc_pseudocode.transpile(req.code)
     except stc_pseudocode.PseudocodeError as exc:
@@ -2685,14 +2692,16 @@ async def transpile_only(req: CompileReq):
 
 
 @app.post("/download")
-async def download(req: CompileReq):
+async def download(req: CompileReq, request: Request = None):
     """Same as /compile, but returns the raw file with a filename attached.
 
     Saves callers from base64-decoding by hand:
         curl -X POST .../download -H 'Content-Type: application/json' \
              -d @req.json -OJ
     """
-    result = build(req)
+    result = build(req) if request is None else _guarded_build(req, request)
+    if isinstance(result, Response):
+        return result
     if not result["success"]:
         # A target that transpiles but cannot be built here is not a failure
         # to report as one: the generated source IS the deliverable, and a
@@ -3067,6 +3076,7 @@ async def health():
         "cc65": cc65_version.strip().splitlines()[0] if cc65_version else None,
         "riscv_gcc": riscv_gcc_version.strip().splitlines()[0] if riscv_gcc_version else None,
         "riscv_wasm": "shecc (wasm)" if riscv_wasm_ok else None,
+        "cowgol": cowgol_build.bundle_status(),
         "targets": {name: cfg["description"] for name, cfg in TARGETS.items()},
         "avr_targets": ({name: cfg["description"] for name, cfg in AVR_TARGETS.items()}
                         if avr_bin else {}),
@@ -3203,6 +3213,7 @@ PAGE = r"""<!doctype html>
       <option value=c selected>C</option>
       <option value=keil>Keil C51</option>
       <option value=arduino>Arduino sketch (C++)</option>
+      <option value=cowgol>Cowgol</option>
     </select>
   </label>
   <label>target
@@ -3215,16 +3226,24 @@ PAGE = r"""<!doctype html>
         <option value=mcs51>generic 8051</option>
       </optgroup>
       <optgroup label="AVR (avr-gcc)">
-        <option value=atmega328p>ATmega328P &mdash; Uno / Nano</option>
-        <option value=atmega168p>ATmega168P</option>
+        <option value=atmega328p data-cowgol-label="Arduino Uno (ATmega328P, .HEX)">ATmega328P &mdash; Uno / Nano</option>
+        <option value=atmega168p data-cowgol-label="Bare ATmega168P (16 KiB flash, .HEX)">ATmega168P</option>
         <option value=atmega2560>ATmega2560 &mdash; Mega</option>
         <option value=attiny85>ATtiny85</option>
         <option value=attiny88>ATtiny88</option>
       </optgroup>
-      <optgroup label="Arduino boards (sketch)">
+      <optgroup label="Arduino board profiles">
         <option value=arduino-uno>Arduino Uno</option>
-        <option value=arduino-nano>Arduino Nano</option>
+        <option value=arduino-nano data-cowgol-label="Classic Arduino Nano (ATmega328P, .HEX)">Arduino Nano</option>
         <option value=arduino-mega>Arduino Mega 2560</option>
+      </optgroup>
+      <optgroup label="Cowgol">
+        <option value=z80-cpm>Z80 CP/M (.COM)</option>
+        <option value=i8080-cpm>8080 CP/M (.COM)</option>
+        <option value=dos>8086 DOS (.EXE)</option>
+        <option value=riscv32>RISC-V RV32 console (.ELF)</option>
+        <option value=eater6502>EATER6502 ROM (.BIN)</option>
+        <option value=cowgol-cgen>Standalone C source</option>
       </optgroup>
     </select>
   </label>
@@ -3234,6 +3253,8 @@ PAGE = r"""<!doctype html>
       <option value=hex>.hex (packihx)</option>
       <option value=ihx>.ihx (raw)</option>
       <option value=bin>.bin</option>
+      <option value=elf>.elf (Cowgol RISC-V)</option>
+      <option value=c>.c (Cowgol source export)</option>
     </select>
   </label>
   <button class=primary id=go>Compile</button>
@@ -3334,7 +3355,7 @@ $('go').onclick = async () => {
         // default is the 8051's 11.0592 MHz.
         fosc: $('fosc').disabled ? undefined : (parseInt($('fosc').value, 10) || null),
         format,
-        disassemble: true,
+        disassemble: $('language').value !== 'cowgol',
       })
     });
     const data = await response.json();
@@ -3342,7 +3363,7 @@ $('go').onclick = async () => {
       image = {bytes: bytesFromBase64(data.base64), filename: data.filename};
       $('status').className = 'ok';
       $('status').textContent = data.bytes + ' bytes → ' + data.filename;
-      $('out').textContent = (format === 'bin')
+      $('out').textContent = (format === 'bin' || format === 'elf')
         ? hexdump(image.bytes)
         : new TextDecoder().decode(image.bytes);
       $('asm').textContent = data.disassembly || '';
@@ -3352,7 +3373,7 @@ $('go').onclick = async () => {
       $('mem').textContent = data.memory || '(none)';
       $('log').textContent = data.log || '(no warnings)';
       $('dl').disabled = false;
-      $('copy').disabled = (format === 'bin');
+      $('copy').disabled = (format === 'bin' || format === 'elf');
     } else if (data.c && data.toolchain) {
       // Transpiled fine; this service just cannot BUILD it -- a micro:bit is
       // interpreted, an Arduino sketch needs the Arduino build system. The
@@ -3461,7 +3482,30 @@ $('copy').onclick = async () => {
 };
 
 const STARTERS = {c: $('code').value, pseudocode: __PSEUDO_EXAMPLE__,
-                  arduino: __ARDUINO_EXAMPLE__, keil: $('code').value};
+                  arduino: __ARDUINO_EXAMPLE__, keil: $('code').value,
+                  cowgol: 'include "cowgol.coh";\nprint("Hello from Cowgol!\\n");\n'};
+const cowgolFormats = Object.freeze({
+  'z80-cpm': 'bin', 'i8080-cpm': 'bin', dos: 'bin', riscv32: 'elf',
+  eater6502: 'bin', 'cowgol-cgen': 'c', atmega328p: 'hex', 'arduino-nano': 'hex', atmega168p: 'hex',
+});
+// These six menu entries are reserved for Cowgol. The three AVR entries also
+// serve their existing C/Arduino routes, so membership in cowgolFormats alone
+// must not disable them when the language changes.
+const cowgolOnlyTargets = new Set(['z80-cpm', 'i8080-cpm', 'dos', 'riscv32', 'eater6502', 'cowgol-cgen']);
+function targetAvailable(target, language) {
+  if (language === 'cowgol') return Object.hasOwn(cowgolFormats, target);
+  if (cowgolOnlyTargets.has(target)) return false;
+  // A board name selects an Arduino core in sketch mode. Plain C targets the
+  // MCU and does not inherit Cowgol's Nano bootloader or memory contract.
+  if (target.startsWith('arduino-')) return language === 'arduino' || language === 'pseudocode';
+  return true;
+}
+function syncCowgolFormat() {
+  if ($('language').value === 'cowgol') {
+    $('format').value = cowgolFormats[$('target').value];
+  }
+}
+$('target').onchange = syncCowgolFormat;
 let lastLanguage = $('language').value;
 $('language').onchange = () => {
   const next = $('language').value;
@@ -3471,7 +3515,19 @@ $('language').onchange = () => {
   }
   lastLanguage = next;
   // pseudocode carries CLOCK; a sketch is built for its board's crystal.
-  $('fosc').disabled = (next === 'pseudocode' || next === 'arduino');
+  $('fosc').disabled = (next === 'pseudocode' || next === 'arduino' || next === 'cowgol');
+  $('format').disabled = next === 'cowgol';
+  for (const option of $('target').options) {
+    option.dataset.defaultLabel ||= option.textContent;
+    option.textContent = next === 'cowgol' && option.dataset.cowgolLabel
+      ? option.dataset.cowgolLabel : option.dataset.defaultLabel;
+    option.disabled = !targetAvailable(option.value, next);
+  }
+  if (!targetAvailable($('target').value, next)) {
+    $('target').value = next === 'cowgol' ? 'z80-cpm' : 'stc12c5a60s2';
+  }
+  if (next !== 'cowgol' && ['c', 'elf'].includes($('format').value)) $('format').value = 'hex';
+  syncCowgolFormat();
   if (next === 'arduino' && !/^(arduino-|atmega|attiny)/.test($('target').value)) {
     $('target').value = 'arduino-uno';
   }

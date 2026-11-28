@@ -1,0 +1,4 @@
+# Frozen build dependencies for the glibc 2.31 compiler bundle. The archive
+# remains signed; only historical Release metadata expiry is disabled.
+deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20250101T000000Z/ bullseye main
+deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20250101T000000Z/ bullseye-security main

@@ -46,6 +46,11 @@ rsync -a \
     --exclude 'docs' --exclude 'test_*.py' --exclude 'scripts' \
     ./ "$STAGE/"
 
+# The Docker builder needs the pinned-source script and package archive; the remaining
+# operator scripts and their local tooling are not deployment inputs.
+mkdir -p "$STAGE/scripts"
+cp scripts/build-cowgol-bundle.py scripts/cowgol-bullseye.list "$STAGE/scripts/"
+
 cat > "$STAGE/README.md" <<EOF
 ---
 title: stc-compiler

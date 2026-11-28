@@ -1,0 +1,67 @@
+name: Cowgol compiler and machine execution
+
+on:
+  push:
+    branches: [main, "feature/**", "feat/cowgol-**"]
+    paths:
+      - "cowgol_build.py"
+      - "app.py"
+      - "test_cowgol.py"
+      - "scripts/build-cowgol-bundle.py"
+      - "scripts/cowgol-bullseye.list"
+      - "scripts/run-cowgol-riscv.mjs"
+      - "scripts/run-cowgol-eater6502.mjs"
+      - "riscv-gcc/**"
+      - "avr/**"
+      - "Dockerfile"
+      - ".github/workflows/cowgol.yml"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  compile-and-run:
+    runs-on: ubuntu-latest
+    container: python:3.11-bullseye
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Checkout the exact Brickwright machine oracle
+        uses: actions/checkout@v4
+        with:
+          repository: CrispStrobe/bw-board
+          ref: d21d6d8b819263eb08231134b7556efa82289a90
+          path: .oracles/bw-board
+      - name: Build dependencies (outside the deployed service image)
+        run: |
+          cp scripts/cowgol-bullseye.list /etc/apt/sources.list
+          rm -f /etc/apt/sources.list.d/debian.sources
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential git ninja-build lua5.4 bison flex gpp moreutils nasm 64tass libreadline-dev
+          pip install --quiet fastapi pydantic
+          npm install --no-save --ignore-scripts --no-audit --no-fund avr8js@0.21.1
+      - name: Checkout the exact compiler pin
+        run: |
+          pin=$(python3 -c "import runpy; print(runpy.run_path('scripts/build-cowgol-bundle.py')['PINNED_COMMIT'])")
+          git init /tmp/cowgol-source
+          git -C /tmp/cowgol-source remote add origin https://github.com/CrispStrobe/cowgol.git
+          git -C /tmp/cowgol-source fetch --depth 1 origin "$pin"
+          git -C /tmp/cowgol-source checkout --detach FETCH_HEAD
+      - name: Build and hash the real compiler bundle
+        run: python3 scripts/build-cowgol-bundle.py --source /tmp/cowgol-source --oracles
+      - name: Execute Cowgol output on C, CP/M, DOS, RV32, EATER6502, Uno, Nano and bare ATmega168P
+        env:
+          REQUIRE_COWGOL_TOOLCHAIN: "1"
+          COWGOL_CPMEMU: /tmp/cowgol-source/bin/cpmemu
+          COWGOL_EMU2: /tmp/cowgol-source/bin/emu2
+          COWGOL_BW_BOARD: .oracles/bw-board
+          COWGOL_AVR_RUNNER: /tmp/cowgol-source/tests/avr-run.mjs
+          AVR8JS_ROOT: ${{ github.workspace }}/node_modules/avr8js
+        run: python3 -m unittest -v test_cowgol
+      - name: Archive verified deployment bundle
+        run: tar -C vendor -czf cowgol-bundle-linux-x64.tar.gz cowgol
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cowgol-bundle-linux-x64
+          path: cowgol-bundle-linux-x64.tar.gz

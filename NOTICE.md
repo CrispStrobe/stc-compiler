@@ -30,6 +30,7 @@ their own upstream licenses.
 | `xtensa-lx106-gcc/**` | [GCC](https://gcc.gnu.org/) 10.3 for `xtensa-lx106-elf` + GNU binutils, prebuilt by [esp-quick-toolchain](https://github.com/earlephilhower/esp-quick-toolchain) | **GPL-3.0-or-later**, `libgcc.a` and headers under the **GCC Runtime Library Exception** |
 | `esp8266/**`, `scripts/fixtures/esp8266/**` | the blob-free bw8266 runtime and Arduino-style layer from [CrispStrobe/esp8266js](https://github.com/CrispStrobe/esp8266js) | **MIT** (`esp8266/LICENSE`) |
 | `riscv-gcc/lib-deps/**` | the shared libraries the compiler links (GMP, MPFR, MPC, ISL, zlib) | LGPL-3.0-or-later / zlib, as each upstream states |
+| Generated `vendor/cowgol/bin/64tass` | 64tass, from the build host's package | **GPL-2.0-or-later**, with an LGPL-2.0 AVL component and permissive supporting files; complete notices in the bundle |
 
 ### Provenance
 
@@ -46,6 +47,7 @@ source, in `vendor/<name>/`:
 | xtensa-lx106-gcc | esp-quick-toolchain release `3.1.0-gcc10.3`, archive pinned by SHA-256, unmodified — only the C driver, cc1, collect2, as, ld, libgcc and freestanding headers kept | `xtensa-lx106-gcc/PROVENANCE.md`; reproduced by `scripts/fetch-xtensa-lx106-gcc.sh` |
 | bw8266 runtime | CrispStrobe/esp8266js `firmware/` at commit `66cdf43`, unmodified | `esp8266/PROVENANCE.md` |
 | riscv-gcc | Debian bullseye `gcc-riscv64-unknown-elf`, `binutils-riscv64-unknown-elf`, `picolibc-riscv64-unknown-elf`, unmodified — trimmed to the rv32imac/ilp32 multilib, DWARF stripped | `vendor/riscv-gcc/VERSION` + three `.copyright` files |
+| Cowgol EATER6502 assembler | The 64tass package from the signed build snapshot in `scripts/cowgol-bullseye.list`, unmodified; corresponding source is the `64tass` source package from that snapshot | Generated `vendor/cowgol/manifest.json` records its version and binary hash; `vendor/cowgol/licenses/64tass-*` carries copyright and GPL/LGPL texts |
 
 `scripts/fetch-sdcc.sh`, `scripts/fetch-avr-gcc.sh`,
 `scripts/fetch-arm-gcc.sh` and `scripts/fetch-riscv-gcc.sh` reproduce those

@@ -92,12 +92,12 @@ silicon.
 ```jsonc
 {
   "code":    "#include <stc12.h>\nvoid main(void) { ... }",  // required
-  "language": "c",             // c | pseudocode | keil | arduino
+  "language": "c",             // c | pseudocode | keil | arduino | cowgol
   "target":  "stc12c5a60s2",   // see Targets below
   "fosc":    11059200,         // emitted as -DFOSC_HZ / -DF_CPU; null to omit
   "defines": { "DEBUG": "1" }, // extra -D flags; null value = bare define
   "options": ["--opt-code-size"], // raw compiler flags
-  "format":  "hex",            // hex (packihx) | ihx (raw) | bin (makebin)
+  "format":  "hex",            // hex | ihx | bin; Cowgol also uses c or elf
   "disassemble": false,        // also return an 8051 listing
   "symbols":     false         // also return a debug symbol table (see below)
 }
@@ -123,6 +123,16 @@ Failure returns `{"success": false, "error": "<compiler output>"}`, with
 `line` and `stage` when the front end caught it rather than the compiler.
 
 Source is capped at 1 MB (4 MB across a whole project).
+
+**Cowgol** uses its real compiler for Z80/8080 CP/M `.COM` files, 8086 DOS
+`.EXE` files, RISC-V console `.ELF` executables compiled via C, and standalone
+C source export. A native EATER6502 route emits 65C02 ROMs with ACIA console
+and VIA digital GPIO. Explicit Uno and classic Nano profiles produce validated
+ATmega328P HEX with separate bootloader flash reservations. A bare ATmega168P
+profile adds an exact 16 KiB flash / 1 KiB SRAM contract with a 128-byte heap.
+Their format/target combinations,
+portable console bridge, exact compiler source pin, installation and machine
+execution checks are documented in [Cowgol compiler service](docs/COWGOL.md).
 
 The `memory` field is worth surfacing to users — it is how you catch an image
 quietly outgrowing 60 KB of flash or 248 bytes of stack.
