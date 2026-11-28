@@ -8,6 +8,8 @@
 # final container needs no apt toolchain packages at all. Cowgol is built in
 # a separate older-glibc stage so its compiler tools also travel to Vercel.
 FROM python:3.11-slim-bullseye AS cowgol-build
+COPY scripts/cowgol-bullseye.list /etc/apt/sources.list
+RUN rm -f /etc/apt/sources.list.d/debian.sources
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential git ninja-build lua5.4 bison flex gpp moreutils nasm \
     && rm -rf /var/lib/apt/lists/*

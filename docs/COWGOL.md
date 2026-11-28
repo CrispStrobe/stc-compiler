@@ -112,9 +112,15 @@ in independent machine emulators and compiles/runs the C output. The emulators
 are test tools outside the deployed bundle. CI with
 `REQUIRE_COWGOL_TOOLCHAIN=1` fails if any compiler or execution oracle is absent.
 
+The build-only apt sources use the signed Debian snapshot from 2025-01-01
+in `scripts/cowgol-bullseye.list`. This preserves the older glibc ABI without
+depending on disappearing packages in a live Bullseye mirror. Package signatures
+and hashes remain checked; the expiry check for historical Release metadata is
+disabled. The final service image keeps its normal package sources.
+
 The Dockerfile builds the bundle in a separate Bullseye stage and copies it
-into the final Python image. The HF staging script carries the one builder
-script needed for that stage. For the existing manual Vercel release, unpack
+into the final Python image. The HF staging script carries the builder and
+apt archive list needed for that stage. For the existing manual Vercel release, unpack
 the verified Linux bundle beneath `vendor/` before using the release script;
 `.vercelignore` keeps the generated bundle in the upload even though Git
 ignores it. Prefer the Bullseye artifact to binaries built on a newer libc or

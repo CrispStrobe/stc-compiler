@@ -8,6 +8,7 @@ on:
       - "app.py"
       - "test_cowgol.py"
       - "scripts/build-cowgol-bundle.py"
+      - "scripts/cowgol-bullseye.list"
       - "Dockerfile"
       - ".github/workflows/cowgol.yml"
   pull_request:
@@ -21,6 +22,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build dependencies (outside the deployed service image)
         run: |
+          cp scripts/cowgol-bullseye.list /etc/apt/sources.list
+          rm -f /etc/apt/sources.list.d/debian.sources
           apt-get update
           apt-get install -y --no-install-recommends build-essential git ninja-build lua5.4 bison flex gpp moreutils nasm libreadline-dev
           pip install --quiet fastapi pydantic
