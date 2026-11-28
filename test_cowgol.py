@@ -90,6 +90,12 @@ class CowgolBoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "checksum mismatch"):
                 cowgol._stage_bundle(directory)
 
+    def test_cpm_layout_guard_requires_static_storage_evidence(self):
+        self.assertEqual(cowgol.cpm_memory("top 164\nws = 1e4\nlomem = 1ec\n", 100)["lomem"], 0x1ec)
+        for listing in ("top 164\n", "top 164\nws = 1e4\nlomem = d001\n", "top 164\nws = 1e4\nlomem = 100\n"):
+            with self.subTest(listing=listing), self.assertRaises(ValueError):
+                cowgol.cpm_memory(listing, 100)
+
     def test_api_routes_cowgol_without_generic_c_validation(self):
         from app import CompileReq, build, transpile_only
         response = {"success": True, "artifact_kind": "source"}
@@ -144,7 +150,8 @@ class CowgolCompilerTests(unittest.TestCase):
                 result, image = self.compile(target)
                 self.assertEqual(result["origin"], 0x100)
                 self.assertEqual(result["filename"], "main.com")
-                self.assertLess(len(image), 0xff00)
+                self.assertLess(len(image), 0xcf00)
+                self.assertLessEqual(result["memory_end"], 0xd000)
                 program = Path(temporary) / "main.com"
                 program.write_bytes(image)
                 output = subprocess.run([emulator, str(program)], capture_output=True, text=True, timeout=10, check=True)
@@ -205,6 +212,18 @@ bw_print_number(-42 as int32);
                 result = cowgol.build_cowgol(request(target=target, code='include "cowgol.coh";\ninclude "brickwright.coh";\nbw_digital_write(1 as int32, 1 as int32);'))
                 self.assertFalse(result["success"])
                 self.assertIn("bw_digital_write", result.get("log", ""))
+
+    def test_cpm_rejects_uninitialized_workspace_that_would_overlap_os(self):
+        source = '''include "cowgol.coh";
+var large: uint8[54000];
+large[53999] := 42;
+print_i8(large[53999]);
+'''
+        for target in ("z80-cpm", "i8080-cpm"):
+            with self.subTest(target=target):
+                result = cowgol.build_cowgol(request(target=target, code=source))
+                self.assertFalse(result["success"])
+                self.assertIn("static workspace exceed", result["error"])
 
 
 if __name__ == "__main__":

@@ -136,6 +136,24 @@ def _stage_bundle(directory):
     return destination
 
 
+def cpm_memory(listing, image_bytes):
+    """Check static storage absent from a .COM file against Brickwright's TPA.
+
+    The pinned linker emits TOP (end of bytes), ws (after its 128-byte stack),
+    and LOMEM (after static workspace). Checking only image length misses a
+    large uninitialized array that would overwrite the guest OS.
+    """
+    matches = re.findall(r"^\s*(top|ws|lomem)\s+(?:=\s*)?([0-9a-f]+)\s*$", listing, re.I | re.M)
+    values = {name.lower(): int(value, 16) for name, value in matches}
+    if len(matches) != 3 or set(values) != {"top", "ws", "lomem"}:
+        raise ValueError("Cowgol CP/M assembly is missing its memory layout symbols")
+    if values["top"] != 0x100 + image_bytes or values["ws"] != values["top"] + 128 or values["lomem"] < values["ws"]:
+        raise ValueError("Cowgol CP/M assembly has an inconsistent code/stack/workspace layout")
+    if values["lomem"] > 0xd000:
+        raise ValueError("Cowgol CP/M code, stack and static workspace exceed the $0100–$CFFF area")
+    return values
+
+
 def build_cowgol(req):
     target = ALIASES.get(req.target.lower(), req.target.lower())
     spec = TARGETS.get(target)
@@ -178,6 +196,7 @@ def build_cowgol(req):
             run([bundle / f"bin/cowfe-{family}", f"-I{bundle / 'rt' / family}/", f"-I{bundle / 'rt'}/", source, cob])
             run([bundle / f"bin/cowbe-{family}", cob, coo])
             output = work / f"main.{spec['extension']}"
+            memory_layout = None
             if family == "cgen":
                 run([bundle / "bin/cowlink-cgen", "-o", output, coo])
                 generated = output.read_text()
@@ -203,9 +222,11 @@ def build_cowgol(req):
                     # zmac selects its writer by suffix; .cim is the raw
                     # memory image format which CP/M calls .COM.
                     cim = work / "main.cim"
-                    run([bundle / "bin/zmac", "-j", "-m", "-z" if family == "cpmz" else "-8", "-o", cim, assembly])
+                    listing = work / "main.lst"
+                    run([bundle / "bin/zmac", "-j", "-m", "-z" if family == "cpmz" else "-8", "-o", cim, "-o", listing, assembly])
+                    memory_layout = cpm_memory(listing.read_text(), cim.stat().st_size)
                     cim.rename(output)
-            maximum = 0xff00 if spec.get("origin") == 0x100 else MAX_ARTIFACT_BYTES
+            maximum = 0xcf00 if spec.get("origin") == 0x100 else MAX_ARTIFACT_BYTES
             if not output.is_file() or not 0 < output.stat().st_size <= maximum:
                 raise ValueError(f"Cowgol output is empty or exceeds {maximum} bytes for {target}")
             artifact = output.read_bytes()
@@ -217,6 +238,10 @@ def build_cowgol(req):
                         "compiler_commit": status["commit"], "artifact_kind": "source" if family == "cgen" else "executable"}
             if "origin" in spec:
                 response["origin"] = spec["origin"]
+                response["memory_end"] = memory_layout["lomem"]
+                response["memory"] = (f"CP/M image {len(artifact)} bytes, stack 128 bytes, "
+                                      f"static workspace {memory_layout['lomem'] - memory_layout['ws']} bytes; "
+                                      f"end ${memory_layout['lomem']:04X} (limit $D000)")
             if family == "cgen":
                 response.update(c=artifact.decode("utf-8"), source_language="c")
             return response

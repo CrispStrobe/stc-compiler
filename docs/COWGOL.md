@@ -35,7 +35,10 @@ Example request:
 `POST /compile` returns the familiar `success`, `base64`, `filename`, `bytes`
 and `log` fields. Cowgol also returns `toolchain`, `target`, `compiler_commit`
 and `artifact_kind` (`executable` or `source`). Both CP/M routes return
-`origin: 256`; DOS returns a complete MZ image. Cowgol debug symbols and
+`origin: 256`, `memory_end` and a memory summary. The assembler's symbol map
+must prove that code, the 128-byte transient stack and static workspace fit
+below `$D000`; a short image with an oversized uninitialized array is refused.
+DOS returns a complete MZ image. Cowgol debug symbols and
 disassembly are currently unsupported and explicit requests for them fail.
 
 For C output, the response includes both the base64 artifact and `c` text,
