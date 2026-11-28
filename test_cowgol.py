@@ -98,7 +98,8 @@ class CowgolBoundaryTests(unittest.TestCase):
                   "__data_load_start": 108, "__data_load_end": 110, "__stack": 0x8ff,
                   "ram": 0x800220, "cowgol_avr_halted": 0x800210, "cowgol_avr_status": 0x800211}
         def listing(changes=None, sizes=None):
-            return "\n".join(f"{value:08x} g O .bss {dict(ram=512, cowgol_avr_halted=1, cowgol_avr_status=1, **(sizes or {})).get(name, 0):08x} {name}"
+            byte_sizes = {"ram": 512, "cowgol_avr_halted": 1, "cowgol_avr_status": 1, **(sizes or {})}
+            return "\n".join(f"{value:08x} g O .bss {byte_sizes.get(name, 0):08x} {name}"
                               for name, value in {**values, **(changes or {})}.items())
         self.assertEqual(cowgol.avr_hex(artifact), image)
         layout = cowgol.avr_memory(listing(), artifact, elf)
