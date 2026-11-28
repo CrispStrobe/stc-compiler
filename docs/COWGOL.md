@@ -27,6 +27,14 @@ tested 32-bit runtime profile and the ATmega328P route has its own bounded
 16-bit-pointer binding. C output alone does not qualify other SDCC, AVR or
 cc65 boards.
 
+The service's browser demo exposes all eight targets when **Cowgol** is
+selected. Its AVR entries identify Arduino Uno and classic ATmega328P Nano
+separately, choose Intel HEX automatically, and retain the fixed runtime clock.
+The format selector follows the target in Cowgol mode. Switching back to C
+retains the shared `atmega328p` MCU target, while Nano's board name remains an
+Arduino/Cowgol choice; it does not create a plain-C Nano board profile. Authored
+source is preserved when changing languages.
+
 Example request:
 
 ```json

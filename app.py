@@ -3226,15 +3226,15 @@ PAGE = r"""<!doctype html>
         <option value=mcs51>generic 8051</option>
       </optgroup>
       <optgroup label="AVR (avr-gcc)">
-        <option value=atmega328p>ATmega328P &mdash; Uno / Nano</option>
+        <option value=atmega328p data-cowgol-label="Arduino Uno (ATmega328P, .HEX)">ATmega328P &mdash; Uno / Nano</option>
         <option value=atmega168p>ATmega168P</option>
         <option value=atmega2560>ATmega2560 &mdash; Mega</option>
         <option value=attiny85>ATtiny85</option>
         <option value=attiny88>ATtiny88</option>
       </optgroup>
-      <optgroup label="Arduino boards (sketch)">
+      <optgroup label="Arduino board profiles">
         <option value=arduino-uno>Arduino Uno</option>
-        <option value=arduino-nano>Arduino Nano</option>
+        <option value=arduino-nano data-cowgol-label="Classic Arduino Nano (ATmega328P, .HEX)">Arduino Nano</option>
         <option value=arduino-mega>Arduino Mega 2560</option>
       </optgroup>
       <optgroup label="Cowgol">
@@ -3484,10 +3484,25 @@ $('copy').onclick = async () => {
 const STARTERS = {c: $('code').value, pseudocode: __PSEUDO_EXAMPLE__,
                   arduino: __ARDUINO_EXAMPLE__, keil: $('code').value,
                   cowgol: 'include "cowgol.coh";\nprint("Hello from Cowgol!\\n");\n'};
-const cowgolTargets = new Set(['z80-cpm', 'i8080-cpm', 'dos', 'riscv32', 'eater6502', 'cowgol-cgen']);
+const cowgolFormats = Object.freeze({
+  'z80-cpm': 'bin', 'i8080-cpm': 'bin', dos: 'bin', riscv32: 'elf',
+  eater6502: 'bin', 'cowgol-cgen': 'c', atmega328p: 'hex', 'arduino-nano': 'hex',
+});
+// These six menu entries are reserved for Cowgol. The two AVR entries also
+// serve their existing C/Arduino routes, so membership in cowgolFormats alone
+// must not disable them when the language changes.
+const cowgolOnlyTargets = new Set(['z80-cpm', 'i8080-cpm', 'dos', 'riscv32', 'eater6502', 'cowgol-cgen']);
+function targetAvailable(target, language) {
+  if (language === 'cowgol') return Object.hasOwn(cowgolFormats, target);
+  if (cowgolOnlyTargets.has(target)) return false;
+  // A board name selects an Arduino core in sketch mode. Plain C targets the
+  // MCU and does not inherit Cowgol's Nano bootloader or memory contract.
+  if (target.startsWith('arduino-')) return language === 'arduino' || language === 'pseudocode';
+  return true;
+}
 function syncCowgolFormat() {
   if ($('language').value === 'cowgol') {
-    $('format').value = $('target').value === 'cowgol-cgen' ? 'c' : $('target').value === 'riscv32' ? 'elf' : 'bin';
+    $('format').value = cowgolFormats[$('target').value];
   }
 }
 $('target').onchange = syncCowgolFormat;
@@ -3501,12 +3516,16 @@ $('language').onchange = () => {
   lastLanguage = next;
   // pseudocode carries CLOCK; a sketch is built for its board's crystal.
   $('fosc').disabled = (next === 'pseudocode' || next === 'arduino' || next === 'cowgol');
+  $('format').disabled = next === 'cowgol';
   for (const option of $('target').options) {
-    if (next === 'cowgol') option.disabled = !cowgolTargets.has(option.value);
-    else option.disabled = cowgolTargets.has(option.value);
+    option.dataset.defaultLabel ||= option.textContent;
+    option.textContent = next === 'cowgol' && option.dataset.cowgolLabel
+      ? option.dataset.cowgolLabel : option.dataset.defaultLabel;
+    option.disabled = !targetAvailable(option.value, next);
   }
-  if (next === 'cowgol' && !cowgolTargets.has($('target').value)) $('target').value = 'z80-cpm';
-  if (next !== 'cowgol' && cowgolTargets.has($('target').value)) $('target').value = 'stc12c5a60s2';
+  if (!targetAvailable($('target').value, next)) {
+    $('target').value = next === 'cowgol' ? 'z80-cpm' : 'stc12c5a60s2';
+  }
   if (next !== 'cowgol' && ['c', 'elf'].includes($('format').value)) $('format').value = 'hex';
   syncCowgolFormat();
   if (next === 'arduino' && !/^(arduino-|atmega|attiny)/.test($('target').value)) {

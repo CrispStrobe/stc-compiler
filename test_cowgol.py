@@ -7,6 +7,7 @@ toolchain checks. The ordinary Python suite also runs every input guard.
 import asyncio
 import base64
 import hashlib
+from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
@@ -284,6 +285,133 @@ class CowgolBoundaryTests(unittest.TestCase):
             self.assertEqual(guarded.call_args.args[0].target, "cowgol-cgen")
             self.assertIs(asyncio.run(app.download(req, object())), limited)
             self.assertEqual(guarded.call_args.args[0].target, "z80-cpm")
+
+    def test_demo_builds_all_cowgol_targets_and_preserves_shared_avr_routes(self):
+        from app import PAGE, CompileReq, build
+
+        class TargetOptions(HTMLParser):
+            def __init__(self):
+                super().__init__(convert_charrefs=True)
+                self.in_target = False
+                self.current = None
+                self.options = []
+
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if tag == "select":
+                    self.in_target = attrs.get("id") == "target"
+                if tag == "option" and self.in_target:
+                    self.current = {"value": attrs["value"], "textContent": "", "dataset": {}}
+                    if "data-cowgol-label" in attrs:
+                        self.current["dataset"]["cowgolLabel"] = attrs["data-cowgol-label"]
+                    self.options.append(self.current)
+
+            def handle_data(self, data):
+                if self.current is not None:
+                    self.current["textContent"] += data
+
+            def handle_endtag(self, tag):
+                if tag == "option":
+                    self.current = None
+                if tag == "select":
+                    self.in_target = False
+
+        parser = TargetOptions()
+        parser.feed(PAGE)
+        node = shutil.which("node")
+        if not node:
+            if os.environ.get("REQUIRE_COWGOL_TOOLCHAIN") == "1":
+                self.fail("Cowgol CI requires Node to exercise the demo's real event handlers")
+            self.skipTest("Node is unavailable for the demo JavaScript execution test")
+        # Execute the actual event handlers with lightweight DOM controls and a
+        # captured HTTP boundary. No frontend target/format logic is replaced.
+        script = r'''
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const input = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+const controls = Object.fromEntries(['language', 'target', 'code', 'format', 'fosc',
+  'go', 'dl', 'copy', 'status', 'out', 'asm', 'cgen', 'mem', 'log'].map(id => [id, {}]));
+controls.language.value = 'c'; controls.target.value = 'stc12c5a60s2';
+controls.target.options = input.options;
+controls.code.value = 'untouched C'; controls.format.value = 'hex'; controls.fosc.value = '11059200';
+const requests = [];
+const context = vm.createContext({
+  $: id => controls[id], TextDecoder, Uint8Array,
+  document: {querySelector: () => ({})},
+  setBusy: () => {},
+  bytesFromBase64: b64 => Uint8Array.from(Buffer.from(b64, 'base64')),
+  hexdump: () => 'binary artifact',
+  fetch: async (url, request) => {
+    assert.equal(url, '/compile');
+    requests.push(JSON.parse(request.body));
+    return {json: async () => ({success: true, base64: 'OklOVEVMSEVY',
+      bytes: 9, filename: 'program.hex'})};
+  },
+});
+const start = input.page.indexOf('const STARTERS =');
+const endMarker = "$('language').onchange();";
+const end = input.page.indexOf(endMarker, start) + endMarker.length;
+assert.ok(start > 0 && end > start);
+const source = input.page.slice(start, end)
+  .replace('__PSEUDO_EXAMPLE__', JSON.stringify('untouched pseudocode'))
+  .replace('__ARDUINO_EXAMPLE__', JSON.stringify('untouched Arduino'));
+vm.runInContext('let image = null;\n' + source, context);
+const compileStart = input.page.indexOf("$('go').onclick = async () => {");
+const compileEnd = input.page.indexOf("$('proj').onclick", compileStart);
+assert.ok(compileStart > 0 && compileEnd > compileStart);
+vm.runInContext(input.page.slice(compileStart, compileEnd), context);
+const changeLanguage = language => { controls.language.value = language; controls.language.onchange(); };
+const changeTarget = target => { controls.target.value = target; controls.target.onchange(); };
+const option = target => controls.target.options.find(entry => entry.value === target);
+(async () => {
+  changeLanguage('cowgol');
+  assert.equal(controls.target.value, 'z80-cpm');
+  const formats = {'z80-cpm': 'bin', 'i8080-cpm': 'bin', dos: 'bin', riscv32: 'elf',
+    eater6502: 'bin', 'cowgol-cgen': 'c', atmega328p: 'hex', 'arduino-nano': 'hex'};
+  assert.deepEqual(controls.target.options.filter(entry => !entry.disabled).map(entry => entry.value).sort(),
+    Object.keys(formats).sort());
+  for (const [target, format] of Object.entries(formats)) {
+    changeTarget(target);
+    assert.equal(controls.format.value, format, target);
+    assert.equal(controls.format.disabled, true);
+    await controls.go.onclick();
+    const sent = requests.at(-1);
+    assert.equal(sent.target, target); assert.equal(sent.format, format);
+    assert.equal(sent.language, 'cowgol'); assert.equal(sent.disassemble, false);
+    assert.equal(Object.hasOwn(sent, 'fosc'), false);
+    assert.equal(controls.dl.disabled, false);
+    assert.equal(controls.copy.disabled, format === 'bin' || format === 'elf');
+  }
+  assert.match(option('atmega328p').textContent, /Arduino Uno.*\.HEX/);
+  assert.match(option('arduino-nano').textContent, /Classic Arduino Nano.*\.HEX/);
+  controls.code.value = 'authored source';
+  changeTarget('atmega328p'); changeLanguage('c');
+  assert.equal(controls.target.value, 'atmega328p');
+  assert.equal(option('atmega328p').disabled, false);
+  assert.equal(controls.fosc.disabled, false); assert.equal(controls.format.disabled, false);
+  assert.equal(option('arduino-nano').disabled, true);
+  assert.equal(controls.code.value, 'authored source');
+  changeLanguage('cowgol'); changeTarget('arduino-nano'); changeLanguage('c');
+  assert.equal(controls.target.value, 'stc12c5a60s2');
+  changeLanguage('arduino');
+  assert.equal(controls.target.value, 'arduino-uno');
+  assert.equal(option('arduino-nano').disabled, false);
+  changeTarget('arduino-nano'); changeLanguage('cowgol');
+  assert.equal(controls.target.value, 'arduino-nano'); assert.equal(controls.format.value, 'hex');
+  changeTarget('cowgol-cgen'); changeLanguage('arduino');
+  assert.equal(controls.target.value, 'arduino-uno'); assert.equal(controls.format.value, 'hex');
+  assert.equal(controls.code.value, 'authored source');
+  assert.equal(option('arduino-nano').textContent, 'Arduino Nano');
+  console.log(JSON.stringify({requests: requests.length, passed: true}));
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''
+        executed = subprocess.run([node, "-e", script], input=json.dumps({"page": PAGE, "options": parser.options}),
+                                  text=True, capture_output=True, timeout=10)
+        self.assertEqual(executed.returncode, 0, executed.stderr)
+        # Nano's Cowgol board profile must never add a plain-C board alias.
+        unsupported = build(CompileReq(code="int main(void) { return 0; }", language="c", target="arduino-nano"))
+        self.assertFalse(unsupported["success"])
+        self.assertIn("unknown target", unsupported["error"])
 
 
 class CowgolCompilerTests(unittest.TestCase):
