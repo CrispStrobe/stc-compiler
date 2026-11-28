@@ -1,0 +1,13 @@
+# Cowgol's generated vendor/cowgol bundle is intentionally uploaded by CLI.
+# Keep it out of Git history with .gitignore, but include it in deployments.
+# Vercel also applies its standard exclusions (.git, .vercel, node_modules).
+__pycache__/
+*.pyc
+.env*
+.DS_Store
+CLAUDE.md
+build-avr/
+build-arm/
+node_modules/
+package-lock.json
+cowgol-bundle-linux-x64.tar.gz

@@ -54,7 +54,7 @@ class CowgolBoundaryTests(unittest.TestCase):
                 result = cowgol.build_cowgol(request(code=f'include "{name}";'))
                 self.assertFalse(result["success"])
                 self.assertEqual(result["stage"], "source")
-        self.assertIsNotNone(cowgol.reject_source('include "brickwright.coh";', "cpmz"))
+        self.assertIsNone(cowgol.reject_source('include "brickwright.coh";', "cpmz"))
 
     def test_inline_assembler_and_external_names_are_refused(self):
         for source in ('@asm "%include /etc/passwd";', 'extern "bad";', '@extern "bad";'):
@@ -99,6 +99,17 @@ class CowgolBoundaryTests(unittest.TestCase):
             self.assertEqual(asyncio.run(transpile_only(CompileReq(code=HELLO, language="cowgol"))), response)
             self.assertEqual(compiler.call_args.args[0].target, "cowgol-cgen")
             self.assertEqual(compiler.call_args.args[0].format, "c")
+
+    def test_http_cowgol_transpile_and_download_share_the_compile_guard(self):
+        import app
+        from fastapi.responses import JSONResponse
+        limited = JSONResponse({"success": False, "error": "rate limited"}, status_code=429)
+        req = app.CompileReq(code=HELLO, language="cowgol", target="z80-cpm", format="bin")
+        with patch.object(app, "_guarded_build", return_value=limited) as guarded:
+            self.assertIs(asyncio.run(app.transpile_only(req, object())), limited)
+            self.assertEqual(guarded.call_args.args[0].target, "cowgol-cgen")
+            self.assertIs(asyncio.run(app.download(req, object())), limited)
+            self.assertEqual(guarded.call_args.args[0].target, "z80-cpm")
 
 
 class CowgolCompilerTests(unittest.TestCase):
@@ -171,6 +182,29 @@ class CowgolCompilerTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertIn("main.cow", result["log"])
         self.assertNotIn("cowgol-request-", result["log"])
+
+    def test_portable_console_bridge_signed_limits_on_each_machine(self):
+        source = '''include "cowgol.coh";
+include "brickwright.coh";
+bw_print_text("console");
+bw_print_number(-2147483647 as int32 - 1);
+bw_print_number(2147483647 as int32);
+bw_print_number(-42 as int32);
+'''
+        for target, oracle_name in (("z80-cpm", "COWGOL_CPMEMU"), ("i8080-cpm", "COWGOL_CPMEMU"), ("dos", "COWGOL_EMU2")):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                result, image = self.compile(target, code=source)
+                program = Path(temporary) / result["filename"]
+                program.write_bytes(image)
+                output = subprocess.run([self.oracle(oracle_name), str(program)], capture_output=True, text=True, timeout=10, check=True)
+                self.assertEqual(output.stdout.strip().splitlines(), ["console", "-2147483648", "2147483647", "-42"])
+
+    def test_native_bridge_does_not_fake_canvas_or_gpio(self):
+        for target in ("z80-cpm", "i8080-cpm", "dos"):
+            with self.subTest(target=target):
+                result = cowgol.build_cowgol(request(target=target, code='include "cowgol.coh";\ninclude "brickwright.coh";\nbw_digital_write(1 as int32, 1 as int32);'))
+                self.assertFalse(result["success"])
+                self.assertIn("bw_digital_write", result.get("log", ""))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,47 @@
+name: Cowgol compiler and machine execution
+
+on:
+  push:
+    branches: [main, "feature/**", "feat/cowgol-**"]
+    paths:
+      - "cowgol_build.py"
+      - "app.py"
+      - "test_cowgol.py"
+      - "scripts/build-cowgol-bundle.py"
+      - "Dockerfile"
+      - ".github/workflows/cowgol.yml"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  compile-and-run:
+    runs-on: ubuntu-latest
+    container: python:3.11-bullseye
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dependencies (outside the deployed service image)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential git ninja-build lua5.4 bison flex gpp moreutils nasm libreadline-dev
+          pip install --quiet fastapi pydantic
+      - name: Checkout the exact compiler pin
+        run: |
+          pin=$(python3 -c "import runpy; print(runpy.run_path('scripts/build-cowgol-bundle.py')['PINNED_COMMIT'])")
+          git init /tmp/cowgol-source
+          git -C /tmp/cowgol-source remote add origin https://github.com/CrispStrobe/cowgol.git
+          git -C /tmp/cowgol-source fetch --depth 1 origin "$pin"
+          git -C /tmp/cowgol-source checkout --detach FETCH_HEAD
+      - name: Build and hash the real compiler bundle
+        run: python3 scripts/build-cowgol-bundle.py --source /tmp/cowgol-source --oracles
+      - name: Execute Cowgol output on C, Z80 CP/M, 8080 CP/M and DOS
+        env:
+          REQUIRE_COWGOL_TOOLCHAIN: "1"
+          COWGOL_CPMEMU: /tmp/cowgol-source/bin/cpmemu
+          COWGOL_EMU2: /tmp/cowgol-source/bin/emu2
+        run: python3 -m unittest -v test_cowgol
+      - name: Archive verified deployment bundle
+        run: tar -C vendor -czf cowgol-bundle-linux-x64.tar.gz cowgol
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cowgol-bundle-linux-x64
+          path: cowgol-bundle-linux-x64.tar.gz

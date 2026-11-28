@@ -92,7 +92,7 @@ silicon.
 ```jsonc
 {
   "code":    "#include <stc12.h>\nvoid main(void) { ... }",  // required
-  "language": "c",             // c | pseudocode | keil | arduino
+  "language": "c",             // c | pseudocode | keil | arduino | cowgol
   "target":  "stc12c5a60s2",   // see Targets below
   "fosc":    11059200,         // emitted as -DFOSC_HZ / -DF_CPU; null to omit
   "defines": { "DEBUG": "1" }, // extra -D flags; null value = bare define
@@ -123,6 +123,11 @@ Failure returns `{"success": false, "error": "<compiler output>"}`, with
 `line` and `stage` when the front end caught it rather than the compiler.
 
 Source is capped at 1 MB (4 MB across a whole project).
+
+**Cowgol** uses its real compiler for Z80/8080 CP/M `.COM` files, 8086 DOS
+`.EXE` files, and standalone C source export. Its format/target combinations,
+portable console bridge, exact compiler source pin, installation and machine
+execution checks are documented in [Cowgol compiler service](docs/COWGOL.md).
 
 The `memory` field is worth surfacing to users — it is how you catch an image
 quietly outgrowing 60 KB of flash or 248 bytes of stack.

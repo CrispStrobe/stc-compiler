@@ -20,7 +20,7 @@ import tempfile
 
 REPOSITORY = "https://github.com/CrispStrobe/cowgol.git"
 # Updated only after the corresponding fork checkpoint is published.
-PINNED_COMMIT = "e96d0fc1c562c4aadeca186abc9df6edcf6f4734"
+PINNED_COMMIT = "02318cfe4de1f5fa4bbef70446764fa8ea8b7cce"
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -49,7 +49,10 @@ def build(source, destination, revision, oracles):
             raise ValueError(f"missing build dependency: {name}; see this script's dependency list")
     run([sys.executable, source / "scripts/compile.py", "--bootstrap-only"], cwd=source)
     # One multi-target invocation reuses the front end / compiler bootstrap.
-    run(["make", *targets], cwd=source)
+    # DJLINK is C++; the serverless host need not have libstdc++ or libgcc_s.
+    # Keep only the system libc dependency in the shipped executables.
+    linker_flags = "-g -static-libstdc++ -static-libgcc"
+    run(["make", f"LDFLAGS={linker_flags}", *targets], cwd=source)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="cowgol-bundle-", dir=destination.parent) as temporary:
         bundle = Path(temporary) / "bundle"
@@ -61,6 +64,13 @@ def build(source, destination, revision, oracles):
         shutil.copy2(source / "third_party/zmac/COPYING.publicdomain", bundle / "licenses/zmac-public-domain.txt")
         shutil.copy2(source / "third_party/djlink/copying", bundle / "licenses/djlink-GPL.txt")
         shutil.copy2(source / "third_party/djlink/copying.dj", bundle / "licenses/djlink-exception.txt")
+        gcc_major = subprocess.check_output(["cc", "-dumpversion"], text=True).strip().split(".")[0]
+        gcc_notice = Path(os.environ.get("GCC_RUNTIME_LICENSE", f"/usr/share/doc/gcc-{gcc_major}-base/copyright"))
+        gpl_notice = Path(os.environ.get("GCC_GPL_LICENSE", "/usr/share/common-licenses/GPL-3"))
+        if not gcc_notice.is_file() or not gpl_notice.is_file():
+            raise ValueError("set GCC_RUNTIME_LICENSE and GCC_GPL_LICENSE to the installed GCC runtime notices")
+        shutil.copy2(gcc_notice, bundle / "licenses/GCC-runtime-copyright.txt")
+        shutil.copy2(gpl_notice, bundle / "licenses/GCC-GPL-3.txt")
         subprocess.run(["nasm", "-v"], check=True, capture_output=True)
         # NASM is BSD-2-Clause; retain its complete notice from the installed
         # package when available. An explicit path supports non-Debian hosts.
@@ -91,6 +101,7 @@ def build(source, destination, revision, oracles):
             "targets": ["cowgol-cgen", "z80-cpm", "i8080-cpm", "dos"],
             "nasm_version": subprocess.check_output(["nasm", "-v"], text=True).strip(),
             "host_compiler": subprocess.check_output(["cc", "--version"], text=True).splitlines()[0],
+            "linker_flags": linker_flags,
             "sha256": {str(path.relative_to(bundle)): hashlib.sha256(path.read_bytes()).hexdigest()
                        for path in sorted(bundle.rglob("*")) if path.is_file()},
         }
@@ -108,6 +119,8 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / "vendor/cowgol")
     parser.add_argument("--oracles", action="store_true", help="also build cpmemu and emu2 for tests")
     args = parser.parse_args()
+    if args.oracles and not args.source:
+        parser.error("--oracles requires --source so the emulator executables remain available for tests")
     try:
         if not re.fullmatch("[0-9a-f]{40}", args.revision):
             raise ValueError("--revision must be an exact 40-character Git commit")

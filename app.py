@@ -2692,14 +2692,16 @@ async def transpile_only(req: CompileReq, request: Request = None):
 
 
 @app.post("/download")
-async def download(req: CompileReq):
+async def download(req: CompileReq, request: Request = None):
     """Same as /compile, but returns the raw file with a filename attached.
 
     Saves callers from base64-decoding by hand:
         curl -X POST .../download -H 'Content-Type: application/json' \
              -d @req.json -OJ
     """
-    result = build(req)
+    result = build(req) if request is None else _guarded_build(req, request)
+    if isinstance(result, Response):
+        return result
     if not result["success"]:
         # A target that transpiles but cannot be built here is not a failure
         # to report as one: the generated source IS the deliverable, and a
@@ -3211,6 +3213,7 @@ PAGE = r"""<!doctype html>
       <option value=c selected>C</option>
       <option value=keil>Keil C51</option>
       <option value=arduino>Arduino sketch (C++)</option>
+      <option value=cowgol>Cowgol</option>
     </select>
   </label>
   <label>target
@@ -3234,6 +3237,12 @@ PAGE = r"""<!doctype html>
         <option value=arduino-nano>Arduino Nano</option>
         <option value=arduino-mega>Arduino Mega 2560</option>
       </optgroup>
+      <optgroup label="Cowgol">
+        <option value=z80-cpm>Z80 CP/M (.COM)</option>
+        <option value=i8080-cpm>8080 CP/M (.COM)</option>
+        <option value=dos>8086 DOS (.EXE)</option>
+        <option value=cowgol-cgen>Standalone C source</option>
+      </optgroup>
     </select>
   </label>
   <label>FOSC <input id=fosc value=11059200 size=9></label>
@@ -3242,6 +3251,7 @@ PAGE = r"""<!doctype html>
       <option value=hex>.hex (packihx)</option>
       <option value=ihx>.ihx (raw)</option>
       <option value=bin>.bin</option>
+      <option value=c>.c (Cowgol source export)</option>
     </select>
   </label>
   <button class=primary id=go>Compile</button>
@@ -3342,7 +3352,7 @@ $('go').onclick = async () => {
         // default is the 8051's 11.0592 MHz.
         fosc: $('fosc').disabled ? undefined : (parseInt($('fosc').value, 10) || null),
         format,
-        disassemble: true,
+        disassemble: $('language').value !== 'cowgol',
       })
     });
     const data = await response.json();
@@ -3469,7 +3479,15 @@ $('copy').onclick = async () => {
 };
 
 const STARTERS = {c: $('code').value, pseudocode: __PSEUDO_EXAMPLE__,
-                  arduino: __ARDUINO_EXAMPLE__, keil: $('code').value};
+                  arduino: __ARDUINO_EXAMPLE__, keil: $('code').value,
+                  cowgol: 'include "cowgol.coh";\nprint("Hello from Cowgol!\\n");\n'};
+const cowgolTargets = new Set(['z80-cpm', 'i8080-cpm', 'dos', 'cowgol-cgen']);
+function syncCowgolFormat() {
+  if ($('language').value === 'cowgol') {
+    $('format').value = $('target').value === 'cowgol-cgen' ? 'c' : 'bin';
+  }
+}
+$('target').onchange = syncCowgolFormat;
 let lastLanguage = $('language').value;
 $('language').onchange = () => {
   const next = $('language').value;
@@ -3479,7 +3497,15 @@ $('language').onchange = () => {
   }
   lastLanguage = next;
   // pseudocode carries CLOCK; a sketch is built for its board's crystal.
-  $('fosc').disabled = (next === 'pseudocode' || next === 'arduino');
+  $('fosc').disabled = (next === 'pseudocode' || next === 'arduino' || next === 'cowgol');
+  for (const option of $('target').options) {
+    if (next === 'cowgol') option.disabled = !cowgolTargets.has(option.value);
+    else option.disabled = cowgolTargets.has(option.value);
+  }
+  if (next === 'cowgol' && !cowgolTargets.has($('target').value)) $('target').value = 'z80-cpm';
+  if (next !== 'cowgol' && cowgolTargets.has($('target').value)) $('target').value = 'stc12c5a60s2';
+  if (next !== 'cowgol' && $('format').value === 'c') $('format').value = 'hex';
+  syncCowgolFormat();
   if (next === 'arduino' && !/^(arduino-|atmega|attiny)/.test($('target').value)) {
     $('target').value = 'arduino-uno';
   }

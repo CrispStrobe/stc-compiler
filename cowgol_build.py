@@ -32,7 +32,7 @@ TARGETS = {
 }
 ALIASES = {"cgen": "cowgol-cgen", "cowgol-c": "cowgol-cgen", "cowgol-z80-cpm": "z80-cpm",
            "8080-cpm": "i8080-cpm", "cowgol-8080-cpm": "i8080-cpm", "i8086-dos": "dos"}
-INCLUDES = frozenset(("cowgol.coh", "strings.coh", "malloc.coh", "file.coh", "argv.coh"))
+INCLUDES = frozenset(("cowgol.coh", "strings.coh", "malloc.coh", "file.coh", "argv.coh", "brickwright.coh"))
 # This scanner observes Cowgol's # comments, strings, character literals and
 # @-keywords, so prose containing 'include' or '@asm' is not mistaken for code.
 TOKENS = re.compile(r"\#[^\n]*|\s+|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|@?[A-Za-z_][A-Za-z_0-9]*|.", re.S)
@@ -45,7 +45,7 @@ def reject_source(source, family):
         return {"success": False, "stage": "source", "error": "Cowgol source cannot contain NUL"}
     tokens = [match for match in TOKENS.finditer(source)
               if not match.group().isspace() and not match.group().startswith("#")]
-    allowed = INCLUDES | ({"brickwright.coh"} if family == "cgen" else set())
+    allowed = INCLUDES
     for index, token in enumerate(tokens):
         word = token.group().lower()
         error = None
@@ -69,7 +69,7 @@ def bundle_root():
 def _required(spec):
     family = spec["family"]
     tools = [f"bin/{name}-{family}" for name in ("cowfe", "cowbe", "cowlink")]
-    files = tools + [f"rt/{family}/cowgol.coh", "rt/common.coh"]
+    files = tools + [f"rt/{family}/cowgol.coh", f"rt/{family}/brickwright.coh", "rt/common.coh"]
     if family == "cgen":
         files += ["rt/cgen/cowgol.h", "rt/cgen/brickwright.h"]
     else:
