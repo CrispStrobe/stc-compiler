@@ -35,7 +35,11 @@ TARGETS = {
     "eater6502": {"description": "Cowgol for Brickwright EATER6502 (65C02 ROM, ACIA console and VIA GPIO)",
                   "family": "eater6502", "format": "bin", "extension": "bin", "origin": 0x8000},
     "atmega328p": {"description": "Cowgol via C for 16 MHz ATmega328P / Uno (UART, digital GPIO and blocking millisecond delays)",
-                   "family": "cgen", "format": "hex", "extension": "hex", "cross": "atmega328p"},
+                   "family": "cgen", "format": "hex", "extension": "hex", "cross": "atmega328p",
+                   "board": "arduino-uno", "flash_limit": 0x7e00},
+    "arduino-nano": {"description": "Cowgol for classic ATmega328P Nano at 16 MHz (2 KiB bootloader reservation)",
+                     "family": "cgen", "format": "hex", "extension": "hex", "cross": "atmega328p",
+                     "toolchain": "arduino-nano", "board": "arduino-nano", "flash_limit": 0x7800},
 }
 ALIASES = {"cgen": "cowgol-cgen", "cowgol-c": "cowgol-cgen", "cowgol-z80-cpm": "z80-cpm",
            "8080-cpm": "i8080-cpm", "cowgol-8080-cpm": "i8080-cpm", "i8086-dos": "dos",
@@ -260,12 +264,14 @@ AVR_STATIC_END = AVR_RAM_END - AVR_STACK_RESERVE
 AVR_HEAP_SIZE = 512
 
 
-def avr_hex(artifact):
+def avr_hex(artifact, flash_limit=AVR_FLASH_LIMIT):
     """Decode the single contiguous ATmega328P flash image, including checksums.
 
     avr-objcopy emits data and EOF records only for this <32 KiB image. Other
     record types, duplicate bytes and sparse images are outside this contract.
     """
+    if flash_limit not in (0x7800, AVR_FLASH_LIMIT):
+        raise ValueError("Cowgol AVR requires an explicitly qualified flash boundary")
     try:
         lines = artifact.decode("ascii").splitlines()
     except UnicodeDecodeError as error:
@@ -281,7 +287,7 @@ def avr_hex(artifact):
         length, address, kind = record[0], int.from_bytes(record[1:3], "big"), record[3]
         if kind == 1 and length == address == 0:
             eof = True
-        elif kind == 0 and length and address == len(image) and address + length <= AVR_FLASH_LIMIT:
+        elif kind == 0 and length and address == len(image) and address + length <= flash_limit:
             image.extend(record[4:-1])
         else:
             raise ValueError("Cowgol ATmega328P HEX exceeds flash, overlaps, is sparse, or uses unsupported records")
@@ -294,7 +300,7 @@ def avr_hex(artifact):
     return bytes(image)
 
 
-def avr_memory(symbols, artifact, elf):
+def avr_memory(symbols, artifact, elf, flash_limit=AVR_FLASH_LIMIT):
     """Check actual linked storage, arena, reset and exit markers before export."""
     if (len(elf) < 52 or elf[:7] != b"\x7fELF\x01\x01\x01"
             or struct.unpack_from("<HHI", elf, 16) != (2, 83, 1)
@@ -313,7 +319,7 @@ def avr_memory(symbols, artifact, elf):
             sizes[name] = int(fields[-2], 16)
     if set(values) != set(required):
         raise ValueError("Cowgol ATmega328P assembly is missing its memory layout symbols")
-    image = avr_hex(artifact)
+    image = avr_hex(artifact, flash_limit)
     ram_address = lambda name: values[name] - 0x800000
     data_start, data_end, bss_end = (ram_address(name) for name in ("__data_start", "__data_end", "__bss_end"))
     heap_start = ram_address("ram")
@@ -326,10 +332,10 @@ def avr_memory(symbols, artifact, elf):
             and values["__stack"] == AVR_RAM_END - 1):
         raise ValueError("Cowgol ATmega328P static workspace/heap exceed SRAM or its 512-byte stack reservation")
     reset = int.from_bytes(image[2:4], "little") * 2
-    if not (104 <= reset < values["__data_load_start"] <= values["__data_load_end"] == len(image) <= AVR_FLASH_LIMIT
+    if not (104 <= reset < values["__data_load_start"] <= values["__data_load_end"] == len(image) <= flash_limit
             and values["__data_load_end"] - values["__data_load_start"] == data_end - data_start):
         raise ValueError("Cowgol ATmega328P flash/data layout does not match its HEX image")
-    return {"flash_end": len(image), "flash_limit": AVR_FLASH_LIMIT,
+    return {"flash_end": len(image), "flash_limit": flash_limit,
             "data_start": data_start, "data_end": data_end, "bss_end": bss_end,
             "heap_start": heap_start, "heap_end": heap_end, "stack_start": AVR_STATIC_END,
             "stack_reserve": AVR_STACK_RESERVE, "ram_end": AVR_RAM_END,
@@ -396,7 +402,7 @@ def build_cowgol(req):
                         if spec.get("cross") == "riscv32"
                         else "install the Cowgol bundle and the service's AVR GCC/avr-libc runtime"
                         if spec.get("cross") == "atmega328p" else "run scripts/build-cowgol-bundle.py")
-        return {"success": False, "stage": "toolchain", "toolchain": "cowgol-" + spec.get("cross", spec["family"]),
+        return {"success": False, "stage": "toolchain", "toolchain": "cowgol-" + spec.get("toolchain", spec.get("cross", spec["family"])),
                 "error": f"Cowgol toolchain for {target} is not installed; {installation}"}
     try:
         bundle = _stage_bundle(bundle_root())
@@ -488,12 +494,12 @@ def build_cowgol(req):
                     run([cross_root / "bin/avr-gcc", "-mmcu=atmega328p", "-DF_CPU=16000000UL",
                          "-std=gnu99", "-Os", "-fwrapv", "-fno-strict-aliasing",
                          "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
-                         f"-Wl,--defsym=__TEXT_REGION_LENGTH__={AVR_FLASH_LIMIT}",
+                         f"-Wl,--defsym=__TEXT_REGION_LENGTH__={spec['flash_limit']}",
                          f"-Wl,--defsym=__DATA_REGION_LENGTH__={AVR_STATIC_END - AVR_RAM_START}",
                          c_source, "-o", elf], env=env)
                     run([cross_root / "bin/avr-objcopy", "-j", ".text", "-j", ".data", "-O", "ihex", elf, output], env=env)
                     symbols = run([cross_root / "bin/avr-objdump", "-t", elf], env=env, capture_log=False)
-                    memory_layout = avr_memory(symbols, output.read_bytes(), elf.read_bytes())
+                    memory_layout = avr_memory(symbols, output.read_bytes(), elf.read_bytes(), spec["flash_limit"])
             else:
                 assembly = work / ("main.asm" if family in ("msdos", "eater6502") else "main.z80")
                 run([bundle / f"bin/cowlink-{family}", "-o", assembly, coo, bundle / f"rt/{family}/cowgol.coo"])
@@ -528,7 +534,7 @@ def build_cowgol(req):
             response = {"success": True, "base64": base64.b64encode(artifact).decode("ascii"),
                         "filename": output.name, "bytes": len(artifact), "log": "".join(logs),
                         "language": "cowgol", "target": target, "format": spec["format"],
-                        "toolchain": "cowgol-" + spec.get("cross", family),
+                        "toolchain": "cowgol-" + spec.get("toolchain", spec.get("cross", family)),
                         "compiler_commit": status["commit"],
                         "artifact_kind": "source" if family == "cgen" and not spec.get("cross") else "executable"}
             if spec.get("origin") == 0x100:
@@ -550,8 +556,9 @@ def build_cowgol(req):
                                 memory="RV32 console: code and static workspace below $3F8000; 64 KiB Cowgol arena; 32 KiB stack reservation")
             if spec.get("cross") == "atmega328p":
                 response.update(origin=0, entry=0, mcu="atmega328p", f_cpu=16000000, uart_baud=9600,
+                                board=spec["board"], bootloader_reserve=0x8000 - spec["flash_limit"],
                                 memory_end=memory_layout["bss_end"], memory_layout=memory_layout,
-                                memory=(f"ATmega328P flash {memory_layout['flash_end']}/{AVR_FLASH_LIMIT} bytes; "
+                                memory=(f"{spec['board']} ATmega328P flash {memory_layout['flash_end']}/{spec['flash_limit']} bytes; "
                                         f"static SRAM {memory_layout['bss_end'] - AVR_RAM_START}/1536 bytes "
                                         "including 512-byte heap; 512-byte C stack reserved"))
             if family == "cgen" and not spec.get("cross"):

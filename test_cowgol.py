@@ -76,7 +76,7 @@ class CowgolBoundaryTests(unittest.TestCase):
         self.assertIsNotNone(cowgol.reject_source("\0", "cgen"))
 
     def test_riscv_refuses_filesystem_header_before_compiling(self):
-        for target, output_format in (("riscv32", "elf"), ("eater6502", "bin"), ("atmega328p", "hex")):
+        for target, output_format in (("riscv32", "elf"), ("eater6502", "bin"), ("atmega328p", "hex"), ("arduino-nano", "hex")):
             with self.subTest(target=target):
                 result = cowgol.build_cowgol(request(target=target, format=output_format, code='include "file.coh";'))
                 self.assertFalse(result["success"])
@@ -102,6 +102,7 @@ class CowgolBoundaryTests(unittest.TestCase):
         self.assertEqual(cowgol.avr_hex(artifact), image)
         layout = cowgol.avr_memory(listing(), artifact, elf)
         self.assertEqual((layout["heap_end"] - layout["heap_start"], layout["stack_reserve"]), (512, 512))
+        self.assertEqual(cowgol.avr_memory(listing(), artifact, elf, 0x7800)["flash_limit"], 30720)
         for changes in ({"__bss_end": 0x800701}, {"__stack": 0x6ff}, {"ram": 0x800500},
                         {"__data_load_end": 112}, {"cowgol_avr_halted": 0x800230}, {"__data_load_start": 104}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
@@ -115,6 +116,28 @@ class CowgolBoundaryTests(unittest.TestCase):
         struct.pack_into("<H", wrong_cpu, 18, 243)
         with self.assertRaises(ValueError):
             cowgol.avr_memory(listing(), artifact, wrong_cpu)
+
+    def test_nano_has_an_independent_30_kib_flash_boundary(self):
+        self.assertNotIn("arduino-nano", cowgol.ALIASES)
+        self.assertEqual(cowgol.TARGETS["arduino-nano"]["flash_limit"], 30720)
+        self.assertEqual(cowgol.TARGETS["arduino-nano"]["board"], "arduino-nano")
+        def hex_image(size):
+            image = bytearray(size)
+            image[:4] = b"\x0c\x94\x34\x00"
+            records = []
+            for address in range(0, size, 16):
+                data = image[address:address + 16]
+                payload = bytes([len(data), address >> 8, address & 255, 0]) + data
+                records.append(":" + (payload + bytes([-sum(payload) & 255])).hex().upper())
+            return ("\n".join(records) + "\n:00000001FF\n").encode()
+        self.assertEqual(len(cowgol.avr_hex(hex_image(0x7800), 0x7800)), 0x7800)
+        # An image fitting the Uno is not necessarily safe for either Nano bootloader.
+        larger = hex_image(0x7802)
+        self.assertEqual(len(cowgol.avr_hex(larger)), 0x7802)
+        with self.assertRaisesRegex(ValueError, "exceeds flash"):
+            cowgol.avr_hex(larger, 0x7800)
+        with self.assertRaisesRegex(ValueError, "qualified flash boundary"):
+            cowgol.avr_hex(larger, 0x8000)
 
     def test_eater_rom_requires_ram_relocation_and_vector_evidence(self):
         labels = {"LOMEM": 0x240, "eater_workspace_end": 0x230, "eater_zp_end": 38,
@@ -216,12 +239,14 @@ class CowgolBoundaryTests(unittest.TestCase):
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_text("test bundle marker")
             (directory / "manifest.json").write_text(json.dumps({"schema": 1,
-                "source_commit": "1" * 40, "targets": ["cowgol-cgen", "atmega328p"]}))
+                "source_commit": "1" * 40, "targets": ["cowgol-cgen", "atmega328p", "arduino-nano"]}))
             with patch.object(cowgol, "_avr_toolchain", return_value=None):
                 self.assertEqual(set(cowgol.bundle_status()["targets"]), {"cowgol-cgen"})
-                result = cowgol.build_cowgol(request(target="atmega328p", format="hex"))
-                self.assertEqual(result["stage"], "toolchain")
-                self.assertIn("AVR GCC/avr-libc", result["error"])
+                for target in ("atmega328p", "arduino-nano"):
+                    result = cowgol.build_cowgol(request(target=target, format="hex"))
+                    self.assertEqual(result["stage"], "toolchain")
+                    self.assertEqual(result["toolchain"], "cowgol-" + target)
+                    self.assertIn("AVR GCC/avr-libc", result["error"])
 
     def test_corrupt_bundle_fails_content_hash(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -470,25 +495,32 @@ bw_print_number(2147483647 as int32);
 
 
 class CowgolAVRCompilerTests(unittest.TestCase):
+    target = "atmega328p"
+    board = "arduino-uno"
+    flash_limit = 0x7e00
+
     @classmethod
     def setUpClass(cls):
-        if "atmega328p" not in cowgol.bundle_status()["targets"]:
+        if cls.target not in cowgol.bundle_status()["targets"]:
             if os.environ.get("REQUIRE_COWGOL_TOOLCHAIN") == "1":
-                raise AssertionError("CI requires the Cowgol ATmega328P target and AVR GCC")
-            raise unittest.SkipTest("Cowgol ATmega328P bundle is not installed")
+                raise AssertionError(f"CI requires the Cowgol {cls.target} target and AVR GCC")
+            raise unittest.SkipTest(f"Cowgol {cls.target} bundle is not installed")
 
     def compile(self, source):
-        result = cowgol.build_cowgol(request(target="atmega328p", format="hex", code=source))
+        result = cowgol.build_cowgol(request(target=self.target, format="hex", code=source))
         self.assertTrue(result["success"], result)
         self.assertEqual((result["language"], result["target"], result["format"], result["toolchain"]),
-                         ("cowgol", "atmega328p", "hex", "cowgol-atmega328p"))
+                         ("cowgol", self.target, "hex", "cowgol-" + self.target))
         self.assertEqual((result["artifact_kind"], result["filename"]), ("executable", "main.hex"))
         self.assertEqual((result["origin"], result["entry"], result["f_cpu"], result["uart_baud"]),
                          (0, 0, 16000000, 9600))
         artifact = base64.b64decode(result["base64"], validate=True)
         self.assertEqual(len(artifact), result["bytes"])
         layout = result["memory_layout"]
-        self.assertEqual(len(cowgol.avr_hex(artifact)), layout["flash_end"])
+        self.assertEqual(result["board"], self.board)
+        self.assertEqual(result["bootloader_reserve"], 0x8000 - self.flash_limit)
+        self.assertEqual(layout["flash_limit"], self.flash_limit)
+        self.assertEqual(len(cowgol.avr_hex(artifact, self.flash_limit)), layout["flash_end"])
         self.assertEqual(result["memory_end"], layout["bss_end"])
         self.assertLessEqual(layout["bss_end"], 0x700)
         self.assertEqual(layout["heap_end"] - layout["heap_start"], 512)
@@ -586,11 +618,18 @@ bw_digital_toggle(19); bw_pin_mode(19, 1); bw_print_number(bw_digital_read(19));
             ('var large: uint8[1600]; MemSet(&large[0], 1, @bytesof large); print_i8(large[0]);', "data"),
         ):
             with self.subTest(body=body):
-                result = cowgol.build_cowgol(request(target="atmega328p", format="hex", code='include "cowgol.coh";' + body))
+                result = cowgol.build_cowgol(request(target=self.target, format="hex", code='include "cowgol.coh";' + body))
                 self.assertFalse(result["success"])
                 self.assertEqual(result["stage"], "compile")
                 self.assertIn(diagnostic, result.get("log", "") + result.get("error", ""))
                 self.assertNotIn("base64", result)
+
+
+class CowgolNanoCompilerTests(CowgolAVRCompilerTests):
+    """Execute the complete AVR contract with Nano's independent linker bounds."""
+    target = "arduino-nano"
+    board = "arduino-nano"
+    flash_limit = 0x7800
 
 
 class CowgolEater6502CompilerTests(unittest.TestCase):

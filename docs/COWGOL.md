@@ -17,6 +17,7 @@ user programs on the server.
 | `riscv32` | `elf` | `main.elf` plus loadable `image` | Cowgol C backend → pinned GCC/picolibc → Brickwright RV32IMAC console machine |
 | `eater6502` | `bin` | `main.bin`, exactly 32768 bytes | Native 65C02 ROM for the canonical Brickwright EATER6502 map; ACIA console and VIA digital GPIO |
 | `atmega328p` | `hex` | `main.hex`, validated Intel HEX | Cowgol C backend → AVR GCC/avr-libc → 16 MHz Uno, 9600-baud UART, digital GPIO and blocking delays |
+| `arduino-nano` | `hex` | `main.hex`, validated Intel HEX | Classic ATmega328P Nano at 16 MHz; UART, digital GPIO and delays; separate 30 KiB application-flash contract |
 
 `cowgol-c`, `cgen`, `cowgol-z80-cpm`, `8080-cpm`, `cowgol-8080-cpm`, and
 `i8086-dos` are aliases; `arduino-uno` selects `atmega328p`. Requesting an unrelated machine such as an STC part
@@ -114,7 +115,7 @@ output. Toggle changes the stored output latch even when an input reads low.
 Invalid coordinates or modes print a diagnostic and halt with failure status.
 Timers, pullups, analog/PWM and canvas calls have no native binding.
 
-### ATmega328P / Uno
+### ATmega328P / Uno and classic Nano
 
 The `atmega328p` route uses cgen and the service's existing AVR GCC/avr-libc
 bundle. It returns `toolchain: "cowgol-atmega328p"`, `format: "hex"`,
@@ -158,6 +159,26 @@ This synchronous delay keeps interrupts disabled and supplies a minimum wait
 at the fixed 16 MHz clock. It does not supply a scheduler or a `bw_millis` clock.
 Compiler-service tests measure the actual GPIO edges around 0, 1 and 7 ms waits
 after repeated cold starts, as well as refusal of negative delays.
+
+The distinct `arduino-nano` target returns `toolchain: "cowgol-arduino-nano"`,
+`board: "arduino-nano"`, `bootloader_reserve: 2048` and
+`memory_layout.flash_limit: 30720`. It uses the same ATmega328P runtime at
+16 MHz, but the linker and HEX/ELF validation independently limit application
+flash to `$0000–$77FF`. The final 2 KiB stay reserved for either of the classic
+Nano ATmega328P bootloader variants, following the
+[Arduino AVR board definitions](https://github.com/arduino/ArduinoCore-avr/blob/master/boards.txt).
+The Uno response now also identifies `board: "arduino-uno"` and its 512-byte
+reservation. The Nano profile must be explicitly present in the bundle manifest;
+an installed Uno profile does not silently enable it.
+
+Nano retains the exact SRAM, heap, stack, GPIO and UART contracts above. A6/A7
+are analog-only package pins and have no digital binding; analog/PWM operations
+remain unavailable. ATmega168 Nano, Nano Every, Nano 33 and other board families
+are not part of this target. The complete AVR execution suite also runs with the
+Nano build target, including repeated cold starts, arrays/allocation, serial
+input, GPIO transitions, delay timing and failure paths. These tests boot the
+compiled application on the CPU model; physical flashing and bootloader serial
+transport are not qualified by this software execution test.
 
 Arrays, records, pointers, nested calls, integer division, allocation/free and
 empty arguments are available through the full compiler. Filesystem includes
@@ -238,7 +259,8 @@ python3 scripts/build-cowgol-bundle.py --targets cowgol-cgen riscv32
 That subset requires Python, a host C compiler, and Git if a checkout is not
 supplied. The manifest advertises only selected targets. RV32 also requires
 the already-vendored GCC, picolibc and console runtime; health omits RV32 if
-those are absent. The default builds all six targets.
+those are absent. The default builds all eight targets, including the distinct
+Uno and classic Nano board profiles.
 
 For a reproducible source checkout and machine execution tests:
 
