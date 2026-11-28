@@ -50,7 +50,7 @@ jobs:
           git -C /tmp/cowgol-source checkout --detach FETCH_HEAD
       - name: Build and hash the real compiler bundle
         run: python3 scripts/build-cowgol-bundle.py --source /tmp/cowgol-source --oracles
-      - name: Execute Cowgol output on C, CP/M, DOS, RV32, EATER6502, Uno and Nano
+      - name: Execute Cowgol output on C, CP/M, DOS, RV32, EATER6502, Uno, Nano and bare ATmega168P
         env:
           REQUIRE_COWGOL_TOOLCHAIN: "1"
           COWGOL_CPMEMU: /tmp/cowgol-source/bin/cpmemu

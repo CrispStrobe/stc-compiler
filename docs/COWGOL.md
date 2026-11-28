@@ -18,6 +18,7 @@ user programs on the server.
 | `eater6502` | `bin` | `main.bin`, exactly 32768 bytes | Native 65C02 ROM for the canonical Brickwright EATER6502 map; ACIA console and VIA digital GPIO |
 | `atmega328p` | `hex` | `main.hex`, validated Intel HEX | Cowgol C backend → AVR GCC/avr-libc → 16 MHz Uno, 9600-baud UART, digital GPIO and blocking delays |
 | `arduino-nano` | `hex` | `main.hex`, validated Intel HEX | Classic ATmega328P Nano at 16 MHz; UART, digital GPIO and delays; separate 30 KiB application-flash contract |
+| `atmega168p` | `hex` | `main.hex`, validated Intel HEX | Bare ATmega168P at 16 MHz; 16 KiB flash, 1 KiB SRAM, 128-byte heap, no bootloader reservation |
 
 `cowgol-c`, `cgen`, `cowgol-z80-cpm`, `8080-cpm`, `cowgol-8080-cpm`, and
 `i8086-dos` are aliases; `arduino-uno` selects `atmega328p`. Requesting an unrelated machine such as an STC part
@@ -27,8 +28,8 @@ tested 32-bit runtime profile and the ATmega328P route has its own bounded
 16-bit-pointer binding. C output alone does not qualify other SDCC, AVR or
 cc65 boards.
 
-The service's browser demo exposes all eight targets when **Cowgol** is
-selected. Its AVR entries identify Arduino Uno and classic ATmega328P Nano
+The service's browser demo exposes all nine targets when **Cowgol** is
+selected. Its AVR entries identify Arduino Uno, classic ATmega328P Nano and bare ATmega168P
 separately, choose Intel HEX automatically, and retain the fixed runtime clock.
 The format selector follows the target in Cowgol mode. Switching back to C
 retains the shared `atmega328p` MCU target, while Nano's board name remains an
@@ -148,7 +149,8 @@ other record types and reset jumps outside executable flash are refused.
 
 `memory_layout` contains `flash_end`, `flash_limit` (32256), `data_start`
 (256), `data_end`, `bss_end`, `heap_start`, `heap_end`, `stack_start` (1792),
-`stack_reserve` (512), and `ram_end` (2304), all in bytes. `memory_end` equals
+`stack_reserve` (512), and `ram_end` (2304), all in bytes. It also carries
+`mcu: "atmega328p"`, `flash_size: 32768` and `heap_size: 512`. `memory_end` equals
 `bss_end`; `heap_end - heap_start` is 512. `halted_addr` and `status_addr`
 identify the actual guest-written bytes used by the execution oracle.
 The initialized data's flash copy follows code, so executable flash ends at
@@ -195,6 +197,42 @@ remain unresolved linker errors. This port is fixed to the declared chip and
 clock; no other AVR board or Arduino core is inferred. Tests execute from
 nonzero SRAM and measure the fixture's stack use; arbitrary pointer writes
 and call depth, and physical-board behavior, remain outside that proof.
+
+### Bare ATmega168P
+
+The separate `atmega168p` target compiles with `-mmcu=atmega168p` and the
+actual chip's avr-libc startup. It is fixed to **16 MHz** and returns
+`toolchain: "cowgol-atmega168p"`, `mcu: "atmega168p"`,
+`board: "atmega168p"`, `format: "hex"`, `origin: 0`, `entry: 0`,
+`f_cpu: 16000000`, `uart_baud: 9600`, and `bootloader_reserve: 0`.
+The bare-chip contract uses all **16384 bytes of flash**. It does not infer an
+Arduino bootloader, program fuses, or qualify a different ATmega168 variant.
+
+Its SRAM is **1024 bytes**, from `$0100` through `$04FF`. The lower
+512 bytes hold initialized data, BSS, generated workspace and the **128-byte
+allocation arena**. The upper 512 bytes remain reserved for the C stack.
+Linker region limits and independent ELF/symbol/HEX validation enforce those
+bounds before an artifact is returned. An Uno artifact is never accepted by
+relabeling its MCU or flash limit.
+
+| `memory_layout` field | ATmega168P value |
+| --- | --- |
+| `mcu` | `atmega168p` |
+| `flash_size`, `flash_limit` | 16384 |
+| `ram_end` | 1280 (`$0500`, exclusive) |
+| `stack_start`, maximum `bss_end` | 768 (`$0300`) |
+| `stack_reserve` | 512 |
+| `heap_size`, `heap_end - heap_start` | 128 |
+
+Console input/output, digital pins 2–19, input pull-ups, latch toggles and
+blocking millisecond waits use the same qualified peripheral behavior as the
+328P family. The smaller arena has an explicit cost: allocation requests
+that fit on Uno may fail on 168P. Service execution tests allocate/reuse small
+blocks, reject a 129-byte allocation, and reject static storage beyond the
+smaller bound. The full-source arithmetic/array witness boots twice from cold
+SRAM on an emulator configured with actual 16 KiB flash and 1 KiB SRAM.
+
+### Standalone C
 
 For C output, the response includes both the base64 artifact and `c` text,
 with `source_language: "c"`. Its runtime and Brickwright host declarations
@@ -267,7 +305,7 @@ python3 scripts/build-cowgol-bundle.py --targets cowgol-cgen riscv32
 That subset requires Python, a host C compiler, and Git if a checkout is not
 supplied. The manifest advertises only selected targets. RV32 also requires
 the already-vendored GCC, picolibc and console runtime; health omits RV32 if
-those are absent. The default builds all eight targets, including the distinct
+those are absent. The default builds all nine targets, including the distinct
 Uno and classic Nano board profiles.
 
 For a reproducible source checkout and machine execution tests:

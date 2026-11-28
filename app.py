@@ -3227,7 +3227,7 @@ PAGE = r"""<!doctype html>
       </optgroup>
       <optgroup label="AVR (avr-gcc)">
         <option value=atmega328p data-cowgol-label="Arduino Uno (ATmega328P, .HEX)">ATmega328P &mdash; Uno / Nano</option>
-        <option value=atmega168p>ATmega168P</option>
+        <option value=atmega168p data-cowgol-label="Bare ATmega168P (16 KiB flash, .HEX)">ATmega168P</option>
         <option value=atmega2560>ATmega2560 &mdash; Mega</option>
         <option value=attiny85>ATtiny85</option>
         <option value=attiny88>ATtiny88</option>
@@ -3486,9 +3486,9 @@ const STARTERS = {c: $('code').value, pseudocode: __PSEUDO_EXAMPLE__,
                   cowgol: 'include "cowgol.coh";\nprint("Hello from Cowgol!\\n");\n'};
 const cowgolFormats = Object.freeze({
   'z80-cpm': 'bin', 'i8080-cpm': 'bin', dos: 'bin', riscv32: 'elf',
-  eater6502: 'bin', 'cowgol-cgen': 'c', atmega328p: 'hex', 'arduino-nano': 'hex',
+  eater6502: 'bin', 'cowgol-cgen': 'c', atmega328p: 'hex', 'arduino-nano': 'hex', atmega168p: 'hex',
 });
-// These six menu entries are reserved for Cowgol. The two AVR entries also
+// These six menu entries are reserved for Cowgol. The three AVR entries also
 // serve their existing C/Arduino routes, so membership in cowgolFormats alone
 // must not disable them when the language changes.
 const cowgolOnlyTargets = new Set(['z80-cpm', 'i8080-cpm', 'dos', 'riscv32', 'eater6502', 'cowgol-cgen']);

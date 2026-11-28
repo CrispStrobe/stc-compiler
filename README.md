@@ -128,7 +128,9 @@ Source is capped at 1 MB (4 MB across a whole project).
 `.EXE` files, RISC-V console `.ELF` executables compiled via C, and standalone
 C source export. A native EATER6502 route emits 65C02 ROMs with ACIA console
 and VIA digital GPIO. Explicit Uno and classic Nano profiles produce validated
-ATmega328P HEX with separate bootloader flash reservations. Their format/target combinations,
+ATmega328P HEX with separate bootloader flash reservations. A bare ATmega168P
+profile adds an exact 16 KiB flash / 1 KiB SRAM contract with a 128-byte heap.
+Their format/target combinations,
 portable console bridge, exact compiler source pin, installation and machine
 execution checks are documented in [Cowgol compiler service](docs/COWGOL.md).
 
