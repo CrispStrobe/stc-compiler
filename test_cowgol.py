@@ -76,11 +76,45 @@ class CowgolBoundaryTests(unittest.TestCase):
         self.assertIsNotNone(cowgol.reject_source("\0", "cgen"))
 
     def test_riscv_refuses_filesystem_header_before_compiling(self):
-        for target, output_format in (("riscv32", "elf"), ("eater6502", "bin")):
+        for target, output_format in (("riscv32", "elf"), ("eater6502", "bin"), ("atmega328p", "hex")):
             with self.subTest(target=target):
                 result = cowgol.build_cowgol(request(target=target, format=output_format, code='include "file.coh";'))
                 self.assertFalse(result["success"])
                 self.assertEqual(result["stage"], "source")
+
+    def test_avr_hex_and_elf_layout_require_matching_memory_evidence(self):
+        image = bytearray(110)
+        image[:4] = b"\x0c\x94\x34\x00"  # JMP $0068 after 26 four-byte vectors
+        def record(address, kind, data=b""):
+            payload = bytes([len(data), address >> 8, address & 255, kind]) + data
+            return ":" + (payload + bytes([-sum(payload) & 255])).hex().upper() + "\n"
+        artifact = ("".join(record(address, 0, image[address:address + 16])
+                           for address in range(0, len(image), 16)) + record(0, 1)).encode()
+        elf = bytearray(52)
+        elf[:7] = b"\x7fELF\x01\x01\x01"
+        struct.pack_into("<HHI", elf, 16, 2, 83, 1)
+        values = {"__data_start": 0x800100, "__data_end": 0x800102, "__bss_end": 0x800420,
+                  "__data_load_start": 108, "__data_load_end": 110, "__stack": 0x8ff,
+                  "ram": 0x800220, "cowgol_avr_halted": 0x800210, "cowgol_avr_status": 0x800211}
+        def listing(changes=None, sizes=None):
+            return "\n".join(f"{value:08x} g O .bss {dict(ram=512, cowgol_avr_halted=1, cowgol_avr_status=1, **(sizes or {})).get(name, 0):08x} {name}"
+                              for name, value in {**values, **(changes or {})}.items())
+        self.assertEqual(cowgol.avr_hex(artifact), image)
+        layout = cowgol.avr_memory(listing(), artifact, elf)
+        self.assertEqual((layout["heap_end"] - layout["heap_start"], layout["stack_reserve"]), (512, 512))
+        for changes in ({"__bss_end": 0x800701}, {"__stack": 0x6ff}, {"ram": 0x800500},
+                        {"__data_load_end": 112}, {"cowgol_avr_halted": 0x800230}, {"__data_load_start": 104}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                cowgol.avr_memory(listing(changes), artifact, elf)
+        for invalid in (artifact.replace(b"0C94", b"0C95", 1), artifact[:-12],
+                        artifact + record(0, 0, b"x").encode(), artifact.replace(b":00000001FF", b":00000001FE"),
+                        (record(0, 2, b"\x00\x00") + artifact.decode()).encode()):
+            with self.assertRaises(ValueError):
+                cowgol.avr_hex(invalid)
+        wrong_cpu = elf.copy()
+        struct.pack_into("<H", wrong_cpu, 18, 243)
+        with self.assertRaises(ValueError):
+            cowgol.avr_memory(listing(), artifact, wrong_cpu)
 
     def test_eater_rom_requires_ram_relocation_and_vector_evidence(self):
         labels = {"LOMEM": 0x240, "eater_workspace_end": 0x230, "eater_zp_end": 38,
@@ -174,6 +208,21 @@ class CowgolBoundaryTests(unittest.TestCase):
                 self.assertEqual(result["stage"], "toolchain")
                 self.assertIn("riscv-gcc/picolibc", result["error"])
 
+    def test_missing_avr_gcc_is_explicit_and_does_not_hide_c_export(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"COWGOL_BUNDLE": temporary}):
+            directory = Path(temporary)
+            for name in cowgol._required(cowgol.TARGETS["atmega328p"])[0]:
+                output = directory / name
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text("test bundle marker")
+            (directory / "manifest.json").write_text(json.dumps({"schema": 1,
+                "source_commit": "1" * 40, "targets": ["cowgol-cgen", "atmega328p"]}))
+            with patch.object(cowgol, "_avr_toolchain", return_value=None):
+                self.assertEqual(set(cowgol.bundle_status()["targets"]), {"cowgol-cgen"})
+                result = cowgol.build_cowgol(request(target="atmega328p", format="hex"))
+                self.assertEqual(result["stage"], "toolchain")
+                self.assertIn("AVR GCC/avr-libc", result["error"])
+
     def test_corrupt_bundle_fails_content_hash(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -215,9 +264,10 @@ class CowgolBoundaryTests(unittest.TestCase):
 class CowgolCompilerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if set(cowgol.bundle_status()["targets"]) != set(cowgol.TARGETS):
+        required = {"cowgol-cgen", "z80-cpm", "i8080-cpm", "dos"}
+        if not required <= set(cowgol.bundle_status()["targets"]):
             if os.environ.get("REQUIRE_COWGOL_TOOLCHAIN") == "1":
-                raise AssertionError("CI requires every pinned Cowgol target; build the bundle first")
+                raise AssertionError("CI requires the pinned C, CP/M and DOS Cowgol targets; build the bundle first")
             raise unittest.SkipTest("Cowgol bundle is not installed")
 
     def compile(self, target, **values):
@@ -417,6 +467,104 @@ bw_print_number(2147483647 as int32);
         self.assertEqual(result["stage"], "compile")
         self.assertRegex((result.get("error", "") + result.get("log", "")).lower(),
                          "workspace|array|overflow|too large")
+
+
+class CowgolAVRCompilerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if "atmega328p" not in cowgol.bundle_status()["targets"]:
+            if os.environ.get("REQUIRE_COWGOL_TOOLCHAIN") == "1":
+                raise AssertionError("CI requires the Cowgol ATmega328P target and AVR GCC")
+            raise unittest.SkipTest("Cowgol ATmega328P bundle is not installed")
+
+    def compile(self, source):
+        result = cowgol.build_cowgol(request(target="atmega328p", format="hex", code=source))
+        self.assertTrue(result["success"], result)
+        self.assertEqual((result["language"], result["target"], result["format"], result["toolchain"]),
+                         ("cowgol", "atmega328p", "hex", "cowgol-atmega328p"))
+        self.assertEqual((result["artifact_kind"], result["filename"]), ("executable", "main.hex"))
+        self.assertEqual((result["origin"], result["entry"], result["f_cpu"], result["uart_baud"]),
+                         (0, 0, 16000000, 9600))
+        artifact = base64.b64decode(result["base64"], validate=True)
+        self.assertEqual(len(artifact), result["bytes"])
+        layout = result["memory_layout"]
+        self.assertEqual(len(cowgol.avr_hex(artifact)), layout["flash_end"])
+        self.assertEqual(result["memory_end"], layout["bss_end"])
+        self.assertLessEqual(layout["bss_end"], 0x700)
+        self.assertEqual(layout["heap_end"] - layout["heap_start"], 512)
+        self.assertEqual(layout["stack_reserve"], 512)
+        return result
+
+    def run_program(self, result, **options):
+        runner, node = os.environ.get("COWGOL_AVR_RUNNER"), shutil.which("node")
+        if not node or not runner or not Path(runner).is_file() or not os.environ.get("AVR8JS_ROOT"):
+            if os.environ.get("REQUIRE_COWGOL_TOOLCHAIN") == "1":
+                self.fail("CI requires COWGOL_AVR_RUNNER, AVR8JS_ROOT and Node for AVR execution")
+            self.skipTest("set COWGOL_AVR_RUNNER and AVR8JS_ROOT for real AVR execution")
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact, layout = Path(temporary) / "main.hex", Path(temporary) / "layout.json"
+            artifact.write_bytes(base64.b64decode(result["base64"], validate=True))
+            layout.write_text(json.dumps(result["memory_layout"]))
+            process = subprocess.run([node, runner, str(artifact), str(layout), json.dumps(options)],
+                                     capture_output=True, text=True, timeout=20, check=True)
+            runs = json.loads(process.stdout)["runs"]
+            for run in runs:
+                self.assertTrue(run["stopped"], run)
+                self.assertTrue(run["flashUnchanged"])
+                self.assertGreaterEqual(run["minSP"], 0x700)
+                self.assertEqual(run["uart"], {"ubrr": 103, "ucsrb": 24, "ucsrc": 6})
+            return runs
+
+    def test_full_source_console_allocations_arrays_and_signed_limits_execute(self):
+        source = '''include "cowgol.coh"; include "brickwright.coh";
+include "malloc.coh"; include "argv.coh";
+var values: int32[] := {21, 30, -9};
+var pointer := &values[0];
+var total: int32 := [pointer] + values[1] + values[2];
+bw_print_text("AVR Cowgol"); bw_print_number(total / 2);
+var block := Alloc(400); [block] := 42; bw_print_number([block] as int32);
+Free(block);
+if RawAlloc(65544) != nil then ExitWithError(); end if;
+ArgvInit(); if ArgvNext() != nil then ExitWithError(); end if;
+bw_print_number(-2147483648); bw_print_number(2147483647);
+'''
+        runs = self.run_program(self.compile(source), runs=2)
+        for run in runs:
+            self.assertEqual((run["status"], run["text"]),
+                             (0, "AVR Cowgol\n21\n42\n-2147483648\n2147483647\n"))
+
+    def test_serial_input_gpio_and_output_latch_execute(self):
+        source = '''include "cowgol.coh"; include "brickwright.coh";
+print_char(get_char()); print_nl();
+bw_pin_mode(2, 0); bw_print_number(bw_digital_read(2));
+bw_pin_mode(13, 1); bw_digital_write(13, 1);
+bw_pin_mode(19, 2); bw_print_number(bw_digital_read(19));
+bw_digital_toggle(19); bw_pin_mode(19, 1); bw_print_number(bw_digital_read(19));
+'''
+        run = self.run_program(self.compile(source), input="Z", pins={"2": True, "19": False})[0]
+        self.assertEqual((run["status"], run["text"]), (0, "Z\n1\n0\n0\n"))
+        self.assertEqual(run["registers"]["B"]["port"], 32)
+        self.assertEqual(run["registers"]["C"]["port"], 0)
+        self.assertEqual(run["registers"]["C"]["ddr"], 32)
+
+    def test_reserved_serial_pin_fails_in_the_machine(self):
+        run = self.run_program(self.compile('include "cowgol.coh"; include "brickwright.coh"; bw_digital_toggle(1);'))[0]
+        self.assertEqual(run["status"], 1)
+        self.assertIn("reserved for serial", run["text"])
+
+    def test_unimplemented_peripherals_and_static_workspace_overflow_are_refused(self):
+        for body, diagnostic in (
+            ('include "brickwright.coh"; bw_delay(1);', "cowgol_bw_delay"),
+            ('include "brickwright.coh"; bw_analog_write(3, 100);', "cowgol_bw_analog_write"),
+            ('include "brickwright.coh"; bw_canvas_clear(0);', "cowgol_bw_canvas_clear"),
+            ('var large: uint8[1600]; MemSet(&large[0], 1, @bytesof large); print_i8(large[0]);', "data"),
+        ):
+            with self.subTest(body=body):
+                result = cowgol.build_cowgol(request(target="atmega328p", format="hex", code='include "cowgol.coh";' + body))
+                self.assertFalse(result["success"])
+                self.assertEqual(result["stage"], "compile")
+                self.assertIn(diagnostic, result.get("log", "") + result.get("error", ""))
+                self.assertNotIn("base64", result)
 
 
 class CowgolEater6502CompilerTests(unittest.TestCase):

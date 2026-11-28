@@ -20,9 +20,9 @@ import tempfile
 
 REPOSITORY = "https://github.com/CrispStrobe/cowgol.git"
 # Updated only after the corresponding fork checkpoint is published.
-PINNED_COMMIT = "8e807002bc6d1d457995f2759da262c230d807e1"
+PINNED_COMMIT = "e6ccb675514cd98a40fb5fc8383512e506893cd6"
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ("cowgol-cgen", "z80-cpm", "i8080-cpm", "dos", "riscv32", "eater6502")
+TARGETS = ("cowgol-cgen", "z80-cpm", "i8080-cpm", "dos", "riscv32", "eater6502", "atmega328p")
 NATIVE = {"z80-cpm": ("cpmz", "z80", "ncpmz"),
           "i8080-cpm": ("cpm", "8080", "ncpm"), "dos": ("msdos", "8086", "msdos"),
           "eater6502": ("eater6502", "65c02-rom", "eater6502")}

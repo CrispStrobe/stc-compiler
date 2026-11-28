@@ -16,13 +16,15 @@ user programs on the server.
 | `cowgol-cgen` | `c` | `main.c` | Standalone generated C for a little-endian host |
 | `riscv32` | `elf` | `main.elf` plus loadable `image` | Cowgol C backend → pinned GCC/picolibc → Brickwright RV32IMAC console machine |
 | `eater6502` | `bin` | `main.bin`, exactly 32768 bytes | Native 65C02 ROM for the canonical Brickwright EATER6502 map; ACIA console and VIA digital GPIO |
+| `atmega328p` | `hex` | `main.hex`, validated Intel HEX | Cowgol C backend → AVR GCC/avr-libc → 16 MHz Uno, 9600-baud UART and digital GPIO |
 
 `cowgol-c`, `cgen`, `cowgol-z80-cpm`, `8080-cpm`, `cowgol-8080-cpm`, and
-`i8086-dos` are aliases. Requesting an unrelated machine such as an STC part
+`i8086-dos` are aliases; `arduino-uno` selects `atmega328p`. Requesting an unrelated machine such as an STC part
 returns a target error; it does not feed generic C to an incompatible chip.
 The C runtime uses 64-bit pointer slots and libc. The RV32 route supplies a
-tested 32-bit runtime profile; C output alone does not qualify other SDCC,
-AVR or cc65 boards.
+tested 32-bit runtime profile and the ATmega328P route has its own bounded
+16-bit-pointer binding. C output alone does not qualify other SDCC, AVR or
+cc65 boards.
 
 Example request:
 
@@ -112,6 +114,51 @@ output. Toggle changes the stored output latch even when an input reads low.
 Invalid coordinates or modes print a diagnostic and halt with failure status.
 Timers, pullups, analog/PWM and canvas calls have no native binding.
 
+### ATmega328P / Uno
+
+The `atmega328p` route uses cgen and the service's existing AVR GCC/avr-libc
+bundle. It returns `toolchain: "cowgol-atmega328p"`, `format: "hex"`,
+`mcu: "atmega328p"`, `origin: 0`, `entry: 0`, `f_cpu: 16000000` and
+`uart_baud: 9600`. `base64` encodes the exact ASCII Intel HEX download, and
+`bytes` counts those ASCII bytes. The fixed runtime initializes USART0 for
+9600 baud, 8N1. `get_char` waits for input and exit drains the final output byte.
+
+The linker limits flash to `$0000–$7DFF` (32256 bytes), retaining the Uno's
+512-byte bootloader area. SRAM spans `$0100–$08FF`. Static data, generated
+workspace and a fixed **512-byte heap** must all fit `$0100–$06FF`; the upper
+512 bytes are reserved for the C stack. The allocator is bound to the static
+arena, rather than borrowing the space below the current SP. Its metadata
+also occupies the arena. Allocation lengths are checked before narrowing into
+AVR's 16-bit `size_t`, so a large request cannot silently become a small one.
+
+The service requires an AVR executable ELF with reset entry zero. Real linked
+symbols prove the initialized-data extent, BSS end, heap object and stack
+reservation. The HEX must contain one contiguous flash image, valid record
+lengths/checksums, data records and a single EOF. Sparse/overlapping data,
+other record types and reset jumps outside executable flash are refused.
+
+`memory_layout` contains `flash_end`, `flash_limit` (32256), `data_start`
+(256), `data_end`, `bss_end`, `heap_start`, `heap_end`, `stack_start` (1792),
+`stack_reserve` (512), and `ram_end` (2304), all in bytes. `memory_end` equals
+`bss_end`; `heap_end - heap_start` is 512. `halted_addr` and `status_addr`
+identify the actual guest-written bytes used by the execution oracle.
+The initialized data's flash copy follows code, so executable flash ends at
+`flash_end - (data_end - data_start)`.
+
+GPIO uses Uno coordinates: D2–D13 are pins `2..13`, and A0–A5 are pins
+`14..19`. Pins `0/1` are reserved for UART and fail explicitly if used as
+GPIO. Modes `0` input, `1` output and `2` input with pull-up are supported.
+Read observes `PIN`; write and toggle change `PORT`, the output latch.
+Invalid modes and pin numbers print a diagnostic and stop with failure status.
+
+Arrays, records, pointers, nested calls, integer division, allocation/free and
+empty arguments are available through the full compiler. Filesystem includes
+are refused before compilation. Timing, analog/PWM and graphics callbacks
+remain unresolved linker errors. This port is fixed to the declared chip and
+clock; no other AVR board or Arduino core is inferred. Tests execute from
+nonzero SRAM and measure the fixture's stack use; arbitrary pointer writes
+and call depth, and physical-board behavior, remain outside that proof.
+
 For C output, the response includes both the base64 artifact and `c` text,
 with `source_language: "c"`. Its runtime and Brickwright host declarations
 are included inline, along with Cowgol's complete BSD licence notice, so the
@@ -148,6 +195,9 @@ Cowgol compiler path; it does not silently substitute the pseudocode subset.
 - EATER6502 implements console and digital GPIO against its actual ACIA/VIA,
   including output-latch toggling. Its native ROM tests also cover mutable
   initialized data, nested calls and reset behavior while auditing ROM writes.
+- ATmega328P implements serial console/input, digital GPIO and input pull-ups.
+  Tests execute the returned HEX through avr8js, including cold startup,
+  allocation bounds, signed limits and the reserved serial pins.
 
 ## Build and install
 

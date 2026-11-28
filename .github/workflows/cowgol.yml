@@ -12,6 +12,7 @@ on:
       - "scripts/run-cowgol-riscv.mjs"
       - "scripts/run-cowgol-eater6502.mjs"
       - "riscv-gcc/**"
+      - "avr/**"
       - "Dockerfile"
       - ".github/workflows/cowgol.yml"
   pull_request:
@@ -39,6 +40,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends build-essential git ninja-build lua5.4 bison flex gpp moreutils nasm 64tass libreadline-dev
           pip install --quiet fastapi pydantic
+          npm install --no-save --ignore-scripts --no-audit --no-fund avr8js@0.21.1
       - name: Checkout the exact compiler pin
         run: |
           pin=$(python3 -c "import runpy; print(runpy.run_path('scripts/build-cowgol-bundle.py')['PINNED_COMMIT'])")
@@ -48,12 +50,14 @@ jobs:
           git -C /tmp/cowgol-source checkout --detach FETCH_HEAD
       - name: Build and hash the real compiler bundle
         run: python3 scripts/build-cowgol-bundle.py --source /tmp/cowgol-source --oracles
-      - name: Execute Cowgol output on C, CP/M, DOS, RV32 and EATER6502
+      - name: Execute Cowgol output on C, CP/M, DOS, RV32, EATER6502 and ATmega328P
         env:
           REQUIRE_COWGOL_TOOLCHAIN: "1"
           COWGOL_CPMEMU: /tmp/cowgol-source/bin/cpmemu
           COWGOL_EMU2: /tmp/cowgol-source/bin/emu2
           COWGOL_BW_BOARD: .oracles/bw-board
+          COWGOL_AVR_RUNNER: /tmp/cowgol-source/tests/avr-run.mjs
+          AVR8JS_ROOT: ${{ github.workspace }}/node_modules/avr8js
         run: python3 -m unittest -v test_cowgol
       - name: Archive verified deployment bundle
         run: tar -C vendor -czf cowgol-bundle-linux-x64.tar.gz cowgol
