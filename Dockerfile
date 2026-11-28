@@ -11,7 +11,7 @@ FROM python:3.11-slim-bullseye AS cowgol-build
 COPY scripts/cowgol-bullseye.list /etc/apt/sources.list
 RUN rm -f /etc/apt/sources.list.d/debian.sources
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential git ninja-build lua5.4 bison flex gpp moreutils nasm \
+    build-essential git ninja-build lua5.4 bison flex gpp moreutils nasm 64tass \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY scripts/build-cowgol-bundle.py ./scripts/build-cowgol-bundle.py

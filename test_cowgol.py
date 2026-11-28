@@ -76,9 +76,42 @@ class CowgolBoundaryTests(unittest.TestCase):
         self.assertIsNotNone(cowgol.reject_source("\0", "cgen"))
 
     def test_riscv_refuses_filesystem_header_before_compiling(self):
-        result = cowgol.build_cowgol(request(target="riscv32", format="elf", code='include "file.coh";'))
-        self.assertFalse(result["success"])
-        self.assertEqual(result["stage"], "source")
+        for target, output_format in (("riscv32", "elf"), ("eater6502", "bin")):
+            with self.subTest(target=target):
+                result = cowgol.build_cowgol(request(target=target, format=output_format, code='include "file.coh";'))
+                self.assertFalse(result["success"])
+                self.assertEqual(result["stage"], "source")
+
+    def test_eater_rom_requires_ram_relocation_and_vector_evidence(self):
+        labels = {"LOMEM": 0x240, "eater_workspace_end": 0x230, "eater_zp_end": 38,
+                  "eater_code_end": 0x8110, "eater_data_load": 0x8100, "eater_data_size": 16,
+                  "eater_reset": 0x8000, "eater_irq": 0x8004, "eater_halt": 0x8003}
+        rom = bytearray(b"\xea" * 32768)
+        rom[3] = 0xdb
+        rom[4] = 0x40
+        struct.pack_into("<HHH", rom, 0x7ffa, 0x8004, 0x8000, 0x8004)
+
+        def listing(values):
+            return "\n".join(f"{key} = ${value:x}" if index % 2 else f"{key} = {value}"
+                             for index, (key, value) in enumerate(values.items()))
+
+        self.assertEqual(cowgol.eater_memory(listing(labels), rom)["lomem"], 0x240)
+        for bad in ({"LOMEM": 0x3ff9}, {"eater_workspace_end": 0x100}, {"eater_zp_end": 257},
+                    {"eater_data_size": 17}, {"eater_code_end": 0x10000}, {"eater_reset": 0x8100},
+                    {"eater_irq": 0x8101}):
+            with self.subTest(labels=bad), self.assertRaises(ValueError):
+                cowgol.eater_memory(listing({**labels, **bad}), rom)
+        wrong_vector = rom.copy()
+        struct.pack_into("<H", wrong_vector, 0x7ffc, 0x8100)
+        wrong_halt = rom.copy()
+        wrong_halt[3] = 0xea
+        wrong_irq = rom.copy()
+        wrong_irq[4] = 0xea
+        for candidate in (wrong_vector, wrong_halt, wrong_irq, rom[:-1]):
+            with self.assertRaises(ValueError):
+                cowgol.eater_memory(listing(labels), candidate)
+        with self.assertRaises(ValueError):
+            cowgol.eater_memory(listing(labels) + "\nLOMEM = 576", rom)
 
     def test_riscv_elf_validation_counts_uninitialized_workspace(self):
         # One code segment with eight initialized bytes and eight BSS bytes.
@@ -384,6 +417,103 @@ bw_print_number(2147483647 as int32);
         self.assertEqual(result["stage"], "compile")
         self.assertRegex((result.get("error", "") + result.get("log", "")).lower(),
                          "workspace|array|overflow|too large")
+
+
+class CowgolEater6502CompilerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if "eater6502" not in cowgol.bundle_status()["targets"]:
+            if os.environ.get("REQUIRE_COWGOL_TOOLCHAIN") == "1":
+                raise AssertionError("CI requires the Cowgol EATER6502 ROM compiler")
+            raise unittest.SkipTest("Cowgol EATER6502 bundle is not installed")
+
+    def compile(self, source):
+        result = cowgol.build_cowgol(request(target="eater6502", format="bin", code=source))
+        self.assertTrue(result["success"], result)
+        self.assertEqual((result["language"], result["target"], result["format"], result["toolchain"]),
+                         ("cowgol", "eater6502", "bin", "cowgol-eater6502"))
+        self.assertEqual((result["artifact_kind"], result["filename"]), ("executable", "main.bin"))
+        self.assertEqual((result["origin"], result["entry"], result["bytes"]), (0x8000, 0x8000, 32768))
+        self.assertEqual(result["memory_end"], result["memory_layout"]["lomem"])
+        self.assertLessEqual(result["memory_end"], 0x3ff8)
+        self.assertEqual(len(base64.b64decode(result["base64"], validate=True)), 32768)
+        return result
+
+    def run_program(self, result, **options):
+        board, node = os.environ.get("COWGOL_BW_BOARD"), shutil.which("node")
+        if not node or not board or not (Path(board) / "src/m6502-machine.js").is_file():
+            if os.environ.get("REQUIRE_COWGOL_TOOLCHAIN") == "1":
+                self.fail("CI requires node and COWGOL_BW_BOARD for actual EATER6502 execution")
+            self.skipTest("set COWGOL_BW_BOARD to the pinned machine checkout to execute EATER6502 output")
+        self.assertEqual(subprocess.check_output(["git", "-C", board, "rev-parse", "HEAD"], text=True).strip(), BW_BOARD_PIN)
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "main.bin"
+            binary.write_bytes(base64.b64decode(result["base64"], validate=True))
+            process = subprocess.run([node, str(Path(__file__).parent / "scripts/run-cowgol-eater6502.mjs"),
+                                      str(binary), json.dumps(options)],
+                                     capture_output=True, text=True, timeout=20, check=True)
+            observed = json.loads(process.stdout)
+            self.assertTrue(all(run["stopped"] for run in observed["runs"]), observed)
+            self.assertEqual(observed["romWrites"], [], "a ROM compiler must not write return slots or data into ROM")
+            self.assertTrue(observed["romUnchanged"])
+            return observed
+
+    def test_rom_console_and_mutable_data_execute_after_each_reset(self):
+        source = '''include "cowgol.coh";
+include "brickwright.coh";
+var values: int32[] := {10, 20, 30};
+sub add(a: int32, b: int32): (out: int32) is out := a + b; end sub;
+sub twice(a: int32): (out: int32) is out := add(a, a); end sub;
+values[1] := add(values[0], twice(values[1]));
+bw_print_text("Eater Cowgol");
+bw_print_number(values[1]);
+bw_print_number(values[2] / 3);
+bw_print_number(-2147483647 as int32 - 1);
+bw_print_number(2147483647 as int32);
+'''
+        observed = self.run_program(self.compile(source), runs=2)
+        self.assertEqual([run["text"] for run in observed["runs"]],
+                         ["Eater Cowgol\n50\n10\n-2147483648\n2147483647\n"] * 2)
+        self.assertTrue(all(run["status"] == 0 for run in observed["runs"]))
+
+    def test_via_gpio_runs_with_real_input_and_output_latches(self):
+        source = '''include "cowgol.coh"; include "brickwright.coh";
+bw_pin_mode(0, 1); bw_pin_mode(7, 1); bw_pin_mode(8, 1); bw_pin_mode(15, 1);
+bw_digital_write(0, 1); bw_digital_write(7, 1); bw_digital_write(8, 1); bw_digital_write(15, 1);
+bw_pin_mode(0, 0); bw_print_number(bw_digital_read(0));
+bw_digital_toggle(0); bw_pin_mode(0, 1); bw_print_number(bw_digital_read(0));
+bw_digital_toggle(15); bw_print_number(bw_digital_read(8));
+'''
+        observed = self.run_program(self.compile(source), inA=0, inB=0)
+        self.assertEqual(observed["runs"][0], {"stopped": True, "status": 0, "text": "0\n0\n1\n"})
+        self.assertEqual(observed["via"], {"ora": 0x80, "orb": 0x01, "ddra": 0x81, "ddrb": 0x81})
+
+    def test_invalid_gpio_fails_in_the_machine_with_a_diagnostic(self):
+        result = self.compile('include "cowgol.coh"; include "brickwright.coh"; bw_pin_mode(0, 2);')
+        observed = self.run_program(result)
+        self.assertEqual(observed["runs"][0]["status"], 1)
+        self.assertIn("input/output modes only", observed["runs"][0]["text"])
+
+    def test_unimplemented_peripherals_and_oversized_ram_are_refused(self):
+        for code, diagnostic in (
+            ('include "brickwright.coh"; bw_delay(1);', "bw_delay"),
+            ('var large: uint8[20000]; MemSet(&large[0], 1, @bytesof large);', "RAM"),
+        ):
+            with self.subTest(code=code):
+                result = cowgol.build_cowgol(request(target="eater6502", format="bin", code='include "cowgol.coh";\n' + code))
+                self.assertFalse(result["success"])
+                self.assertEqual(result["stage"], "compile")
+                self.assertIn(diagnostic, result.get("error", "") + result.get("log", ""))
+
+    def test_eater_rejects_argument_transfers_above_the_backend_limit(self):
+        arguments = ", ".join(f"a{i}: int32" for i in range(33))
+        for declaration in (f"sub many({arguments}) is end sub;", f"sub many(): ({arguments}) is end sub;"):
+            with self.subTest(declaration=declaration):
+                result = cowgol.build_cowgol(request(target="eater6502", format="bin",
+                                                    code='include "cowgol.coh";\n' + declaration))
+                self.assertFalse(result["success"])
+                self.assertEqual(result["stage"], "compile")
+                self.assertIn("arguments exceed 128 bytes", result.get("log", ""))
 
 
 if __name__ == "__main__":

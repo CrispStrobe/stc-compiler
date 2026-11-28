@@ -15,6 +15,7 @@ user programs on the server.
 | `dos` | `bin` | `main.exe` | 8086 DOS small-model MZ executable |
 | `cowgol-cgen` | `c` | `main.c` | Standalone generated C for a little-endian host |
 | `riscv32` | `elf` | `main.elf` plus loadable `image` | Cowgol C backend → pinned GCC/picolibc → Brickwright RV32IMAC console machine |
+| `eater6502` | `bin` | `main.bin`, exactly 32768 bytes | Native 65C02 ROM for the canonical Brickwright EATER6502 map; ACIA console and VIA digital GPIO |
 
 `cowgol-c`, `cgen`, `cowgol-z80-cpm`, `8080-cpm`, `cowgol-8080-cpm`, and
 `i8086-dos` are aliases. Requesting an unrelated machine such as an STC part
@@ -35,7 +36,7 @@ Example request:
 ```
 
 `POST /compile` returns the familiar `success`, `base64`, `filename`, `bytes`
-and `log` fields. Cowgol also returns `toolchain`, `target`, `compiler_commit`
+and `log` fields. Cowgol also returns `language`, `toolchain`, `target`, `format`, `compiler_commit`
 and `artifact_kind` (`executable` or `source`). Both CP/M routes return
 `origin: 256`, `memory_end` and a memory summary. The assembler's symbol map
 must prove that code, the 128-byte transient stack and static workspace fit
@@ -72,6 +73,45 @@ console machine has no filesystem. Input follows the existing RV32 runtime
 and returns EOF. GPIO, timers and canvas callbacks remain unresolved linker
 errors. The service never executes the produced ELF.
 
+The EATER6502 route uses the real `65c02-rom` Cowgol backend, a board-specific
+linker/runtime, and 64tass. It returns `toolchain: "cowgol-eater6502"`,
+`mcu: "w65c02"`, `format: "bin"`, and `origin: 32768` / `entry: 32768`.
+This is the canonical 1 MHz configuration: RAM `$0000–$3FFF`, ROM
+`$8000–$FFFF`, W65C51 ACIA at `$5000`, and W65C22 VIA at `$6000`.
+Other 6502 memory maps need their own runtime and are not inferred from the CPU.
+
+This backend keeps writable return addresses and initialized arrays in RAM;
+startup copies their initial bytes out of ROM on every reset. The service
+checks the assembler's memory labels, the exact ROM length, reset/NMI/IRQ
+vectors, the STP exit opcode and the RTI interrupt handler. Static workspace and relocated data must
+end at or before `$3FF8` (eight bytes remain for allocator bookkeeping),
+zero-page storage must fit 256 bytes, and ROM code plus initialization data
+must end by `$FFFA`, before hardware vectors. A linker/assembler failure or
+inconsistent layout returns no image.
+
+The returned `memory_layout` contains integer values named `lomem`,
+`eater_workspace_end`, `eater_zp_end`, `eater_code_end`, `eater_data_load`,
+`eater_data_size`, `eater_reset`, `eater_irq`, and `eater_halt`.
+`memory_end` equals `lomem`. The service verifies
+`eater_data_size = lomem - eater_workspace_end` and
+`eater_data_load + eater_data_size = eater_code_end`.
+These checks cover static layout; ordinary Cowgol pointers and dynamic
+allocation still require a valid program. Hardware execution is not claimed.
+
+The ROM backend limits each subroutine's complete input argument list to
+128 bytes and its complete output/result list to 128 bytes independently.
+Larger lists are refused before assembly. The 256-byte 65C02 hardware stack
+also remains finite; these checks do not prove arbitrary call depth safe.
+
+The ACIA uses 19200 baud, 8N1, with paced output at the fixed 1 MHz clock;
+`get_char` waits for a received byte. `argv.coh` returns no process arguments,
+and `file.coh` is unavailable. `bw_pin_mode`, `bw_digital_write`,
+`bw_digital_read` and `bw_digital_toggle` operate the real VIA. Pins `0–7`
+map to `PA0–PA7`; `8–15` map to `PB0–PB7`. Modes are `0` input and `1`
+output. Toggle changes the stored output latch even when an input reads low.
+Invalid coordinates or modes print a diagnostic and halt with failure status.
+Timers, pullups, analog/PWM and canvas calls have no native binding.
+
 For C output, the response includes both the base64 artifact and `c` text,
 with `source_language: "c"`. Its runtime and Brickwright host declarations
 are included inline, along with Cowgol's complete BSD licence notice, so the
@@ -105,6 +145,9 @@ Cowgol compiler path; it does not silently substitute the pseudocode subset.
   ECALL console. Arrays, pointers, allocation and integer division compile
   through the full Cowgol compiler even when the Blocks converter refuses
   that source. CI executes those constructs on Brickwright's machine.
+- EATER6502 implements console and digital GPIO against its actual ACIA/VIA,
+  including output-latch toggling. Its native ROM tests also cover mutable
+  initialized data, nested calls and reset behavior while auditing ROM writes.
 
 ## Build and install
 
@@ -116,13 +159,16 @@ python3 scripts/build-cowgol-bundle.py
 ```
 
 This fetches exactly the pinned commit, builds Cowgol's bootstrapped C
-frontend plus the 16-bit frontend, the Z80/8080/8086 backends, the CP/M/DOS
-linkers, zmac and DJLINK, and produces `vendor/cowgol`. NASM comes from the
-build host's installed package. The manifest records Cowgol's commit, the
-host C compiler, NASM version, target list, and a SHA-256 for every deployed
+frontend plus the 16-bit and 6502 frontends, the Z80/8080/8086/65C02 ROM
+backends, target linkers, zmac and DJLINK, and produces `vendor/cowgol`.
+NASM and 64tass come from the build host's installed packages. The manifest
+records Cowgol's commit, the host C compiler, both assembler versions,
+target list, and a SHA-256 for every deployed
 file. DJLINK's C++ support libraries are linked statically so serverless hosts
 do not need a system libstdc++; the bundle retains Cowgol, zmac, NASM, DJLINK
-and GCC runtime licence notices.
+and GCC runtime licence notices, plus 64tass's copyright and GPL/LGPL texts.
+`TASS64_LICENSE` and `TASS64_LICENSE_DIR` select those notices on build hosts
+where the Debian paths are unavailable.
 
 To build only the C export and RISC-V compiler stages, without the legacy
 assemblers or full compiler build dependencies:
@@ -134,7 +180,7 @@ python3 scripts/build-cowgol-bundle.py --targets cowgol-cgen riscv32
 That subset requires Python, a host C compiler, and Git if a checkout is not
 supplied. The manifest advertises only selected targets. RV32 also requires
 the already-vendored GCC, picolibc and console runtime; health omits RV32 if
-those are absent. The default remains all five targets.
+those are absent. The default builds all six targets.
 
 For a reproducible source checkout and machine execution tests:
 
@@ -156,12 +202,12 @@ file execute bits.
 
 The machine oracle uses `CrispStrobe/bw-board` at
 `d21d6d8b819263eb08231134b7556efa82289a90`, the current Brickwright pin,
-and Node 22. The RV32 runner needs no npm packages and is outside the deployed
+and Node 22. The RV32 and EATER6502 runners need no npm packages and are outside the deployed
 bundle. The tests check the checkout's exact commit before running programs.
 
 The dedicated Cowgol GitHub Actions job builds on Debian Bullseye and uploads
 `cowgol-bundle-linux-x64.tar.gz`. It executes the emitted CP/M and DOS programs
-in independent machine emulators, boots RV32 output on Brickwright's machine,
+in independent machine emulators, boots RV32 and EATER6502 output on Brickwright's machines,
 and compiles/runs the C output. The emulators
 are test tools outside the deployed bundle. CI with
 `REQUIRE_COWGOL_TOOLCHAIN=1` fails if any compiler or execution oracle is absent.
@@ -184,7 +230,8 @@ release this service.
 ## Hosted source boundary
 
 The lexer-aware guard allows only `cowgol.coh`, `strings.coh`, `malloc.coh`,
-`file.coh`, `argv.coh` and `brickwright.coh`. It rejects path traversal,
+`file.coh`, `argv.coh` and `brickwright.coh`; RV32 and EATER6502 omit
+`file.coh`. It rejects path traversal,
 absolute paths, escaped include names, inline assembly and external symbol
 directives before invoking tools. Compiler options and defines are not
 accepted for this route. This keeps compiler/assembler file reads inside the

@@ -32,6 +32,8 @@ TARGETS = {
             "family": "msdos", "format": "bin", "extension": "exe"},
     "riscv32": {"description": "Cowgol via C for Brickwright RV32IMAC (console ELF)",
                 "family": "cgen", "format": "elf", "extension": "elf", "cross": "riscv32"},
+    "eater6502": {"description": "Cowgol for Brickwright EATER6502 (65C02 ROM, ACIA console and VIA GPIO)",
+                  "family": "eater6502", "format": "bin", "extension": "bin", "origin": 0x8000},
 }
 ALIASES = {"cgen": "cowgol-cgen", "cowgol-c": "cowgol-cgen", "cowgol-z80-cpm": "z80-cpm",
            "8080-cpm": "i8080-cpm", "cowgol-8080-cpm": "i8080-cpm", "i8086-dos": "dos"}
@@ -48,9 +50,9 @@ def reject_source(source, family):
         return {"success": False, "stage": "source", "error": "Cowgol source cannot contain NUL"}
     tokens = [match for match in TOKENS.finditer(source)
               if not match.group().isspace() and not match.group().startswith("#")]
-    # The RV32 console machine has no filesystem. Do not expose a header
-    # whose POSIX calls have no implementation in its embedded runtime.
-    allowed = INCLUDES - {"file.coh"} if family == "riscv32" else INCLUDES
+    # These embedded machines have no filesystem. Do not expose a header
+    # whose calls have no implementation in their runtime.
+    allowed = INCLUDES - {"file.coh"} if family in ("riscv32", "eater6502") else INCLUDES
     for index, token in enumerate(tokens):
         word = token.group().lower()
         error = None
@@ -81,7 +83,8 @@ def _required(spec):
             files.append("rt/cgen/brickwright-console.h")
     else:
         files.append(f"rt/{family}/cowgol.coo")
-        tools += (["bin/nasm", "bin/djlink"] if family == "msdos" else ["bin/zmac"])
+        tools += (["bin/nasm", "bin/djlink"] if family == "msdos"
+                  else ["bin/64tass"] if family == "eater6502" else ["bin/zmac"])
         files += tools[3:]
     return files, tools
 
@@ -180,6 +183,42 @@ def cpm_memory(listing, image_bytes):
         raise ValueError("Cowgol CP/M assembly has an inconsistent code/stack/workspace layout")
     if values["lomem"] > 0xd000:
         raise ValueError("Cowgol CP/M code, stack and static workspace exceed the $0100–$CFFF area")
+    return values
+
+
+def eater_memory(labels, artifact):
+    """Prove the bare-metal ROM, RAM relocation and vector contract.
+
+    64tass emits both decimal and $hex label values. The linker names the
+    RAM end, workspace/data split and zero-page end so uninitialized storage
+    cannot disappear from the artifact-size check.
+    """
+    names = ("LOMEM", "eater_workspace_end", "eater_zp_end", "eater_code_end",
+             "eater_data_load", "eater_data_size", "eater_reset", "eater_irq", "eater_halt")
+    pattern = r"^\s*(" + "|".join(names) + r")\s*=\s*(\$[0-9a-f]+|[0-9]+)\s*$"
+    matches = re.findall(pattern, labels, re.M | re.I)
+    values = {name.lower(): int(value[1:], 16) if value.startswith("$") else int(value)
+              for name, value in matches}
+    if len(matches) != len(names) or set(values) != {name.lower() for name in names}:
+        raise ValueError("Cowgol EATER6502 assembly is missing its memory layout symbols")
+    if len(artifact) != 32768:
+        raise ValueError("Cowgol EATER6502 must produce an exact 32 KiB ROM")
+    if not (0x200 <= values["eater_workspace_end"] <= values["lomem"] <= 0x3ff8
+            and 0 <= values["eater_zp_end"] <= 0x100):
+        raise ValueError("Cowgol EATER6502 workspace/data exceed RAM $0200–$3FF7 or zero page")
+    if not (values["eater_reset"] == 0x8000
+            and 0x8000 < values["eater_halt"] < values["eater_data_load"]
+            and 0x8000 < values["eater_irq"] < values["eater_data_load"]
+            and values["eater_data_load"] <= values["eater_code_end"] <= 0xfffa
+            and values["eater_data_size"] == values["lomem"] - values["eater_workspace_end"]
+            and values["eater_data_load"] + values["eater_data_size"] == values["eater_code_end"]):
+        raise ValueError("Cowgol EATER6502 has an inconsistent ROM/data relocation layout")
+    if struct.unpack_from("<HHH", artifact, 0x7ffa) != (values["eater_irq"], 0x8000, values["eater_irq"]):
+        raise ValueError("Cowgol EATER6502 ROM hardware vectors do not match its executable code")
+    if artifact[values["eater_halt"] - 0x8000] != 0xdb:
+        raise ValueError("Cowgol EATER6502 ROM is missing its STP exit instruction")
+    if artifact[values["eater_irq"] - 0x8000] != 0x40:
+        raise ValueError("Cowgol EATER6502 ROM is missing its RTI interrupt handler")
     return values
 
 
@@ -314,12 +353,19 @@ def build_cowgol(req):
                          runtime / "crt0.S", runtime / "console.c", c_source,
                          "-L" + str(cross_root / "picolibc/lib"), "-lc", "-lm", "-lgcc", "-o", output], env=env)
             else:
-                assembly = work / ("main.asm" if family == "msdos" else "main.z80")
+                assembly = work / ("main.asm" if family in ("msdos", "eater6502") else "main.z80")
                 run([bundle / f"bin/cowlink-{family}", "-o", assembly, coo, bundle / f"rt/{family}/cowgol.coo"])
                 if family == "msdos":
                     obj = work / "main.obj"
                     run([bundle / "bin/nasm", "-f", "obj", "-o", obj, assembly])
                     run([bundle / "bin/djlink", "-o", output, obj])
+                elif family == "eater6502":
+                    labels = work / "main.labels"
+                    run([bundle / "bin/64tass", "--quiet", "--long-branch", "--ascii", "--case-sensitive",
+                         "--nostart", "--labels", labels, "-o", output, assembly])
+                    if not output.is_file() or output.stat().st_size != 32768:
+                        raise ValueError("Cowgol EATER6502 must produce an exact 32 KiB ROM")
+                    memory_layout = eater_memory(labels.read_text(), output.read_bytes())
                 else:
                     # zmac selects its writer by suffix; .cim is the raw
                     # memory image format which CP/M calls .COM.
@@ -328,7 +374,8 @@ def build_cowgol(req):
                     run([bundle / "bin/zmac", "-j", "-m", "-z" if family == "cpmz" else "-8", "-o", cim, "-o", listing, assembly])
                     memory_layout = cpm_memory(listing.read_text(), cim.stat().st_size)
                     cim.rename(output)
-            maximum = 0xcf00 if spec.get("origin") == 0x100 else MAX_ARTIFACT_BYTES
+            maximum = (0xcf00 if spec.get("origin") == 0x100
+                       else 32768 if family == "eater6502" else MAX_ARTIFACT_BYTES)
             if not output.is_file() or not 0 < output.stat().st_size <= maximum:
                 raise ValueError(f"Cowgol output is empty or exceeds {maximum} bytes for {target}")
             artifact = output.read_bytes()
@@ -342,12 +389,18 @@ def build_cowgol(req):
                         "toolchain": "cowgol-" + spec.get("cross", family),
                         "compiler_commit": status["commit"],
                         "artifact_kind": "source" if family == "cgen" and not spec.get("cross") else "executable"}
-            if "origin" in spec:
+            if spec.get("origin") == 0x100:
                 response["origin"] = spec["origin"]
                 response["memory_end"] = memory_layout["lomem"]
                 response["memory"] = (f"CP/M image {len(artifact)} bytes, stack 128 bytes, "
                                       f"static workspace {memory_layout['lomem'] - memory_layout['ws']} bytes; "
                                       f"end ${memory_layout['lomem']:04X} (limit $D000)")
+            if family == "eater6502":
+                response.update(origin=0x8000, entry=0x8000, mcu="w65c02", memory_end=memory_layout["lomem"],
+                                memory_layout=memory_layout,
+                                memory=(f"EATER6502 ROM 32768 bytes; code/data end ${memory_layout['eater_code_end']:04X}; "
+                                        f"RAM end ${memory_layout['lomem']:04X} (limit $3FF8); "
+                                        f"zero-page end ${memory_layout['eater_zp_end']:02X}"))
             if image is not None:
                 response.update(entry=image["entry"], image=image, mcu="rv32imac",
                                 memory_end=max(segment["addr"] + len(base64.b64decode(segment["bytes"]))

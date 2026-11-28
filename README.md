@@ -126,7 +126,8 @@ Source is capped at 1 MB (4 MB across a whole project).
 
 **Cowgol** uses its real compiler for Z80/8080 CP/M `.COM` files, 8086 DOS
 `.EXE` files, RISC-V console `.ELF` executables compiled via C, and standalone
-C source export. Its format/target combinations,
+C source export. A native EATER6502 route emits 65C02 ROMs with ACIA console
+and VIA digital GPIO. Its format/target combinations,
 portable console bridge, exact compiler source pin, installation and machine
 execution checks are documented in [Cowgol compiler service](docs/COWGOL.md).
 

@@ -3242,6 +3242,7 @@ PAGE = r"""<!doctype html>
         <option value=i8080-cpm>8080 CP/M (.COM)</option>
         <option value=dos>8086 DOS (.EXE)</option>
         <option value=riscv32>RISC-V RV32 console (.ELF)</option>
+        <option value=eater6502>EATER6502 ROM (.BIN)</option>
         <option value=cowgol-cgen>Standalone C source</option>
       </optgroup>
     </select>
@@ -3483,7 +3484,7 @@ $('copy').onclick = async () => {
 const STARTERS = {c: $('code').value, pseudocode: __PSEUDO_EXAMPLE__,
                   arduino: __ARDUINO_EXAMPLE__, keil: $('code').value,
                   cowgol: 'include "cowgol.coh";\nprint("Hello from Cowgol!\\n");\n'};
-const cowgolTargets = new Set(['z80-cpm', 'i8080-cpm', 'dos', 'riscv32', 'cowgol-cgen']);
+const cowgolTargets = new Set(['z80-cpm', 'i8080-cpm', 'dos', 'riscv32', 'eater6502', 'cowgol-cgen']);
 function syncCowgolFormat() {
   if ($('language').value === 'cowgol') {
     $('format').value = $('target').value === 'cowgol-cgen' ? 'c' : $('target').value === 'riscv32' ? 'elf' : 'bin';

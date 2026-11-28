@@ -2,7 +2,7 @@
 """Build the pinned Cowgol source into a relocatable compiler-service bundle.
 
 Debian/Ubuntu build dependencies: build-essential git python3 ninja-build
-lua5.4 bison flex gpp moreutils nasm. libreadline-dev is only needed to build
+lua5.4 bison flex gpp moreutils nasm 64tass. libreadline-dev is only needed to build
 the optional CP/M execution oracle. No dependency is installed by this script.
 """
 
@@ -20,11 +20,12 @@ import tempfile
 
 REPOSITORY = "https://github.com/CrispStrobe/cowgol.git"
 # Updated only after the corresponding fork checkpoint is published.
-PINNED_COMMIT = "8146eeb02d0a2443435a720dffd4a61c978f98e2"
+PINNED_COMMIT = "8e807002bc6d1d457995f2759da262c230d807e1"
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ("cowgol-cgen", "z80-cpm", "i8080-cpm", "dos", "riscv32")
+TARGETS = ("cowgol-cgen", "z80-cpm", "i8080-cpm", "dos", "riscv32", "eater6502")
 NATIVE = {"z80-cpm": ("cpmz", "z80", "ncpmz"),
-          "i8080-cpm": ("cpm", "8080", "ncpm"), "dos": ("msdos", "8086", "msdos")}
+          "i8080-cpm": ("cpm", "8080", "ncpm"), "dos": ("msdos", "8086", "msdos"),
+          "eater6502": ("eater6502", "65c02-rom", "eater6502")}
 
 
 def run(args, cwd=None):
@@ -43,7 +44,9 @@ def build(source, destination, revision, oracles, requested=TARGETS):
     native = [NATIVE[name] for name in requested if name in NATIVE]
     cpms = any(family in ("cpm", "cpmz") for family, _backend, _linker in native)
     dos = any(family == "msdos" for family, _backend, _linker in native)
-    targets = ["bin/cowfe-for-16bit-with-nncgen"] if native else []
+    eater = any(family == "eater6502" for family, _backend, _linker in native)
+    frontends = sorted({"6502" if family == "eater6502" else "16bit" for family, _backend, _linker in native})
+    targets = [f"bin/cowfe-for-{arch}-with-nncgen" for arch in frontends]
     for family, backend, linker in native:
         targets += [f"bin/cowbe-for-{backend}-with-ncgen", f"bin/cowlink-for-{linker}-with-ncgen",
                     f"rt/{family}/+cowgolcoo"]
@@ -58,6 +61,8 @@ def build(source, destination, revision, oracles, requested=TARGETS):
         dependencies += ["make", "ninja", "c++", "lua", "bison", "flex", "gpp", "chronic"]
     if dos:
         dependencies.append("nasm")
+    if eater:
+        dependencies.append("64tass")
     for name in dependencies:
         if not shutil.which(name):
             raise ValueError(f"missing build dependency: {name}; see this script's dependency list")
@@ -95,10 +100,21 @@ def build(source, destination, revision, oracles, requested=TARGETS):
             if not notice.is_file():
                 raise ValueError("set NASM_LICENSE to the installed NASM copyright/licence file")
             shutil.copy2(notice, bundle / "licenses/nasm.txt")
+        if eater:
+            tass_notice = Path(os.environ.get("TASS64_LICENSE", "/usr/share/doc/64tass/copyright"))
+            if not tass_notice.is_file():
+                raise ValueError("set TASS64_LICENSE to the installed 64tass copyright/licence file")
+            shutil.copy2(tass_notice, bundle / "licenses/64tass-copyright.txt")
+            for license_name in ("GPL-2", "LGPL-2", "GPL-3"):
+                license_file = Path(os.environ.get("TASS64_LICENSE_DIR", "/usr/share/common-licenses")) / license_name
+                if not license_file.is_file():
+                    raise ValueError("set TASS64_LICENSE_DIR to a directory containing GPL-2, LGPL-2 and GPL-3 licence texts")
+                shutil.copy2(license_file, bundle / f"licenses/64tass-{license_name}.txt")
         for tool in ("cowfe", "cowbe", "cowlink"):
             shutil.copy2(source / f".obj/brickwright/bootstrap/{tool}", bundle / f"bin/{tool}-cgen")
         for family, backend, linker in native:
-            shutil.copy2(source / "bin/cowfe-for-16bit-with-nncgen", bundle / f"bin/cowfe-{family}")
+            frontend = "6502" if family == "eater6502" else "16bit"
+            shutil.copy2(source / f"bin/cowfe-for-{frontend}-with-nncgen", bundle / f"bin/cowfe-{family}")
             shutil.copy2(source / f"bin/cowbe-for-{backend}-with-ncgen", bundle / f"bin/cowbe-{family}")
             shutil.copy2(source / f"bin/cowlink-for-{linker}-with-ncgen", bundle / f"bin/cowlink-{family}")
             shutil.copy2(source / f".obj/rt/{family}/+cowgolcoo/cowgol.coo", bundle / f"rt/{family}/cowgol.coo")
@@ -106,6 +122,8 @@ def build(source, destination, revision, oracles, requested=TARGETS):
             shutil.copy2(source / f"bin/{tool}", bundle / f"bin/{tool}")
         if dos:
             shutil.copy2(shutil.which("nasm"), bundle / "bin/nasm")
+        if eater:
+            shutil.copy2(shutil.which("64tass"), bundle / "bin/64tass")
         if oracles:
             # Test programs stay outside the deployed bundle (cpmemu includes
             # GPL z80ex); they are execution witnesses, not service dependencies.
@@ -117,6 +135,7 @@ def build(source, destination, revision, oracles, requested=TARGETS):
             "source_commit": revision,
             "targets": list(dict.fromkeys(requested)),
             "nasm_version": subprocess.check_output(["nasm", "-v"], text=True).strip() if dos else None,
+            "tass64_version": subprocess.check_output(["64tass", "--version"], text=True).splitlines()[0] if eater else None,
             "host_compiler": subprocess.check_output(["cc", "--version"], text=True).splitlines()[0],
             "linker_flags": linker_flags,
             "sha256": {str(path.relative_to(bundle)): hashlib.sha256(path.read_bytes()).hexdigest()

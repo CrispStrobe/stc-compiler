@@ -10,6 +10,7 @@ on:
       - "scripts/build-cowgol-bundle.py"
       - "scripts/cowgol-bullseye.list"
       - "scripts/run-cowgol-riscv.mjs"
+      - "scripts/run-cowgol-eater6502.mjs"
       - "riscv-gcc/**"
       - "Dockerfile"
       - ".github/workflows/cowgol.yml"
@@ -36,7 +37,7 @@ jobs:
           cp scripts/cowgol-bullseye.list /etc/apt/sources.list
           rm -f /etc/apt/sources.list.d/debian.sources
           apt-get update
-          apt-get install -y --no-install-recommends build-essential git ninja-build lua5.4 bison flex gpp moreutils nasm libreadline-dev
+          apt-get install -y --no-install-recommends build-essential git ninja-build lua5.4 bison flex gpp moreutils nasm 64tass libreadline-dev
           pip install --quiet fastapi pydantic
       - name: Checkout the exact compiler pin
         run: |
@@ -47,7 +48,7 @@ jobs:
           git -C /tmp/cowgol-source checkout --detach FETCH_HEAD
       - name: Build and hash the real compiler bundle
         run: python3 scripts/build-cowgol-bundle.py --source /tmp/cowgol-source --oracles
-      - name: Execute Cowgol output on C, CP/M, DOS and Brickwright RV32
+      - name: Execute Cowgol output on C, CP/M, DOS, RV32 and EATER6502
         env:
           REQUIRE_COWGOL_TOOLCHAIN: "1"
           COWGOL_CPMEMU: /tmp/cowgol-source/bin/cpmemu
